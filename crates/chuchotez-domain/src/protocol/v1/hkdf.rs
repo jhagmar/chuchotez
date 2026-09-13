@@ -1,11 +1,11 @@
 //! HMAC-SHA-256 port and HKDF-Expand for one SHA-256 block.
 //!
-//! [`InviteSecret`](super::InviteSecret) is already a uniform PRK of
+//! Invite-secret bytes are already a uniform HMAC-SHA-256 key of
 //! [`DIGEST_LEN`] bytes, so Extract is skipped. Expand for [`EXPAND_LEN`] is
-//! `HMAC(PRK, info || EXPAND_T1_COUNTER)` (RFC 5869 `T(1)`). Info strings live
-//! in [`super::v1`]; this module concatenates the counter and calls the port.
+//! `HMAC(key, info || EXPAND_T1_COUNTER)` (RFC 5869 `T(1)`). Info strings live
+//! in [`super`]; this module concatenates the counter and calls the port.
 
-use super::bytes32;
+use super::super::bytes32;
 
 /// SHA-256 digest length, and therefore HMAC-SHA-256 output length.
 pub const DIGEST_LEN: usize = 32;
@@ -19,7 +19,7 @@ pub const EXPAND_LEN: usize = DIGEST_LEN;
 /// RFC 5869 `T(1)` counter appended to `info` for the first Expand block.
 pub const EXPAND_T1_COUNTER: u8 = 0x01;
 
-/// HMAC-SHA-256 key (the PRK when used with HKDF-Expand).
+/// HMAC-SHA-256 key.
 #[derive(Clone, Eq)]
 pub struct HmacSha256Key(DigestBytes);
 
@@ -100,13 +100,13 @@ pub trait HmacSha256 {
 /// HKDF-Expand with `L = `[`EXPAND_LEN`].
 pub(super) fn expand<H: HmacSha256 + ?Sized>(
     hmac: &H,
-    prk: &HmacSha256Key,
+    key: &HmacSha256Key,
     info: &[u8],
 ) -> HmacSha256Mac {
     let mut data = Vec::with_capacity(info.len() + core::mem::size_of_val(&EXPAND_T1_COUNTER));
     data.extend_from_slice(info);
     data.push(EXPAND_T1_COUNTER);
-    hmac.mac(prk, &data)
+    hmac.mac(key, &data)
 }
 
 #[cfg(test)]
@@ -139,8 +139,8 @@ mod tests {
             out: HmacSha256Mac::from_bytes(fill(0x42)),
         };
         let info = b"chuchotez/1/invite-tag";
-        let prk = HmacSha256Key::from_bytes(fill(0x11));
-        let out = expand(&hmac, &prk, info);
+        let key = HmacSha256Key::from_bytes(fill(0x11));
+        let out = expand(&hmac, &key, info);
         assert_eq!(out, HmacSha256Mac::from_bytes(fill(0x42)));
         assert_eq!(out.as_bytes(), &fill(0x42));
         assert_eq!(out.as_bytes().len(), EXPAND_LEN);
