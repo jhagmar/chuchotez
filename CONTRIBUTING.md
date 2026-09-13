@@ -28,6 +28,8 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --locked --no-deps
 
 CI runs those commands. Line coverage on measured crates is 100%. `crates/chuchotez-domain` has no crates.io dependencies.
 
+The [README](README.md) is the short entry. [docs/book.md](docs/book.md) is the complete guide.
+
 ## Pull requests
 
 1. Keep `chuchotez-domain` free of third-party crates and of host IO (`std::fs`, `std::net`, threads, `SystemTime`, `Instant`). Do not implement `Rng` in this workspace.

@@ -66,7 +66,7 @@ pub trait Rng {
     fn random32(&self) -> Random32;
 }
 
-/// Shared secret from which invite locators and mailbox keys are derived.
+/// Shared secret from which the Billboard Tag and Mailbox Tag Key are derived.
 ///
 /// v1 is [`v1::SECRET_LEN`] random bytes used as the HKDF-Expand PRK. Hosts carry
 /// this value to the peer; the domain only sees the bytes and the version.
@@ -83,7 +83,7 @@ impl InviteSecret {
         Self::V1(v1::InviteSecret::from_bytes(rng.random32().into_bytes()))
     }
 
-    /// Invite-document locator tag (HKDF-Expand, [`v1::INFO_INVITE_TAG`]).
+    /// Billboard Tag for the PublicInvite Notice ([`v1::INFO_INVITE_TAG`]).
     #[must_use]
     pub fn tag_with<H: HmacSha256 + ?Sized>(&self, hmac: &H) -> InviteTag {
         match self {
@@ -95,7 +95,7 @@ impl InviteSecret {
         }
     }
 
-    /// Mailbox tag key (HKDF-Expand, [`v1::INFO_MAILBOX_TAG_KEY`]).
+    /// Mailbox Tag Key for the Message stream ([`v1::INFO_MAILBOX_TAG_KEY`]).
     #[must_use]
     pub fn mailbox_tag_key_with<H: HmacSha256 + ?Sized>(&self, hmac: &H) -> MailboxTagKey {
         match self {
@@ -124,10 +124,10 @@ impl core::fmt::Debug for InviteSecret {
     }
 }
 
-/// Locator tag for the invite document, derived from [`InviteSecret`].
+/// Billboard Tag for the PublicInvite Notice, derived from [`InviteSecret`].
 #[derive(Clone, Eq)]
 pub enum InviteTag {
-    /// Tag derived with [`v1::INFO_INVITE_TAG`].
+    /// Billboard Tag derived with [`v1::INFO_INVITE_TAG`].
     V1(v1::InviteTag),
 }
 
@@ -147,10 +147,10 @@ impl core::fmt::Debug for InviteTag {
     }
 }
 
-/// Key from which time-binned mailbox tags are derived.
+/// Mailbox Tag Key: identifies a Message stream. Bins are this key and binned time.
 #[derive(Clone, Eq)]
 pub enum MailboxTagKey {
-    /// Key derived with [`v1::INFO_MAILBOX_TAG_KEY`].
+    /// Tag Key derived with [`v1::INFO_MAILBOX_TAG_KEY`].
     V1(v1::MailboxTagKey),
 }
 

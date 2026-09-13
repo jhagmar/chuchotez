@@ -1,6 +1,6 @@
 [package]
 name = "chuchotez"
-description = "WASM-first communications backend: invite, Hold, live ladder, pairwise streams, and a group mesh"
+description = "WASM-first communications backend: invite, Billboard, Mailbox, live ladder, pairwise streams, and a group mesh"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

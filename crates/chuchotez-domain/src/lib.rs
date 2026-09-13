@@ -1,6 +1,6 @@
 //! Domain crate: protocol types, ports, suites, and [`Engine`].
 //!
-//! Zero third-party dependencies. Hosts depend on the `chuchotez` facade, hold
+//! Zero third-party dependencies. Hosts depend on the `chuchotez` facade, keep
 //! an [`Engine`] bound to a suite, and supply [`Rng`] on every entropy call.
 //!
 //! Wire objects live in [`protocol`]. Version is an enum variant

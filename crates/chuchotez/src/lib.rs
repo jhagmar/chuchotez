@@ -1,15 +1,19 @@
 //! Chuchotez is a communications backend the app author does not operate.
 //!
-//! Pairwise streams, a group mesh, Hold (billboard and mailbox), and a live
-//! ladder compile for `wasm32-unknown-unknown` with the Rust standard library.
-//! Chat and turn-based games are application mappings. Crypto suite is policy:
-//! `hybrid` for a messenger host, `classical` when a game asks for it.
+//! A Billboard is a Channel A shares with B so A has at least write and B has
+//! at least read. Notices such as PublicInvite pin at a Tag (a coordinate on
+//! that Billboard). A Mailbox is a Channel A shares with B so A has at least
+//! read and B has at least write. A Message stream is identified by a Tag Key;
+//! Message bins by that key and binned time. Pairwise streams, a group mesh, and a live ladder compile for
+//! `wasm32-unknown-unknown` with the Rust standard library. Chat and turn-based
+//! games are application mappings. Crypto suite is policy: `hybrid` for a
+//! messenger host, `classical` when a game asks for it.
 //!
-//! This crate is the package hosts depend on. Hold an [`Engine`] bound to a
+//! This crate is the package hosts depend on. Keep an [`Engine`] bound to a
 //! suite. Supply [`Rng`] on every call that needs entropy.
 //!
 //! ```
-//! use chuchotez::{Engine, InviteSecret, RANDOM32_LEN, Random32, Rng, std_engine};
+//! use chuchotez::{InviteSecret, RANDOM32_LEN, Random32, Rng, std_engine};
 //!
 //! struct HostRng;
 //!
@@ -21,7 +25,9 @@
 //!
 //! let engine = std_engine();
 //! let secret = InviteSecret::v1_from_rng(&HostRng);
-//! let _tag = engine.tag(&secret);
+//! let tag = engine.tag(&secret);
+//! let tag_key = engine.mailbox_tag_key(&secret);
+//! let _ = (tag, tag_key);
 //! ```
 
 pub use chuchotez_adapters::Sha2;
@@ -61,7 +67,7 @@ mod tests {
     }
 
     #[test]
-    fn host_holds_engine_and_supplies_rng() {
+    fn host_keeps_engine_and_supplies_rng() {
         let engine = std_engine();
         let secret = InviteSecret::v1_from_rng(&SeedRng(fill(0x11)));
         match &secret {

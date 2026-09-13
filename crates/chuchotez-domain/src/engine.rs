@@ -25,13 +25,13 @@ impl Engine {
         &self.suite
     }
 
-    /// Invite-document locator tag (HKDF-Expand).
+    /// Billboard Tag for the PublicInvite Notice (HKDF-Expand).
     #[must_use]
     pub fn tag(&self, secret: &InviteSecret) -> InviteTag {
         secret.tag_with(self.suite.hmac())
     }
 
-    /// Mailbox tag key (HKDF-Expand).
+    /// Mailbox Tag Key for the Message stream (HKDF-Expand).
     #[must_use]
     pub fn mailbox_tag_key(&self, secret: &InviteSecret) -> MailboxTagKey {
         secret.mailbox_tag_key_with(self.suite.hmac())
