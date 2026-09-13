@@ -1,0 +1,7 @@
+# Community health files
+
+blank_issues_enabled: true
+contact_links:
+  - name: Security
+    url: https://github.com/jhagmar/chuchotez/security/policy
+    about: Report a vulnerability privately (see SECURITY.md)

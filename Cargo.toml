@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/chuchotez"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/jhagmar/chuchotez"
+homepage = "https://github.com/jhagmar/chuchotez"
+authors = ["Jonas Hagmar <jonas.hagmar@protonmail.com>"]
+publish = false
+
+[workspace.dependencies]
+chuchotez = { path = "crates/chuchotez", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
