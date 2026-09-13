@@ -4,7 +4,7 @@
 ///
 /// Secrets and tags are compared on protocol paths. A variable-time `==` on a
 /// byte array leaks how far two values match.
-pub(super) fn ct_eq<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
+pub(crate) fn ct_eq<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
     a.iter()
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))

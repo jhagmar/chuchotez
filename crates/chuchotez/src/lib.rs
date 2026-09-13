@@ -6,14 +6,17 @@
 //! read and B has at least write. A Message stream is identified by a Tag Key;
 //! Message bins by that key and binned time. Pairwise streams, a group mesh, and a live ladder compile for
 //! `wasm32-unknown-unknown` with the Rust standard library. Chat and turn-based
-//! games are application mappings. Crypto suite is policy: `hybrid` for a
-//! messenger host, `classical` when a game asks for it.
+//! games are application mappings. Crypto policy is [`Policy::Hybrid`] for a
+//! messenger host, [`Policy::Classic`] when a game asks for it.
 //!
-//! This crate is the package hosts depend on. Keep an [`Engine`] bound to a
-//! suite. Supply [`Rng`] on every call that needs entropy.
+//! This crate is the package hosts depend on. Construct a [`v1::Engine`] with
+//! [`v1::std_engine`]. Supply [`Rng`] on every call that needs entropy. A DM
+//! [`v1::InviteSecret`] is the QR capability (secret bytes plus Billboards);
+//! Tag, Tag Key, and the compact envelope are bound to that secret.
 //!
 //! ```
-//! use chuchotez::{InviteSecret, RANDOM32_LEN, Random32, Rng, std_engine};
+//! use chuchotez::v1;
+//! use chuchotez::{RANDOM32_LEN, Random32, Rng};
 //!
 //! struct HostRng;
 //!
@@ -23,36 +26,35 @@
 //!     }
 //! }
 //!
-//! let engine = std_engine();
-//! let secret = InviteSecret::v1_from_rng(&HostRng);
-//! let tag = engine.tag(&secret);
-//! let tag_key = engine.mailbox_tag_key(&secret);
-//! let _ = (tag, tag_key);
+//! let engine: v1::Engine = v1::std_engine(v1::Policy::Hybrid);
+//! let board = engine.new_billboard(
+//!     engine.try_new_billboard_kind("nostr").expect("kind"),
+//!     engine
+//!         .try_new_billboard_address("wss://relay.example")
+//!         .expect("addr"),
+//! );
+//! let secret = engine
+//!     .try_new_invite_secret(&HostRng, &[board])
+//!     .expect("secret");
+//! let tag = secret.billboard_tag();
+//! let tag_key = secret.mailbox_tag_key();
+//! let blob = secret.serialize();
+//! let _ = (tag, tag_key, blob);
 //! ```
 
-pub use chuchotez_adapters::Sha2;
-pub use chuchotez_domain::{
-    EXPAND_LEN, Engine, HmacSha256, HmacSha256Key, HmacSha256Mac, InviteSecret, InviteTag,
-    MailboxTagKey, RANDOM32_LEN, Random32, Random32Bytes, Rng, Suite, VERSION, protocol, v1,
-};
+pub use chuchotez_adapters::{Base64Ct, Deflate, Sha2};
+pub use chuchotez_domain::{Policy, RANDOM32_LEN, Random32, Random32Bytes, Rng, VERSION, protocol};
 
-/// Default portable suite (HMAC-SHA-256 over RustCrypto).
-#[must_use]
-pub fn std_suite() -> Suite {
-    chuchotez_adapters::std_suite()
-}
-
-/// [`Engine`] bound to [`std_suite`].
-#[must_use]
-pub fn std_engine() -> Engine {
-    Engine::new(std_suite())
+/// First on-wire layout: engine, invite secret, and portable adapters.
+pub mod v1 {
+    pub use chuchotez_adapters::v1::{std_engine, std_suite};
+    pub use chuchotez_domain::v1::*;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        InviteSecret, InviteTag, MailboxTagKey, RANDOM32_LEN, Random32, Rng, Sha2, std_engine,
-    };
+    use super::v1;
+    use super::{Policy, RANDOM32_LEN, Random32, Rng};
 
     struct SeedRng([u8; RANDOM32_LEN]);
 
@@ -68,27 +70,47 @@ mod tests {
 
     #[test]
     fn host_keeps_engine_and_supplies_rng() {
-        let engine = std_engine();
-        let secret = InviteSecret::v1_from_rng(&SeedRng(fill(0x11)));
-        match &secret {
-            InviteSecret::V1(inner) => assert_eq!(inner.as_bytes(), &fill(0x11)),
-        }
-        let tag = engine.tag(&secret);
-        let again = engine.tag(&secret);
+        let engine: v1::Engine = v1::std_engine(v1::Policy::Hybrid);
+        let board = engine.new_billboard(
+            engine.try_new_billboard_kind("nostr").expect("kind"),
+            engine
+                .try_new_billboard_address("wss://relay.example")
+                .expect("addr"),
+        );
+        let secret = engine
+            .try_new_invite_secret(&SeedRng(fill(0x11)), std::slice::from_ref(&board))
+            .expect("secret");
+        assert_eq!(secret.billboards().len(), 1);
+        let tag = secret.billboard_tag();
+        let again = secret.billboard_tag();
         assert_eq!(tag, again);
-        let key = engine.mailbox_tag_key(&secret);
-        match (&tag, &key) {
-            (InviteTag::V1(tag), MailboxTagKey::V1(key)) => {
-                assert_ne!(tag.as_bytes(), key.as_bytes());
-            }
-        }
-        assert_eq!(tag, secret.tag_with(&Sha2));
-        assert_eq!(key, secret.mailbox_tag_key_with(&Sha2));
-        assert_eq!(format!("{secret:?}"), "InviteSecret::V1(..)");
-        let other = InviteSecret::v1_from_rng(&SeedRng(fill(0x22)));
+        let key = secret.mailbox_tag_key();
+        assert_ne!(tag.as_bytes(), key.as_bytes());
+        assert_eq!(format!("{secret:?}"), "InviteSecret(..)");
+        let other = engine
+            .try_new_invite_secret(&SeedRng(fill(0x22)), std::slice::from_ref(&board))
+            .expect("other");
         assert_ne!(secret, other);
-        assert_eq!(secret, InviteSecret::v1_from_rng(&SeedRng(fill(0x11))));
-        let other_engine = std_engine();
-        assert_eq!(engine.tag(&secret), other_engine.tag(&secret));
+        assert_eq!(
+            secret,
+            engine
+                .try_new_invite_secret(&SeedRng(fill(0x11)), std::slice::from_ref(&board))
+                .expect("again")
+        );
+        let other_engine = v1::std_engine(Policy::Classic);
+        let blob = secret.serialize();
+        let parsed = other_engine.try_parse_invite_secret(&blob).expect("parse");
+        assert_eq!(parsed, secret);
+        assert_eq!(parsed.billboard_tag(), secret.billboard_tag());
+        assert!(!blob.contains('='));
+        assert!(matches!(
+            engine.try_parse_invite_secret("!!!!").unwrap_err(),
+            v1::EnvelopeError::Base64(_)
+        ));
+        let _ = v1::std_suite();
+        assert_eq!(
+            v1::std_engine(Policy::PostQuantum).policy(),
+            Policy::PostQuantum
+        );
     }
 }

@@ -1,8 +1,8 @@
 # Chuchotez
 
 Chuchotez is a communications library the app author does not operate. A host
-(chat, a turn-based game, or another mapping) depends on this crate, keeps an
-`Engine`, and supplies cryptographic randomness. The library compiles for
+(chat, a turn-based game, or another mapping) depends on this crate, keeps a
+`v1::Engine`, and supplies cryptographic randomness. The library compiles for
 `wasm32-unknown-unknown` with the Rust standard library.
 
 Two Channel kinds are locked:
@@ -14,8 +14,9 @@ Two Channel kinds are locked:
   at least write. A Message stream is identified by a **Tag Key**. Message bins
   are that Tag Key keyed by binned time.
 
-v1 currently derives the Billboard Tag and the Mailbox Tag Key from an
-`InviteSecret`. Pairwise streams, a group mesh, and a live ladder use the same
+`InviteSecret` is the QR capability: secret bytes plus an explicit Billboard
+list (`kind` + `address`). v1 derives the Billboard Tag and the Mailbox Tag Key
+from those bytes. Pairwise streams, a group mesh, and a live ladder use the same
 envelopes in later slices.
 
 The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
@@ -34,11 +35,13 @@ The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
 chuchotez = { git = "https://github.com/jhagmar/chuchotez" }
 ```
 
-Construct an `Engine` with `std_engine()` (HMAC-SHA-256) or `Engine::new(suite)`.
-Pass `&impl Rng` whenever the protocol needs entropy.
+Construct a `v1::Engine` with `v1::std_engine(Policy)` (HMAC-SHA-256, raw
+Deflate, unpadded base64url). Pass `&impl Rng` whenever the protocol needs
+entropy. The secret is bound to that engine: `secret.billboard_tag()`.
 
 ```rust
-use chuchotez::{InviteSecret, RANDOM32_LEN, Random32, Rng, std_engine};
+use chuchotez::v1;
+use chuchotez::{RANDOM32_LEN, Random32, Rng};
 
 struct HostRng;
 
@@ -48,17 +51,30 @@ impl Rng for HostRng {
     }
 }
 
-let engine = std_engine();
-let secret = InviteSecret::v1_from_rng(&HostRng);
-let tag = engine.tag(&secret);
-let tag_key = engine.mailbox_tag_key(&secret);
-let _ = (tag, tag_key);
+let engine: v1::Engine = v1::std_engine(v1::Policy::Hybrid);
+let board = engine.new_billboard(
+    engine.try_new_billboard_kind("nostr").expect("kind"),
+    engine
+        .try_new_billboard_address("wss://relay.example")
+        .expect("addr"),
+);
+let secret = engine
+    .try_new_invite_secret(&HostRng, &[board])
+    .expect("secret");
+let tag = secret.billboard_tag();
+let tag_key = secret.mailbox_tag_key();
+let blob = secret.serialize();
+let _ = (tag, tag_key, blob);
 ```
 
 `tag` is the Billboard Tag for the PublicInvite Notice. `tag_key` is the
-Mailbox Tag Key for the Message stream. The host CSPRNG must fill `Random32`
-with fresh bytes; the array of ones above is only a compile-checked sketch.
-The same sketch is the crate doctest.
+Mailbox Tag Key for the Message stream. `blob` is the compact DM invite
+(`b64u(version || kind || raw_deflate(payload))` with `kind = 0x01`). The host
+CSPRNG must fill `Random32` with fresh bytes; the array of ones above is only a
+compile-checked sketch. The same sketch is the crate doctest.
+
+A host looks up a mapper by Billboard `kind` and passes `address` plus the Tag.
+Mapping libraries (Nostr, …) live beside `chuchotez`; this crate does not fetch.
 
 ## Workspace
 
@@ -75,9 +91,9 @@ git config core.hooksPath .githooks
 
 | Crate | Role |
 | --- | --- |
-| `crates/chuchotez` | Facade hosts depend on (`std_engine`, re-exports) |
-| `crates/chuchotez-domain` | Protocol, ports, `Suite`, `Engine` |
-| `crates/chuchotez-adapters` | Shipped pure adapters (HMAC-SHA-256) |
+| `crates/chuchotez` | Facade hosts depend on (`v1::std_engine`, re-exports) |
+| `crates/chuchotez-domain` | Protocol, ports, `v1::Suite` / `v1::Engine` |
+| `crates/chuchotez-adapters` | Shipped pure adapters (HMAC-SHA-256, raw Deflate, unpadded base64url) |
 
 `scripts/layering.py` is the CI gate that keeps the domain free of third-party
 crates and of host IO.

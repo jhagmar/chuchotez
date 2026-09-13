@@ -1,21 +1,15 @@
-//! Domain crate: protocol types, ports, suites, and [`Engine`].
+//! Domain crate: protocol types, ports, suites, and versioned engines.
 //!
 //! Zero third-party dependencies. Hosts depend on the `chuchotez` facade, keep
-//! an [`Engine`] bound to a suite, and supply [`Rng`] on every entropy call.
+//! a [`v1::Engine`] constructed with [`Policy`], and supply [`Rng`] on every
+//! entropy call.
 //!
-//! Wire objects live in [`protocol`]. Version is an enum variant
-//! (`InviteSecret::V1`); layout-specific types live in [`protocol::v1`].
+//! Wire objects live in [`protocol`]. Layout version is the module ([`v1`]
+//! today). Hosts use factory methods on that module’s `Engine`.
 
-mod engine;
 pub mod protocol;
-mod suite;
 
-pub use engine::Engine;
-pub use protocol::{
-    EXPAND_LEN, HmacSha256, HmacSha256Key, HmacSha256Mac, InviteSecret, InviteTag, MailboxTagKey,
-    RANDOM32_LEN, Random32, Random32Bytes, Rng, v1,
-};
-pub use suite::Suite;
+pub use protocol::{Policy, RANDOM32_LEN, Random32, Random32Bytes, Rng, v1};
 
 /// Crate version from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,6 +1,6 @@
 [package]
 name = "chuchotez-domain"
-description = "Chuchotez domain: protocol types, ports, and the current crypto suite"
+description = "Chuchotez domain: protocol types, versioned Engine/Suite, and ports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
