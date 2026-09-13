@@ -6,6 +6,14 @@ Thank you for contributing to Chuchotez.
 
 Rust 1.98, including the `wasm32-unknown-unknown` target.
 
+Once per clone, enable the pre-commit hook so `cargo fmt --all` runs before each commit:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+CI still runs `cargo fmt --all -- --check`. The hook is a local convenience.
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --locked --all-targets -- -D warnings
@@ -18,11 +26,11 @@ cargo llvm-cov --workspace --locked --fail-under-lines 100 --lcov --output-path 
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --locked --no-deps
 ```
 
-CI runs those commands. Line coverage on measured crates is 100%. `crates/chuchotez` has no crates.io dependencies.
+CI runs those commands. Line coverage on measured crates is 100%. `crates/chuchotez-domain` has no crates.io dependencies.
 
 ## Pull requests
 
-1. Keep the domain crate free of third-party crates and of host IO (`std::fs`, `std::net`, threads, `SystemTime`, `Instant`).
+1. Keep `chuchotez-domain` free of third-party crates and of host IO (`std::fs`, `std::net`, threads, `SystemTime`, `Instant`). Do not implement `Rng` in this workspace.
 2. A change that compiles only on the host is unfinished. `wasm32-unknown-unknown` is a first-class target.
 3. Fill in the pull request template.
 

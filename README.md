@@ -16,18 +16,21 @@ Rust 1.98, including the `wasm32-unknown-unknown` target. From a clone:
 
 ```bash
 cargo test --workspace --locked
+git config core.hooksPath .githooks
 ```
 
-That is the default test command. Line coverage on measured crates is 100%. `crates/chuchotez` is the domain: it has no crates.io dependencies and compiles for `wasm32-unknown-unknown`.
+That is the default test command. `git config core.hooksPath .githooks` enables the pre-commit hook that runs `cargo fmt --all`. Line coverage on measured crates is 100%. `crates/chuchotez-domain` has no crates.io dependencies and compiles for `wasm32-unknown-unknown`. Hosts depend on `crates/chuchotez`, hold an `Engine`, and supply `Rng`.
 
 ## Layout
 
 The Cargo workspace is the repository root.
 
-- `crates/chuchotez` — domain library (`std` and ports)
+- `crates/chuchotez` — facade hosts depend on (`std_engine`, re-exports)
+- `crates/chuchotez-domain` — protocol, ports, `Suite`, `Engine`
+- `crates/chuchotez-adapters` — shipped pure adapters (HMAC-SHA-256)
 - `scripts/layering.py` — CI gate: domain stays free of third-party crates and host IO
 
-Hosts inject adapters. A WASM facade, when it exists, maps JavaScript values into domain types.
+The host holds an `Engine` bound to a suite (`std_engine()` or `Engine::new(suite)`). `Rng` is an argument on every call that needs entropy.
 
 ## Security
 
