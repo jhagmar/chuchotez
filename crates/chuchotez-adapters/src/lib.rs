@@ -9,7 +9,7 @@ use chuchotez_domain::v1::{
 };
 use flate2::Compression;
 use flate2::write::{DeflateDecoder, DeflateEncoder};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -129,7 +129,7 @@ mod tests {
         Base64Url, Base64UrlError, Compress, CompressError, HmacSha256, HmacSha256Key,
         HmacSha256Mac,
     };
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
 
     #[test]
     fn sha2_matches_hmac_crate() {
