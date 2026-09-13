@@ -1,6 +1,6 @@
 [package]
-name = "chuchotez"
-description = "WASM-first communications backend: invite, Hold, live ladder, pairwise streams, and a group mesh"
+name = "chuchotez-domain"
+description = "Chuchotez domain: protocol types, ports, and the current crypto suite"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,6 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 publish.workspace = true
-readme = "../../README.md"
-
-[dependencies]
-chuchotez-adapters.workspace = true
-chuchotez-domain.workspace = true
 
 [lints]
 workspace = true

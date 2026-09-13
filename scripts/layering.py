@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CRATES = ROOT / "crates"
-DOMAIN = ("chuchotez",)
+DOMAIN = ("chuchotez-domain",)
 FORBIDDEN_SOURCE = re.compile(
     r"\bstd::(fs|net|os|process|thread|env)\b|\bSystemTime\b|\bInstant\b"
 )

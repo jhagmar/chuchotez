@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/chuchotez"]
+members = [
+    "crates/chuchotez",
+    "crates/chuchotez-adapters",
+    "crates/chuchotez-domain",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +18,10 @@ publish = false
 
 [workspace.dependencies]
 chuchotez = { path = "crates/chuchotez", version = "0.1.0" }
+chuchotez-adapters = { path = "crates/chuchotez-adapters", version = "0.1.0" }
+chuchotez-domain = { path = "crates/chuchotez-domain", version = "0.1.0" }
+hmac = "0.12"
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
