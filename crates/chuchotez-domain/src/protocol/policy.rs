@@ -1,17 +1,17 @@
 //! Layout version is the module (`v1`, later `v2`). Crypto policy is selected
 //! when constructing that module’s engine.
 
-/// Crypto policy the engine honors for handshake and wrapping.
+/// Crypto policy the engine honors for Intake KEM.
 ///
 /// Every v1 engine accepts every variant. Tag Expand is HMAC-SHA-256 for all
-/// three; KEM and signatures branch on this value when those ports ship.
+/// three. Intake KEM follows this value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Policy {
-    /// X25519 and Ed25519.
+    /// X25519.
     Classic,
-    /// ML-KEM-768 and ML-DSA-65.
+    /// ML-KEM-768.
     PostQuantum,
-    /// X-Wing wrap; Ed25519 and ML-DSA-65 both verify.
+    /// X-Wing.
     Hybrid,
 }
 

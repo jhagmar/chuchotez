@@ -28,6 +28,8 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --locked --no-deps
 
 CI runs those commands. Line coverage on measured crates is 100%. `crates/chuchotez-domain` has no crates.io dependencies.
 
+With Docker, `docker compose run --rm ci` runs the same required checks plus `reuse lint`. `docker compose run --rm codeql` writes `ci/out/codeql.sarif` using CodeQL bundle v2.27.0, the CLI pinned by `github/codeql-action` v4.38.0. Codecov upload stays on GitHub.
+
 The [README](README.md) is the short entry. [docs/book.md](docs/book.md) is the complete guide.
 
 ## Pull requests

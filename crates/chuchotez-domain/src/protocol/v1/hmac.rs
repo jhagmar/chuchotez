@@ -1,9 +1,4 @@
-//! HMAC-SHA-256 port and HKDF-Expand for one SHA-256 block.
-//!
-//! Invite-secret bytes are already a uniform HMAC-SHA-256 key of
-//! [`DIGEST_LEN`] bytes, so Extract is skipped. Expand for [`EXPAND_LEN`] is
-//! `HMAC(key, info || EXPAND_T1_COUNTER)` (RFC 5869 `T(1)`). Info strings live
-//! in [`super`]; this module concatenates the counter and calls the port.
+//! HMAC-SHA-256 port and one-block HKDF-Expand (RFC 5869 `T(1)`).
 
 use super::super::bytes32;
 
@@ -14,10 +9,12 @@ pub const DIGEST_LEN: usize = 32;
 pub type DigestBytes = [u8; DIGEST_LEN];
 
 /// HKDF-Expand `L` when the derived secret is one SHA-256 block.
-pub const EXPAND_LEN: usize = DIGEST_LEN;
+pub(crate) const EXPAND_LEN: usize = DIGEST_LEN;
 
 /// RFC 5869 `T(1)` counter appended to `info` for the first Expand block.
-pub const EXPAND_T1_COUNTER: u8 = 0x01;
+pub(crate) const EXPAND_T1_COUNTER: u8 = 0x01;
+
+const _: () = assert!(EXPAND_LEN == DIGEST_LEN);
 
 /// HMAC-SHA-256 key.
 #[derive(Clone, Eq)]

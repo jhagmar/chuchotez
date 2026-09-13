@@ -20,10 +20,11 @@ publish = false
 chuchotez = { path = "crates/chuchotez", version = "0.1.0" }
 chuchotez-adapters = { path = "crates/chuchotez-adapters", version = "0.1.0" }
 chuchotez-domain = { path = "crates/chuchotez-domain", version = "0.1.0" }
-hmac = "0.13"
-sha2 = "0.11"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 base64ct = { version = "1.8", default-features = false, features = ["alloc"] }
+libcrux-hmac = "0.0.8"
+libcrux-aes = "0.0.9"
+libcrux-kem = "0.0.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

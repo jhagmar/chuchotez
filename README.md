@@ -1,23 +1,9 @@
 # Chuchotez
 
 Chuchotez is a communications library the app author does not operate. A host
-(chat, a turn-based game, or another mapping) depends on this crate, keeps a
-`v1::Engine`, and supplies cryptographic randomness. The library compiles for
-`wasm32-unknown-unknown` with the Rust standard library.
-
-Two Channel kinds are locked:
-
-- A **Billboard** is a Channel A shares with B so A has at least write and B
-  has at least read. Notices (the first is PublicInvite) pin at a **Tag**, which
-  is a coordinate on that Billboard.
-- A **Mailbox** is a Channel A shares with B so A has at least read and B has
-  at least write. A Message stream is identified by a **Tag Key**. Message bins
-  are that Tag Key keyed by binned time.
-
-`InviteSecret` is the QR capability: secret bytes plus an explicit Billboard
-list (`kind` + `address`). v1 derives the Billboard Tag and the Mailbox Tag Key
-from those bytes. Pairwise streams, a group mesh, and a live ladder use the same
-envelopes in later slices.
+depends on this crate, keeps a `v1::Engine`, and supplies cryptographic
+randomness. The library compiles for `wasm32-unknown-unknown` with the Rust
+standard library.
 
 The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
 
@@ -35,9 +21,9 @@ The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
 chuchotez = { git = "https://github.com/jhagmar/chuchotez" }
 ```
 
-Construct a `v1::Engine` with `v1::std_engine(Policy)` (HMAC-SHA-256, raw
-Deflate, unpadded base64url). Pass `&impl Rng` whenever the protocol needs
-entropy. The secret is bound to that engine: `secret.billboard_tag()`.
+Construct a `v1::Engine` with `v1::std_engine(Policy)`. Pass `&impl Rng`
+whenever the protocol needs entropy. The crate doctest is the sketch; fill
+`Random32` from a CSPRNG in a real host.
 
 ```rust
 use chuchotez::v1;
@@ -51,30 +37,36 @@ impl Rng for HostRng {
     }
 }
 
-let engine: v1::Engine = v1::std_engine(v1::Policy::Hybrid);
+let engine: v1::Engine = v1::std_engine(v1::Policy::Classic);
 let board = engine.new_billboard(
     engine.try_new_billboard_kind("nostr").expect("kind"),
     engine
         .try_new_billboard_address("wss://relay.example")
         .expect("addr"),
 );
-let secret = engine
-    .try_new_invite_secret(&HostRng, &[board])
-    .expect("secret");
-let tag = secret.billboard_tag();
-let tag_key = secret.mailbox_tag_key();
-let blob = secret.serialize();
-let _ = (tag, tag_key, blob);
+let mailbox = engine.new_mailbox(
+    engine.try_new_mailbox_kind("nostr").expect("kind"),
+    engine
+        .try_new_mailbox_address("wss://mailbox.example")
+        .expect("addr"),
+);
+let wire = engine.new_wire(
+    engine.try_new_wire_kind("webrtc").expect("kind"),
+    engine
+        .try_new_wire_address("stun:stun.example")
+        .expect("addr"),
+);
+let invite = engine
+    .try_new_invite(&HostRng, &[board], &[mailbox], &[wire])
+    .expect("invite");
+let ticket = invite.ticket();
+let intake = invite.intake();
+let tag = ticket.billboard_tag(&engine);
+let tag_key = ticket.mailbox_tag_key(&engine);
+let ticket_blob = ticket.serialize(&engine);
+let notice_blob = engine.serialize_notice(ticket, intake);
+let _ = (tag, tag_key, ticket_blob, notice_blob);
 ```
-
-`tag` is the Billboard Tag for the PublicInvite Notice. `tag_key` is the
-Mailbox Tag Key for the Message stream. `blob` is the compact DM invite
-(`b64u(version || kind || raw_deflate(payload))` with `kind = 0x01`). The host
-CSPRNG must fill `Random32` with fresh bytes; the array of ones above is only a
-compile-checked sketch. The same sketch is the crate doctest.
-
-A host looks up a mapper by Billboard `kind` and passes `address` plus the Tag.
-Mapping libraries (Nostr, …) live beside `chuchotez`; this crate does not fetch.
 
 ## Workspace
 
@@ -85,18 +77,16 @@ cargo test --workspace --locked
 git config core.hooksPath .githooks
 ```
 
-`cargo test --workspace --locked` is the default test command. The hook runs
-`cargo fmt --all`. Line coverage on measured crates is 100%.
+The hook runs `cargo fmt --all`. Line coverage on measured crates is 100%.
 `crates/chuchotez-domain` has no crates.io dependencies.
+`scripts/layering.py` is the CI gate that keeps the domain free of third-party
+crates and of host IO.
 
 | Crate | Role |
 | --- | --- |
 | `crates/chuchotez` | Facade hosts depend on (`v1::std_engine`, re-exports) |
 | `crates/chuchotez-domain` | Protocol, ports, `v1::Suite` / `v1::Engine` |
-| `crates/chuchotez-adapters` | Shipped pure adapters (HMAC-SHA-256, raw Deflate, unpadded base64url) |
-
-`scripts/layering.py` is the CI gate that keeps the domain free of third-party
-crates and of host IO.
+| `crates/chuchotez-adapters` | Shipped pure adapters |
 
 ## Security
 

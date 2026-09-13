@@ -1,285 +1,303 @@
-//! Invite secret, Billboard Tag, and Mailbox Tag Key.
+//! Invite: Ticket and Intake.
 
-use super::{
-    BILLBOARD_MAX_COUNT, Billboard, Engine, HmacSha256Key, HmacSha256Mac, INFO_INVITE_TAG,
-    INFO_MAILBOX_TAG_KEY, SECRET_LEN, hkdf,
-};
+use super::{Intake, IntakeError, KemError, Ticket, TicketError};
 
-/// Why constructing an [`InviteSecret`] rejected the Billboard list.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InviteSecretError {
-    /// No Billboard (hosts must pass at least one).
-    EmptyBillboards,
-    /// More than [`BILLBOARD_MAX_COUNT`].
-    TooManyBillboards,
+/// Why [`super::Engine::try_new_invite`] failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InviteError {
+    /// Ticket Billboard list failed.
+    Ticket(TicketError),
+    /// Intake Mailbox or Wire list failed.
+    Intake(IntakeError),
+    /// Intake key generation failed.
+    Kem(KemError),
 }
 
-impl core::fmt::Display for InviteSecretError {
+impl core::fmt::Display for InviteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::EmptyBillboards => f.write_str("invite secret needs at least one Billboard"),
-            Self::TooManyBillboards => {
-                write!(
-                    f,
-                    "invite secret has more than {BILLBOARD_MAX_COUNT} Billboards"
-                )
-            }
+            Self::Ticket(err) => write!(f, "invite: {err}"),
+            Self::Intake(err) => write!(f, "invite: {err}"),
+            Self::Kem(err) => write!(f, "invite: {err}"),
         }
     }
 }
 
-impl std::error::Error for InviteSecretError {}
-
-/// Shared secret bytes plus the Billboards the invitee should fetch.
-///
-/// Bound to the [`Engine`] that created or parsed it. Secret bytes are the
-/// HMAC-SHA-256 key for HKDF-Expand. The Billboard [`InviteTag`] and the
-/// Mailbox [`MailboxTagKey`] are derived from those bytes with distinct info
-/// strings so those roles cannot be swapped. Equality compares secret bytes
-/// and Billboards only.
-#[derive(Clone)]
-pub struct InviteSecret {
-    engine: Engine,
-    secret: HmacSha256Key,
-    billboards: Vec<Billboard>,
-}
-
-impl InviteSecret {
-    /// Wrap an engine, [`SECRET_LEN`] bytes, and a nonempty Billboard list.
-    pub(crate) fn from_parts(
-        engine: Engine,
-        bytes: [u8; SECRET_LEN],
-        billboards: Vec<Billboard>,
-    ) -> Result<Self, InviteSecretError> {
-        if billboards.is_empty() {
-            return Err(InviteSecretError::EmptyBillboards);
+impl std::error::Error for InviteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Ticket(err) => Some(err),
+            Self::Intake(err) => Some(err),
+            Self::Kem(err) => Some(err),
         }
-        if billboards.len() > BILLBOARD_MAX_COUNT {
-            return Err(InviteSecretError::TooManyBillboards);
-        }
-        Ok(Self {
-            engine,
-            secret: HmacSha256Key::from_bytes(bytes),
-            billboards,
-        })
-    }
-
-    pub(crate) const fn secret_bytes(&self) -> &[u8; SECRET_LEN] {
-        self.secret.as_bytes()
-    }
-
-    pub(crate) fn engine(&self) -> &Engine {
-        &self.engine
-    }
-
-    /// Billboards the invitee tries in list order.
-    #[must_use]
-    pub fn billboards(&self) -> &[Billboard] {
-        &self.billboards
-    }
-
-    /// Billboard Tag via the bound engine.
-    #[must_use]
-    pub fn billboard_tag(&self) -> InviteTag {
-        InviteTag::from_mac(hkdf::expand(
-            self.engine.hmac(),
-            &self.secret,
-            INFO_INVITE_TAG,
-        ))
-    }
-
-    /// Mailbox Tag Key via the bound engine.
-    #[must_use]
-    pub fn mailbox_tag_key(&self) -> MailboxTagKey {
-        MailboxTagKey::from_mac(hkdf::expand(
-            self.engine.hmac(),
-            &self.secret,
-            INFO_MAILBOX_TAG_KEY,
-        ))
     }
 }
 
-impl PartialEq for InviteSecret {
+impl From<TicketError> for InviteError {
+    fn from(err: TicketError) -> Self {
+        Self::Ticket(err)
+    }
+}
+
+impl From<IntakeError> for InviteError {
+    fn from(err: IntakeError) -> Self {
+        Self::Intake(err)
+    }
+}
+
+impl From<KemError> for InviteError {
+    fn from(err: KemError) -> Self {
+        Self::Kem(err)
+    }
+}
+
+/// Minted DM invite: Ticket and Intake.
+pub struct Invite {
+    ticket: Ticket,
+    intake: Intake,
+}
+
+impl Invite {
+    pub(crate) fn from_parts(ticket: Ticket, intake: Intake) -> Self {
+        Self { ticket, intake }
+    }
+
+    /// QR capability.
+    #[must_use]
+    pub const fn ticket(&self) -> &Ticket {
+        &self.ticket
+    }
+
+    /// Calling-card receiver.
+    #[must_use]
+    pub const fn intake(&self) -> &Intake {
+        &self.intake
+    }
+}
+
+impl PartialEq for Invite {
     fn eq(&self, other: &Self) -> bool {
-        self.secret == other.secret && self.billboards == other.billboards
+        self.ticket == other.ticket && self.intake == other.intake
     }
 }
 
-impl Eq for InviteSecret {}
+impl Eq for Invite {}
 
-impl core::fmt::Debug for InviteSecret {
+impl core::fmt::Debug for Invite {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("InviteSecret(..)")
-    }
-}
-
-/// Billboard Tag for the PublicInvite Notice, derived from [`InviteSecret`].
-#[derive(Clone, Eq)]
-pub struct InviteTag {
-    mac: HmacSha256Mac,
-}
-
-impl InviteTag {
-    /// Wrap a derived (or round-tripped) Billboard Tag.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
-        Self {
-            mac: HmacSha256Mac::from_bytes(bytes),
-        }
-    }
-
-    pub(crate) const fn from_mac(mac: HmacSha256Mac) -> Self {
-        Self { mac }
-    }
-
-    /// Billboard Tag bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; SECRET_LEN] {
-        self.mac.as_bytes()
-    }
-}
-
-impl PartialEq for InviteTag {
-    fn eq(&self, other: &Self) -> bool {
-        self.mac == other.mac
-    }
-}
-
-impl core::fmt::Debug for InviteTag {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("InviteTag(..)")
-    }
-}
-
-/// Mailbox Tag Key: identifies a Message stream. Bins are this key and binned time.
-#[derive(Clone, Eq)]
-pub struct MailboxTagKey {
-    mac: HmacSha256Mac,
-}
-
-impl MailboxTagKey {
-    /// Wrap a derived Mailbox Tag Key.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
-        Self {
-            mac: HmacSha256Mac::from_bytes(bytes),
-        }
-    }
-
-    pub(crate) const fn from_mac(mac: HmacSha256Mac) -> Self {
-        Self { mac }
-    }
-
-    /// Tag Key bytes for later per-bin Message-bin Expand.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; SECRET_LEN] {
-        self.mac.as_bytes()
-    }
-}
-
-impl PartialEq for MailboxTagKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.mac == other.mac
-    }
-}
-
-impl core::fmt::Debug for MailboxTagKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("MailboxTagKey(..)")
+        f.write_str("Invite(..)")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InviteSecret, InviteSecretError, InviteTag, MailboxTagKey};
+    use super::InviteError;
+    use crate::protocol::Policy;
     use crate::protocol::v1::{
-        BILLBOARD_MAX_COUNT, Base64Url, Compress, CompressError, SECRET_LEN, fixtures,
+        IntakeError, KemError, MAILBOX_MAX_COUNT, TicketError, WIRE_MAX_COUNT,
     };
 
     #[test]
-    fn from_parts_requires_billboards() {
+    fn invite_error_display() {
         assert_eq!(
-            InviteSecret::from_parts(fixtures::test_engine(), fixtures::fill(1), Vec::new())
-                .unwrap_err(),
-            InviteSecretError::EmptyBillboards
+            format!("{}", InviteError::Intake(IntakeError::EmptyMailboxes)),
+            format!("invite: {}", IntakeError::EmptyMailboxes)
         );
-        let too_many = vec![fixtures::sample_board(); BILLBOARD_MAX_COUNT + 1];
         assert_eq!(
-            InviteSecret::from_parts(fixtures::test_engine(), fixtures::fill(1), too_many)
-                .unwrap_err(),
-            InviteSecretError::TooManyBillboards
+            format!("{}", InviteError::Ticket(TicketError::EmptyBillboards)),
+            format!("invite: {}", TicketError::EmptyBillboards)
         );
-        let secret = InviteSecret::from_parts(
-            fixtures::test_engine(),
-            fixtures::fill(0xab),
-            vec![fixtures::sample_board()],
+        assert_eq!(
+            format!(
+                "{}",
+                InviteError::Kem(KemError::UnsupportedPolicy(Policy::Hybrid))
+            ),
+            format!("invite: {}", KemError::UnsupportedPolicy(Policy::Hybrid))
+        );
+        assert!(
+            std::error::Error::source(&InviteError::Ticket(TicketError::EmptyBillboards)).is_some()
+        );
+        assert!(
+            std::error::Error::source(&InviteError::Intake(IntakeError::EmptyMailboxes)).is_some()
+        );
+        assert!(
+            std::error::Error::source(&InviteError::Kem(KemError::UnsupportedPolicy(
+                Policy::Classic
+            )))
+            .is_some()
+        );
+        assert_eq!(
+            InviteError::from(TicketError::TooManyBillboards),
+            InviteError::Ticket(TicketError::TooManyBillboards)
+        );
+        assert_eq!(
+            InviteError::from(IntakeError::TooManyWires),
+            InviteError::Intake(IntakeError::TooManyWires)
+        );
+        assert_eq!(
+            InviteError::from(KemError::UnsupportedPolicy(Policy::PostQuantum)),
+            InviteError::Kem(KemError::UnsupportedPolicy(Policy::PostQuantum))
+        );
+        let _ = MAILBOX_MAX_COUNT;
+        let _ = WIRE_MAX_COUNT;
+    }
+
+    #[test]
+    fn try_new_invite_uses_entropy() {
+        use crate::protocol::v1::fixtures;
+        let rng = fixtures::SeedRng(fixtures::fill(0x11));
+        let engine = fixtures::test_engine();
+        let invite = engine
+            .try_new_invite(
+                &rng,
+                &[fixtures::sample_billboard()],
+                &[fixtures::sample_mailbox()],
+                &[fixtures::sample_wire()],
+            )
+            .expect("invite");
+        let expected = crate::protocol::v1::Ticket::from_parts(
+            fixtures::fill(0x11),
+            vec![fixtures::sample_billboard()],
         )
-        .expect("secret");
-        assert_eq!(secret.secret_bytes(), &fixtures::fill(0xab));
-        assert_eq!(secret.billboards().len(), 1);
-        assert_eq!(format!("{secret:?}"), "InviteSecret(..)");
-        assert!(!format!("{secret:?}").contains("ab"));
+        .expect("expected");
+        assert_eq!(invite.ticket(), &expected);
+        assert_eq!(invite.ticket().billboards().len(), 1);
+        assert_eq!(invite.intake().mailboxes().len(), 1);
+        assert_eq!(invite.intake().wires().len(), 1);
+        let _ = engine.serialize_notice(invite.ticket(), invite.intake());
+        assert_eq!(invite.intake().public_bytes()[0], 0x11);
+        assert_eq!(format!("{:?}", invite), "Invite(..)");
         assert_eq!(
-            format!("{}", InviteSecretError::EmptyBillboards),
-            "invite secret needs at least one Billboard"
-        );
-        assert_eq!(
-            format!("{}", InviteSecretError::TooManyBillboards),
-            format!("invite secret has more than {BILLBOARD_MAX_COUNT} Billboards")
-        );
-        let _ = &InviteSecretError::EmptyBillboards as &dyn std::error::Error;
-        let _ = secret.clone();
-        let blob = secret.serialize();
-        assert_eq!(
-            secret
-                .engine()
-                .try_parse_invite_secret(&blob)
-                .expect("parse"),
-            secret
-        );
-        assert!(fixtures::HexB64.decode("a").is_err());
-        assert!(fixtures::HexB64.decode("0g").is_err());
-        assert_eq!(
-            fixtures::IdentityCompress
-                .decompress(&[0; 8], 1)
+            engine
+                .try_new_invite(&rng, &[], &[fixtures::sample_mailbox()], &[])
                 .unwrap_err(),
-            CompressError::Oversize
+            InviteError::Ticket(TicketError::EmptyBillboards)
         );
     }
 
     #[test]
-    fn debug_redacts_payloads() {
-        let secret = InviteSecret::from_parts(
-            fixtures::test_engine(),
-            fixtures::fill(0xab),
-            vec![fixtures::sample_board()],
-        )
-        .expect("secret");
-        let tag = InviteTag::from_bytes(fixtures::fill(0xcd));
-        let key = MailboxTagKey::from_bytes(fixtures::fill(0xef));
-        assert_eq!(format!("{secret:?}"), "InviteSecret(..)");
-        assert_eq!(format!("{tag:?}"), "InviteTag(..)");
-        assert_eq!(format!("{key:?}"), "MailboxTagKey(..)");
-        assert!(!format!("{secret:?}").contains("ab"));
-        assert!(!format!("{tag:?}").contains("cd"));
-        assert!(!format!("{key:?}").contains("ef"));
+    fn every_policy_mints_invite() {
+        use crate::protocol::v1::fixtures;
+        use crate::protocol::v1::intake_pk_len;
+        for policy in [Policy::Classic, Policy::PostQuantum, Policy::Hybrid] {
+            let engine = fixtures::engine_with_policy(policy);
+            assert_eq!(engine.policy(), policy);
+            let board = engine.new_billboard(
+                engine.try_new_billboard_kind("nostr").expect("kind"),
+                engine
+                    .try_new_billboard_address("wss://relay.example")
+                    .expect("addr"),
+            );
+            let mailbox = engine.new_mailbox(
+                engine.try_new_mailbox_kind("nostr").expect("kind"),
+                engine
+                    .try_new_mailbox_address("wss://mailbox.example")
+                    .expect("addr"),
+            );
+            let invite = engine
+                .try_new_invite(
+                    &fixtures::SeedRng(fixtures::fill(0x11)),
+                    &[board],
+                    &[mailbox],
+                    &[],
+                )
+                .expect("invite");
+            let ticket_blob = invite.ticket().serialize(&engine);
+            let parsed = engine.try_parse_ticket(&ticket_blob).expect("parse");
+            assert_eq!(&parsed, invite.ticket());
+            let notice_blob = engine.serialize_notice(invite.ticket(), invite.intake());
+            let notice = engine
+                .try_parse_notice(invite.ticket(), &notice_blob)
+                .expect("notice");
+            assert_eq!(notice.policy(), policy);
+            assert_eq!(notice.intake_pk().len(), intake_pk_len(policy));
+            assert_eq!(notice.mailboxes().len(), 1);
+        }
     }
 
     #[test]
-    fn mailbox_tag_key_eq() {
-        let a = MailboxTagKey::from_bytes([1; SECRET_LEN]);
-        let b = MailboxTagKey::from_bytes([1; SECRET_LEN]);
-        let c = MailboxTagKey::from_bytes([2; SECRET_LEN]);
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(a.as_bytes(), &[1; SECRET_LEN]);
-        let _ = a.clone();
-        let tag_a = InviteTag::from_bytes([1; SECRET_LEN]);
-        let tag_b = InviteTag::from_bytes([1; SECRET_LEN]);
-        let tag_c = InviteTag::from_bytes([2; SECRET_LEN]);
-        assert_eq!(tag_a, tag_b);
-        assert_ne!(tag_a, tag_c);
-        assert_eq!(tag_a.as_bytes(), &[1; SECRET_LEN]);
-        let _ = tag_a.clone();
+    fn notice_rejects_foreign_ticket_and_policy() {
+        use crate::protocol::v1::{
+            MAILBOX_MAX_COUNT, NOTICE_MAX_B64U_LEN, WIRE_MAX_COUNT, fixtures,
+        };
+        let engine = fixtures::test_engine();
+        let invite = engine
+            .try_new_invite(
+                &fixtures::SeedRng(fixtures::fill(0x11)),
+                &[fixtures::sample_billboard()],
+                &[fixtures::sample_mailbox()],
+                &[],
+            )
+            .expect("invite");
+        let blob = engine.serialize_notice(invite.ticket(), invite.intake());
+        let again = engine.serialize_notice(invite.ticket(), invite.intake());
+        assert_eq!(blob, again);
+        let other = engine
+            .try_new_invite(
+                &fixtures::SeedRng(fixtures::fill(0x22)),
+                &[fixtures::sample_billboard()],
+                &[fixtures::sample_mailbox()],
+                &[],
+            )
+            .expect("other");
+        assert!(engine.try_parse_notice(other.ticket(), &blob).is_err());
+        let classic = fixtures::engine_with_policy(Policy::Classic);
+        assert_eq!(
+            classic
+                .try_parse_notice(invite.ticket(), &blob)
+                .unwrap_err(),
+            crate::protocol::v1::NoticeError::PolicyMismatch
+        );
+        assert_eq!(
+            engine
+                .try_new_invite(
+                    &fixtures::SeedRng(fixtures::fill(0x11)),
+                    &[fixtures::sample_billboard()],
+                    &[],
+                    &[]
+                )
+                .unwrap_err(),
+            InviteError::Intake(IntakeError::EmptyMailboxes)
+        );
+        let many_mail = vec![fixtures::sample_mailbox(); MAILBOX_MAX_COUNT + 1];
+        assert_eq!(
+            engine
+                .try_new_invite(
+                    &fixtures::SeedRng(fixtures::fill(0x11)),
+                    &[fixtures::sample_billboard()],
+                    &many_mail,
+                    &[]
+                )
+                .unwrap_err(),
+            InviteError::Intake(IntakeError::TooManyMailboxes)
+        );
+        let many_wire = vec![fixtures::sample_wire(); WIRE_MAX_COUNT + 1];
+        assert_eq!(
+            engine
+                .try_new_invite(
+                    &fixtures::SeedRng(fixtures::fill(0x11)),
+                    &[fixtures::sample_billboard()],
+                    &[fixtures::sample_mailbox()],
+                    &many_wire
+                )
+                .unwrap_err(),
+            InviteError::Intake(IntakeError::TooManyWires)
+        );
+        assert_ne!(invite, other);
+        assert_eq!(invite, invite);
+        assert!(format!("{:?}", invite.intake()).starts_with("Intake"));
+        let long = "aa".repeat(NOTICE_MAX_B64U_LEN);
+        assert_eq!(
+            engine.try_parse_notice(invite.ticket(), &long).unwrap_err(),
+            crate::protocol::v1::NoticeError::TooLong
+        );
+        assert_eq!(
+            engine.try_parse_notice(invite.ticket(), "").unwrap_err(),
+            crate::protocol::v1::NoticeError::Empty
+        );
+        assert!(matches!(
+            engine.try_parse_notice(invite.ticket(), "0g"),
+            Err(crate::protocol::v1::NoticeError::Base64(_))
+        ));
     }
 }

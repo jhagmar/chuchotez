@@ -1,18 +1,17 @@
-//! v1 capability bag and host handle.
+//! v1 capability bag.
 
-use super::{
-    Base64Url, Billboard, BillboardAddress, BillboardAddressError, BillboardKind,
-    BillboardKindError, Compress, EnvelopeError, HmacSha256, InviteSecret, InviteSecretError,
-};
-use crate::protocol::{Policy, Rng};
+use super::{Aead, Base64Url, CanonicalJson, Compress, HmacSha256, Kem};
 use std::sync::Arc;
 
-/// HMAC, compress, and b64u a host binds to a v1 [`Engine`].
+/// HMAC, compress, b64u, AEAD, canonical JSON, and KEM a host binds to a v1 [`super::Engine`].
 #[derive(Clone)]
 pub struct Suite {
     hmac: Arc<dyn HmacSha256 + Send + Sync>,
     compress: Arc<dyn Compress + Send + Sync>,
     b64u: Arc<dyn Base64Url + Send + Sync>,
+    aead: Arc<dyn Aead + Send + Sync>,
+    json: Arc<dyn CanonicalJson + Send + Sync>,
+    kem: Arc<dyn Kem + Send + Sync>,
 }
 
 impl Suite {
@@ -22,11 +21,17 @@ impl Suite {
         hmac: Arc<dyn HmacSha256 + Send + Sync>,
         compress: Arc<dyn Compress + Send + Sync>,
         b64u: Arc<dyn Base64Url + Send + Sync>,
+        aead: Arc<dyn Aead + Send + Sync>,
+        json: Arc<dyn CanonicalJson + Send + Sync>,
+        kem: Arc<dyn Kem + Send + Sync>,
     ) -> Self {
         Self {
             hmac,
             compress,
             b64u,
+            aead,
+            json,
+            kem,
         }
     }
 
@@ -47,107 +52,41 @@ impl Suite {
     pub(crate) fn b64u(&self) -> &dyn Base64Url {
         &*self.b64u
     }
+
+    /// AES-256-GCM.
+    #[must_use]
+    pub(crate) fn aead(&self) -> &dyn Aead {
+        &*self.aead
+    }
+
+    /// RFC 8785.
+    #[must_use]
+    pub(crate) fn canonical_json(&self) -> &dyn CanonicalJson {
+        &*self.json
+    }
+
+    /// Intake keypair generator.
+    #[must_use]
+    pub(crate) fn kem(&self) -> &dyn Kem {
+        &*self.kem
+    }
 }
 
 impl core::fmt::Debug for Suite {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Suite { hmac: .., compress: .., b64u: .. }")
-    }
-}
-
-/// Host-owned handle bound to a v1 [`Suite`] and a [`Policy`].
-///
-/// Construction of Billboards and invite secrets lives here. Tag and envelope
-/// mapping live on [`InviteSecret`].
-#[derive(Clone)]
-pub struct Engine {
-    suite: Suite,
-    policy: Policy,
-}
-
-impl Engine {
-    /// Bind this engine to `suite` and `policy`. The caller keeps the engine.
-    #[must_use]
-    pub fn new(suite: Suite, policy: Policy) -> Self {
-        Self { suite, policy }
-    }
-
-    /// Crypto policy this engine was constructed with.
-    #[must_use]
-    pub fn policy(&self) -> Policy {
-        self.policy
-    }
-
-    /// HMAC-SHA-256 capability.
-    #[must_use]
-    pub(crate) fn hmac(&self) -> &dyn HmacSha256 {
-        self.suite.hmac()
-    }
-
-    /// Raw DEFLATE capability.
-    #[must_use]
-    pub(crate) fn compress(&self) -> &dyn Compress {
-        self.suite.compress()
-    }
-
-    /// Unpadded base64url capability.
-    #[must_use]
-    pub(crate) fn b64u(&self) -> &dyn Base64Url {
-        self.suite.b64u()
-    }
-
-    /// Parse and brand a Billboard mapper key.
-    pub fn try_new_billboard_kind(&self, kind: &str) -> Result<BillboardKind, BillboardKindError> {
-        BillboardKind::try_from(kind)
-    }
-
-    /// Parse and brand a Billboard address.
-    pub fn try_new_billboard_address(
-        &self,
-        address: &str,
-    ) -> Result<BillboardAddress, BillboardAddressError> {
-        BillboardAddress::try_from(address)
-    }
-
-    /// Bind a validated kind to a validated address.
-    #[must_use]
-    pub fn new_billboard(&self, kind: BillboardKind, address: BillboardAddress) -> Billboard {
-        Billboard::new(kind, address)
-    }
-
-    /// Assign host RNG output the v1 invite-secret role.
-    pub fn try_new_invite_secret<R: Rng + ?Sized>(
-        &self,
-        rng: &R,
-        billboards: &[Billboard],
-    ) -> Result<InviteSecret, InviteSecretError> {
-        InviteSecret::from_parts(
-            self.clone(),
-            rng.random32().into_bytes(),
-            billboards.to_vec(),
-        )
-    }
-
-    /// Parse a compact DM invite blob and bind it to this engine.
-    pub fn try_parse_invite_secret(&self, s: &str) -> Result<InviteSecret, EnvelopeError> {
-        InviteSecret::try_parse(self, s)
-    }
-}
-
-impl core::fmt::Debug for Engine {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Engine { suite: .. }")
+        f.write_str("Suite { hmac: .., compress: .., b64u: .., aead: .., json: .., kem: .. }")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, Suite};
+    use super::Suite;
+    use crate::protocol::Policy;
     use crate::protocol::v1::{
-        Base64Url, Base64UrlError, BillboardAddressError, BillboardKindError, Compress,
-        CompressError, HmacSha256, HmacSha256Key, HmacSha256Mac, SECRET_LEN,
+        Aead, AeadError, AeadKey, AeadNonce, Base64Url, Base64UrlError, CanonicalJson,
+        CanonicalJsonError, Compress, CompressError, HmacSha256, HmacSha256Key, HmacSha256Mac,
+        IntakeKeypair, Json, KEM_SEED_LEN, Kem, KemError, KemSeed, SECRET_LEN,
     };
-    use crate::protocol::{Policy, Random32, Rng};
     use std::sync::Arc;
 
     struct ConstHmac(u8);
@@ -186,20 +125,59 @@ mod tests {
         }
     }
 
+    struct EmptyAead;
+
+    impl Aead for EmptyAead {
+        fn seal(
+            &self,
+            _key: &AeadKey,
+            _nonce: &AeadNonce,
+            _aad: &[u8],
+            _plaintext: &[u8],
+        ) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn open(
+            &self,
+            _key: &AeadKey,
+            _nonce: &AeadNonce,
+            _aad: &[u8],
+            _ciphertext: &[u8],
+        ) -> Result<Vec<u8>, AeadError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct EmptyJson;
+
+    impl CanonicalJson for EmptyJson {
+        fn encode(&self, _value: &Json) -> Vec<u8> {
+            Vec::new()
+        }
+
+        fn decode(&self, _bytes: &[u8]) -> Result<Json, CanonicalJsonError> {
+            Ok(Json::Null)
+        }
+    }
+
+    struct EmptyKem;
+
+    impl Kem for EmptyKem {
+        fn generate(&self, policy: Policy, _seed: &KemSeed) -> Result<IntakeKeypair, KemError> {
+            Err(KemError::UnsupportedPolicy(policy))
+        }
+    }
+
     fn suite() -> Suite {
         Suite::new(
             Arc::new(ConstHmac(1)),
             Arc::new(EmptyCompress),
             Arc::new(EmptyB64),
+            Arc::new(EmptyAead),
+            Arc::new(EmptyJson),
+            Arc::new(EmptyKem),
         )
-    }
-
-    struct SeedRng([u8; SECRET_LEN]);
-
-    impl Rng for SeedRng {
-        fn random32(&self) -> Random32 {
-            Random32::from_bytes(self.0)
-        }
     }
 
     #[test]
@@ -207,7 +185,7 @@ mod tests {
         let suite = suite();
         assert_eq!(
             format!("{suite:?}"),
-            "Suite { hmac: .., compress: .., b64u: .. }"
+            "Suite { hmac: .., compress: .., b64u: .., aead: .., json: .., kem: .. }"
         );
         assert_eq!(
             suite
@@ -226,43 +204,28 @@ mod tests {
                 .is_empty()
         );
         assert!(suite.b64u().decode("x").expect("b64").is_empty());
-        let engine = Engine::new(suite, Policy::Hybrid);
-        assert_eq!(format!("{engine:?}"), "Engine { suite: .. }");
-        assert_eq!(engine.policy(), Policy::Hybrid);
-        assert_eq!(
-            engine
-                .hmac()
-                .mac(&HmacSha256Key::from_bytes([0; SECRET_LEN]), b"")
-                .as_bytes()[0],
-            1
+        let nonce = AeadNonce::from_bytes(core::array::from_fn(|i| i as u8));
+        let key = AeadKey::from_bytes([0; 32]);
+        assert!(suite.aead().seal(&key, &nonce, b"", b"x").is_empty());
+        assert!(
+            suite
+                .aead()
+                .open(&key, &nonce, b"", b"x")
+                .expect("open")
+                .is_empty()
         );
-        assert!(engine.compress().compress(b"").is_empty());
-        assert!(engine.b64u().encode(b"").is_empty());
-        let _ = engine.clone();
-    }
-
-    #[test]
-    fn factory_brands_billboard_parts() {
-        let engine = Engine::new(suite(), Policy::Classic);
-        let kind = engine.try_new_billboard_kind("nostr").expect("kind");
-        let address = engine
-            .try_new_billboard_address("wss://relay.example")
-            .expect("addr");
-        let board = engine.new_billboard(kind, address);
-        assert_eq!(board.kind().as_str(), "nostr");
+        assert!(suite.canonical_json().encode(&Json::Null).is_empty());
         assert_eq!(
-            engine.try_new_billboard_kind("").unwrap_err(),
-            BillboardKindError::Empty
+            suite.canonical_json().decode(b"").expect("json"),
+            Json::Null
         );
         assert_eq!(
-            engine.try_new_billboard_address("").unwrap_err(),
-            BillboardAddressError::Empty
-        );
-        assert_eq!(
-            engine
-                .try_new_invite_secret(&SeedRng([3; SECRET_LEN]), &[])
+            suite
+                .kem()
+                .generate(Policy::Hybrid, &KemSeed::from_bytes([0; KEM_SEED_LEN]))
                 .unwrap_err(),
-            super::InviteSecretError::EmptyBillboards
+            KemError::UnsupportedPolicy(Policy::Hybrid)
         );
+        let _ = suite.clone();
     }
 }
