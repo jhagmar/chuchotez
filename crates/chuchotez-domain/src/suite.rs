@@ -1,7 +1,8 @@
 //! Pure cryptographic adapter bundle (HMAC now; AEAD and signatures later).
 //!
-//! [`Rng`](crate::Rng) is a host port. It is not stored here. Every method that
-//! needs entropy takes `&impl Rng` from the caller.
+//! [`Rng`](crate::Rng) is a host port. The suite stores HMAC (and later AEAD
+//! and signatures). Every method that needs entropy takes `&impl Rng` from the
+//! caller.
 
 use crate::protocol::HmacSha256;
 use std::sync::Arc;

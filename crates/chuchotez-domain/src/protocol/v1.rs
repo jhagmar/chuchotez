@@ -1,23 +1,24 @@
 //! First on-wire layout.
 //!
-//! Pins [`SECRET_LEN`] secrets, HMAC-SHA-256 as the HKDF PRF, one-hour mailbox
-//! bins, and the closed billboard / mailbox / live unions. A later layout is a
-//! sibling module and a new enum variant on the crate-level types.
+//! Pins [`SECRET_LEN`] secrets, HMAC-SHA-256 as the HKDF PRF, and one-hour
+//! Mailbox Message bins. A later layout is a sibling module and a new enum
+//! variant on the crate-level types.
 
 use super::hkdf::{DIGEST_LEN, HmacSha256Key, HmacSha256Mac};
 
 /// Length of v1 secrets, tags, and derived keys. Same as HMAC-SHA-256 output.
 pub const SECRET_LEN: usize = DIGEST_LEN;
 
-/// HKDF-Expand `info` for [`InviteTag`](super::InviteTag).
+/// HKDF-Expand `info` for the Billboard [`InviteTag`](super::InviteTag).
 pub const INFO_INVITE_TAG: &[u8] = b"chuchotez/1/invite-tag";
 
-/// HKDF-Expand `info` for [`MailboxTagKey`](super::MailboxTagKey).
+/// HKDF-Expand `info` for the Mailbox [`MailboxTagKey`](super::MailboxTagKey).
 pub const INFO_MAILBOX_TAG_KEY: &[u8] = b"chuchotez/1/mailbox-tag-key";
 
 /// Shared secret bytes for the first layout.
 ///
-/// This value is the PRK for HKDF-Expand. [`InviteTag`](super::InviteTag) and
+/// This value is the PRK for HKDF-Expand. The Billboard
+/// [`InviteTag`](super::InviteTag) and the Mailbox
 /// [`MailboxTagKey`](super::MailboxTagKey) are derived from it with distinct
 /// info strings so those roles cannot be swapped.
 #[derive(Clone, Eq)]
@@ -57,14 +58,14 @@ impl core::fmt::Debug for InviteSecret {
     }
 }
 
-/// Locator tag for the invite document, derived from [`InviteSecret`].
+/// Billboard Tag for the PublicInvite Notice, derived from [`InviteSecret`].
 #[derive(Clone, Eq)]
 pub struct InviteTag {
     mac: HmacSha256Mac,
 }
 
 impl InviteTag {
-    /// Wrap a derived (or round-tripped) tag.
+    /// Wrap a derived (or round-tripped) Billboard Tag.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
         Self {
@@ -76,7 +77,7 @@ impl InviteTag {
         Self { mac }
     }
 
-    /// Derived tag bytes.
+    /// Billboard Tag bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; SECRET_LEN] {
         self.mac.as_bytes()
@@ -95,14 +96,14 @@ impl core::fmt::Debug for InviteTag {
     }
 }
 
-/// Key from which time-binned mailbox tags are derived.
+/// Mailbox Tag Key: identifies a Message stream. Bins are this key and binned time.
 #[derive(Clone, Eq)]
 pub struct MailboxTagKey {
     mac: HmacSha256Mac,
 }
 
 impl MailboxTagKey {
-    /// Wrap a derived mailbox tag key.
+    /// Wrap a derived Mailbox Tag Key.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
         Self {
@@ -114,7 +115,7 @@ impl MailboxTagKey {
         Self { mac }
     }
 
-    /// PRK bytes for later per-bin mailbox tag Expand.
+    /// Tag Key bytes for later per-bin Message-bin Expand.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; SECRET_LEN] {
         self.mac.as_bytes()
