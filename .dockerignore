@@ -1,0 +1,5 @@
+target/
+.git/
+ci/out/
+*.lcov
+lcov.info
