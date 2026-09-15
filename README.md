@@ -1,9 +1,9 @@
 # Chuchotez
 
 Chuchotez is a communications library the app author does not operate. A host
-depends on this crate, keeps a `v1::Engine`, and supplies cryptographic
-randomness. The library compiles for `wasm32-unknown-unknown` with the Rust
-standard library.
+depends on this crate, keeps a `v1::Engine` and `v1::EngineState`, and supplies
+cryptographic randomness and a DEK. The library compiles for
+`wasm32-unknown-unknown` with the Rust standard library.
 
 The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
 
@@ -21,7 +21,7 @@ The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
 chuchotez = { git = "https://github.com/jhagmar/chuchotez" }
 ```
 
-Construct a `v1::Engine` with `v1::std_engine(Policy)`. Pass `&impl Rng`
+Construct a `v1::Engine` with `v1::std_engine(Policy)`. Pass `&dyn Rng`
 whenever the protocol needs entropy. The crate doctest is the sketch; fill
 `Random32` from a CSPRNG in a real host.
 
@@ -38,34 +38,40 @@ impl Rng for HostRng {
 }
 
 let engine: v1::Engine = v1::std_engine(v1::Policy::Classic);
-let board = engine.new_billboard(
-    engine.try_new_billboard_kind("nostr").expect("kind"),
-    engine
-        .try_new_billboard_address("wss://relay.example")
-        .expect("addr"),
+let board = v1::Billboard::new(
+    v1::BillboardKind::try_from("nostr").expect("kind"),
+    v1::BillboardAddress::try_from("wss://relay.example").expect("addr"),
 );
-let mailbox = engine.new_mailbox(
-    engine.try_new_mailbox_kind("nostr").expect("kind"),
-    engine
-        .try_new_mailbox_address("wss://mailbox.example")
-        .expect("addr"),
+let mailbox = v1::Mailbox::new(
+    v1::MailboxKind::try_from("nostr").expect("kind"),
+    v1::MailboxAddress::try_from("wss://mailbox.example").expect("addr"),
 );
-let wire = engine.new_wire(
-    engine.try_new_wire_kind("webrtc").expect("kind"),
-    engine
-        .try_new_wire_address("stun:stun.example")
-        .expect("addr"),
+let wire = v1::Wire::new(
+    v1::WireKind::try_from("webrtc").expect("kind"),
+    v1::WireAddress::try_from("stun:stun.example").expect("addr"),
 );
-let invite = engine
-    .try_new_invite(&HostRng, &[board], &[mailbox], &[wire])
-    .expect("invite");
-let ticket = invite.ticket();
-let intake = invite.intake();
-let tag = ticket.billboard_tag(&engine);
-let tag_key = ticket.mailbox_tag_key(&engine);
-let ticket_blob = ticket.serialize(&engine);
-let notice_blob = engine.serialize_notice(ticket, intake);
-let _ = (tag, tag_key, ticket_blob, notice_blob);
+let dek = v1::AeadKey::from_bytes([2; RANDOM32_LEN]);
+let (state, user_ok) = engine.create_user(v1::EngineState::new(), &HostRng, &dek);
+let user_id = user_ok.expect("user").user_id;
+let (state, id_ok) = engine.create_identity(state, &HostRng, &dek, user_id);
+let identity_id = id_ok.expect("identity").identity_id;
+let (state, invite_ok) = engine.create_invite(
+    state,
+    &HostRng,
+    &dek,
+    user_id,
+    identity_id,
+    std::slice::from_ref(&board),
+    std::slice::from_ref(&mailbox),
+    std::slice::from_ref(&wire),
+);
+let invite_ok = invite_ok.expect("invite");
+let ticket_blob = invite_ok.ticket_blob.clone();
+let notice_blob = invite_ok.notice_blob.clone();
+let tag = invite_ok.billboard_tag;
+let conversation_id = invite_ok.conversation_id;
+let _ = engine.mark_notices_pinned(state, &dek, user_id, identity_id, conversation_id);
+let _ = (tag, ticket_blob, notice_blob);
 ```
 
 ## Workspace
