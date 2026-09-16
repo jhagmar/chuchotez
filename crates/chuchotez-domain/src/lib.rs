@@ -5,7 +5,7 @@
 //! entropy call.
 //!
 //! Wire objects live in [`protocol`]. Layout version is the module ([`v1`]
-//! today). Hosts use factory methods on that module’s `Engine`.
+//! today). Hosts keep [`v1::Engine`] and [`v1::EngineState`].
 
 pub mod protocol;
 

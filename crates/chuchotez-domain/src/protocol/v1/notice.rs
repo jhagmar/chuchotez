@@ -188,7 +188,7 @@ impl Notice {
         engine.b64u().encode(&ct)
     }
 
-    fn to_json(&self, engine: &Engine) -> Json {
+    pub(crate) fn to_json(&self, engine: &Engine) -> Json {
         let b64u = engine.b64u();
         Json::Object(vec![
             (
@@ -235,7 +235,20 @@ impl core::fmt::Debug for Notice {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn try_parse_notice(
+    engine: &Engine,
+    ticket: &Ticket,
+    s: &str,
+) -> Result<Notice, NoticeError> {
+    let notice = try_parse_notice_any_policy(engine, ticket, s)?;
+    if notice.policy != engine.policy() {
+        return Err(NoticeError::PolicyMismatch);
+    }
+    Ok(notice)
+}
+
+pub(crate) fn try_parse_notice_any_policy(
     engine: &Engine,
     ticket: &Ticket,
     s: &str,
@@ -268,16 +281,13 @@ pub(crate) fn try_parse_notice(
         .decode(&canonical)
         .map_err(NoticeError::Json)?;
     let notice = notice_from_json(engine, json)?;
-    if notice.policy != engine.policy() {
-        return Err(NoticeError::PolicyMismatch);
-    }
     if notice.intake_pk.len() != intake_pk_len(notice.policy) {
         return Err(NoticeError::IntakePk);
     }
     Ok(notice)
 }
 
-fn notice_from_json(engine: &Engine, json: Json) -> Result<Notice, NoticeError> {
+pub(crate) fn notice_from_json(engine: &Engine, json: Json) -> Result<Notice, NoticeError> {
     let Json::Object(members) = json else {
         return Err(NoticeError::Type);
     };
@@ -301,7 +311,7 @@ fn notice_from_json(engine: &Engine, json: Json) -> Result<Notice, NoticeError> 
     Notice::from_parts(policy, intake_pk, mailboxes, wires)
 }
 
-fn parse_policy(value: Json) -> Result<Policy, NoticeError> {
+pub(crate) fn parse_policy(value: Json) -> Result<Policy, NoticeError> {
     let Json::String(s) = value else {
         return Err(NoticeError::Type);
     };
@@ -399,7 +409,7 @@ fn channels_json<T>(items: &[T], parts: impl Fn(&T) -> (&str, &str)) -> Json {
     )
 }
 
-fn policy_str(policy: Policy) -> &'static str {
+pub(crate) fn policy_str(policy: Policy) -> &'static str {
     match policy {
         Policy::Classic => POLICY_CLASSIC,
         Policy::PostQuantum => POLICY_POST_QUANTUM,

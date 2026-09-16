@@ -7,6 +7,7 @@ use super::{
     MailboxAddress, MailboxKind, Policy, SECRET_LEN, Suite, Ticket, Wire, WireAddress, WireKind,
 };
 use crate::protocol::{Random32, Rng};
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 pub(crate) fn fill(byte: u8) -> [u8; SECRET_LEN] {
@@ -19,6 +20,27 @@ pub(crate) struct SeedRng(pub [u8; SECRET_LEN]);
 impl Rng for SeedRng {
     fn random32(&self) -> Random32 {
         Random32::from_bytes(self.0)
+    }
+}
+
+/// Distinct [`Random32`] draws: big-endian counter in the last eight bytes.
+pub(crate) struct CounterRng {
+    n: Cell<u64>,
+}
+
+impl CounterRng {
+    pub(crate) fn new() -> Self {
+        Self { n: Cell::new(0) }
+    }
+}
+
+impl Rng for CounterRng {
+    fn random32(&self) -> Random32 {
+        let i = self.n.get();
+        self.n.set(i + 1);
+        let mut bytes = [0u8; SECRET_LEN];
+        bytes[SECRET_LEN - 8..].copy_from_slice(&i.to_be_bytes());
+        Random32::from_bytes(bytes)
     }
 }
 
@@ -73,6 +95,83 @@ impl Compress for IdentityCompress {
             return Err(CompressError::Oversize);
         }
         Ok(src.to_vec())
+    }
+}
+
+pub(crate) struct ExplodingCompress;
+
+impl Compress for ExplodingCompress {
+    fn compress(&self, src: &[u8]) -> Vec<u8> {
+        let mut out = src.to_vec();
+        out.resize(crate::protocol::v1::COMMAND_MAX_COMPRESSED + 1, 0);
+        out
+    }
+
+    fn decompress(&self, src: &[u8], max_uncompressed: usize) -> Result<Vec<u8>, CompressError> {
+        IdentityCompress.decompress(src, max_uncompressed)
+    }
+}
+
+pub(crate) struct MaxPadCompress;
+
+impl Compress for MaxPadCompress {
+    fn compress(&self, src: &[u8]) -> Vec<u8> {
+        let mut out = src.to_vec();
+        out.resize(crate::protocol::v1::COMMAND_MAX_COMPRESSED, 0);
+        out
+    }
+
+    fn decompress(&self, src: &[u8], max_uncompressed: usize) -> Result<Vec<u8>, CompressError> {
+        IdentityCompress.decompress(src, max_uncompressed)
+    }
+}
+
+pub(crate) struct CodecCompress;
+
+impl Compress for CodecCompress {
+    fn compress(&self, src: &[u8]) -> Vec<u8> {
+        src.to_vec()
+    }
+
+    fn decompress(&self, _src: &[u8], _max_uncompressed: usize) -> Result<Vec<u8>, CompressError> {
+        Err(CompressError::Codec)
+    }
+}
+
+pub(crate) struct FatAead;
+
+impl Aead for FatAead {
+    fn seal(&self, key: &AeadKey, nonce: &AeadNonce, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let mut out = XorAead.seal(key, nonce, aad, plaintext);
+        out.extend_from_slice(&[0u8; 300]);
+        out
+    }
+
+    fn open(
+        &self,
+        key: &AeadKey,
+        nonce: &AeadNonce,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, AeadError> {
+        if ciphertext.len() < 300 {
+            return Err(AeadError::Open);
+        }
+        XorAead.open(key, nonce, aad, &ciphertext[..ciphertext.len() - 300])
+    }
+}
+
+pub(crate) struct PadJson;
+
+impl CanonicalJson for PadJson {
+    fn encode(&self, value: &Json) -> Vec<u8> {
+        let mut out = DetJson.encode(value);
+        out.resize(crate::protocol::v1::COMMAND_MAX_UNCOMPRESSED + 1, b'x');
+        out
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<Json, CanonicalJsonError> {
+        DetJson.decode(bytes)
     }
 }
 
@@ -395,6 +494,24 @@ pub(crate) fn engine_with(
     )
 }
 
+pub(crate) fn engine_custom(
+    compress: Arc<dyn Compress + Send + Sync>,
+    aead: Arc<dyn Aead + Send + Sync>,
+    json: Arc<dyn CanonicalJson + Send + Sync>,
+) -> Engine {
+    Engine::new(
+        Suite::new(
+            Arc::new(XorHmac),
+            compress,
+            Arc::new(HexB64),
+            aead,
+            json,
+            Arc::new(EchoKem),
+        ),
+        Policy::Hybrid,
+    )
+}
+
 pub(crate) fn test_engine() -> Engine {
     engine_with(Arc::new(IdentityCompress), Arc::new(HexB64))
 }
@@ -449,8 +566,14 @@ pub(crate) fn engine_with_hmac(hmac: Arc<dyn HmacSha256 + Send + Sync>) -> Engin
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalJson, DetJson, Json, XorAead};
-    use crate::protocol::v1::{Aead, AeadError, AeadKey, AeadNonce, CanonicalJsonError};
+    use super::{
+        CanonicalJson, CodecCompress, Compress, DetJson, ExplodingCompress, FatAead, Json,
+        MaxPadCompress, PadJson, XorAead,
+    };
+    use crate::protocol::v1::{
+        Aead, AeadError, AeadKey, AeadNonce, COMMAND_MAX_COMPRESSED, COMMAND_MAX_UNCOMPRESSED,
+        CanonicalJsonError, CompressError,
+    };
 
     #[test]
     fn xor_aead_rejects_short_and_wrong_key() {
@@ -483,6 +606,34 @@ mod tests {
             aead.open(&key, &nonce, b"ad", &short_aad).unwrap_err(),
             AeadError::Open
         );
+    }
+
+    #[test]
+    fn persist_test_doubles() {
+        let key = AeadKey::from_bytes([1u8; 32]);
+        let nonce = AeadNonce::from_bytes([2u8; 12]);
+        let fat = FatAead;
+        let ct = fat.seal(&key, &nonce, b"ad", b"pt");
+        assert_eq!(fat.open(&key, &nonce, b"ad", &ct).expect("ok"), b"pt");
+        assert_eq!(
+            fat.open(&key, &nonce, b"ad", &[1, 2]).unwrap_err(),
+            AeadError::Open
+        );
+        assert_eq!(
+            ExplodingCompress.compress(b"x").len(),
+            COMMAND_MAX_COMPRESSED + 1
+        );
+        assert_eq!(ExplodingCompress.decompress(b"xy", 8).expect("id"), b"xy");
+        assert_eq!(MaxPadCompress.compress(b"x").len(), COMMAND_MAX_COMPRESSED);
+        assert_eq!(MaxPadCompress.decompress(b"z", 8).expect("id"), b"z");
+        assert_eq!(CodecCompress.compress(b"a"), b"a");
+        assert_eq!(
+            CodecCompress.decompress(b"a", 8).unwrap_err(),
+            CompressError::Codec
+        );
+        let padded = PadJson.encode(&Json::Null);
+        assert_eq!(padded.len(), COMMAND_MAX_UNCOMPRESSED + 1);
+        assert_eq!(PadJson.decode(b"null").expect("n"), Json::Null);
     }
 
     #[test]

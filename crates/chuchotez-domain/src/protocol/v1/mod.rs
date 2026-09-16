@@ -16,6 +16,7 @@ mod json;
 mod kem;
 mod mailbox;
 mod notice;
+mod state;
 mod suite;
 mod ticket;
 mod wire;
@@ -41,6 +42,17 @@ pub use kem::{
 };
 pub use mailbox::{Mailbox, MailboxAddress, MailboxAddressError, MailboxKind, MailboxKindError};
 pub use notice::{Notice, NoticeError};
+pub use state::{
+    ApplyError, COMMAND_MAX_COMPRESSED, COMMAND_MAX_PERSIST_LEN, COMMAND_MAX_UNCOMPRESSED,
+    COMMAND_PERSIST_VERSION, COMMAND_SCHEMA_VERSION, Command, Conversation, ConversationId,
+    ConversationPhase, CreateIdentityError, CreateIdentityOk, CreateInviteError, CreateInviteOk,
+    CreateUserError, CreateUserOk, DISPLAY_NAME_MAX_LEN, DeleteConversationError,
+    DeleteIdentityError, DeleteUserError, DirectMessage, DisplayName, DisplayNameError,
+    EngineState, Established, Failed, Group, Identity, IdentityId, Invitee, Inviter,
+    MarkNoticesPinnedError, PersistError, PersistOk, PersistedCommand, ReceiveNoticeError,
+    ReceiveNoticeOk, ReceiveTicketError, ReceiveTicketOk, SetDisplayNameError, Synchronization,
+    UnsetDisplayNameError, User, UserId,
+};
 pub use suite::Suite;
 pub use ticket::{
     BillboardTag, EnvelopeError, MailboxTagKey, PayloadError, Ticket, TicketError, TicketSecret,
@@ -73,7 +85,7 @@ pub const PAYLOAD_VERSION: u8 = 1;
 /// Envelope version byte before the invite kind and raw Deflate (`0xC1`).
 pub const ENVELOPE_VERSION: u8 = 0xC1;
 
-/// Compact-envelope invite kind for a DM Thread (`0x01`).
+/// Compact-envelope invite kind for a DM Conversation (`0x01`).
 pub const INVITE_KIND_DM: u8 = 0x01;
 
 /// Cap on uncompressed canonical Ticket bytes (zip-bomb brake).
