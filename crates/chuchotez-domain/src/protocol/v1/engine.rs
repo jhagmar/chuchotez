@@ -1,16 +1,16 @@
 //! Host-owned handle bound to a v1 [`Suite`] and a [`Policy`].
 
 use super::{
-    AddressError, Billboard, BillboardAddress, BillboardKind, EnvelopeError, Intake, Invite,
-    InviteError, KemSeed, KindError, Mailbox, MailboxAddress, MailboxKind, Notice, NoticeError,
-    Suite, Ticket, Wire, WireAddress, WireKind, notice,
+    AddressError, Billboard, BillboardAddress, BillboardKind, DisplayName, DisplayNameError,
+    EnvelopeError, Intake, Invite, InviteError, KemSeed, KindError, Mailbox, MailboxAddress,
+    MailboxKind, Notice, NoticeError, Suite, Ticket, Wire, WireAddress, WireKind, notice,
 };
 use crate::protocol::{Policy, Rng};
 
 /// Host-owned handle bound to a v1 [`Suite`] and a [`Policy`].
 ///
-/// Construction of Billboards, Mailboxes, Wires, and Invites lives here. Tag
-/// and envelope mapping take `&Engine` on [`Ticket`].
+/// Named methods drive and query [`super::EngineState`]. Protocol helpers stay
+/// crate-private. Tag and envelope mapping take `&Engine` on [`Ticket`].
 #[derive(Clone)]
 pub struct Engine {
     suite: Suite,
@@ -28,6 +28,12 @@ impl Engine {
     #[must_use]
     pub fn policy(&self) -> Policy {
         self.policy
+    }
+
+    /// Brand a preferred display name with the address gate.
+    pub fn try_new_display_name(&self, name: &str) -> Result<DisplayName, DisplayNameError> {
+        let _ = self;
+        DisplayName::try_from(name)
     }
 
     /// HMAC-SHA-256 capability.
@@ -67,12 +73,14 @@ impl Engine {
     }
 
     /// Parse and brand a Billboard mapper key.
-    pub fn try_new_billboard_kind(&self, kind: &str) -> Result<BillboardKind, KindError> {
+    #[allow(dead_code)]
+    pub(crate) fn try_new_billboard_kind(&self, kind: &str) -> Result<BillboardKind, KindError> {
         BillboardKind::try_from(kind)
     }
 
     /// Parse and brand a Billboard address.
-    pub fn try_new_billboard_address(
+    #[allow(dead_code)]
+    pub(crate) fn try_new_billboard_address(
         &self,
         address: &str,
     ) -> Result<BillboardAddress, AddressError> {
@@ -81,46 +89,60 @@ impl Engine {
 
     /// Bind a validated kind to a validated address.
     #[must_use]
-    pub fn new_billboard(&self, kind: BillboardKind, address: BillboardAddress) -> Billboard {
+    #[allow(dead_code)]
+    pub(crate) fn new_billboard(
+        &self,
+        kind: BillboardKind,
+        address: BillboardAddress,
+    ) -> Billboard {
         Billboard::new(kind, address)
     }
 
     /// Parse and brand a Mailbox mapper key.
-    pub fn try_new_mailbox_kind(&self, kind: &str) -> Result<MailboxKind, KindError> {
+    #[allow(dead_code)]
+    pub(crate) fn try_new_mailbox_kind(&self, kind: &str) -> Result<MailboxKind, KindError> {
         MailboxKind::try_from(kind)
     }
 
     /// Parse and brand a Mailbox address.
-    pub fn try_new_mailbox_address(&self, address: &str) -> Result<MailboxAddress, AddressError> {
+    #[allow(dead_code)]
+    pub(crate) fn try_new_mailbox_address(
+        &self,
+        address: &str,
+    ) -> Result<MailboxAddress, AddressError> {
         MailboxAddress::try_from(address)
     }
 
     /// Bind a validated Mailbox kind to a validated address.
     #[must_use]
-    pub fn new_mailbox(&self, kind: MailboxKind, address: MailboxAddress) -> Mailbox {
+    #[allow(dead_code)]
+    pub(crate) fn new_mailbox(&self, kind: MailboxKind, address: MailboxAddress) -> Mailbox {
         Mailbox::new(kind, address)
     }
 
     /// Parse and brand a Wire mapper key.
-    pub fn try_new_wire_kind(&self, kind: &str) -> Result<WireKind, KindError> {
+    #[allow(dead_code)]
+    pub(crate) fn try_new_wire_kind(&self, kind: &str) -> Result<WireKind, KindError> {
         WireKind::try_from(kind)
     }
 
     /// Parse and brand a Wire address.
-    pub fn try_new_wire_address(&self, address: &str) -> Result<WireAddress, AddressError> {
+    #[allow(dead_code)]
+    pub(crate) fn try_new_wire_address(&self, address: &str) -> Result<WireAddress, AddressError> {
         WireAddress::try_from(address)
     }
 
     /// Bind a validated Wire kind to a validated address.
     #[must_use]
-    pub fn new_wire(&self, kind: WireKind, address: WireAddress) -> Wire {
+    #[allow(dead_code)]
+    pub(crate) fn new_wire(&self, kind: WireKind, address: WireAddress) -> Wire {
         Wire::new(kind, address)
     }
 
     /// Mint an Invite: Ticket secret and Intake [`KemSeed`] from `rng`.
-    pub fn try_new_invite<R: Rng>(
+    pub(crate) fn try_new_invite(
         &self,
-        rng: &R,
+        rng: &dyn Rng,
         billboards: &[Billboard],
         mailboxes: &[Mailbox],
         wires: &[Wire],
@@ -133,20 +155,21 @@ impl Engine {
     }
 
     /// Parse a compact DM Ticket blob using this engine's codecs.
-    pub fn try_parse_ticket(&self, s: &str) -> Result<Ticket, EnvelopeError> {
+    pub(crate) fn try_parse_ticket(&self, s: &str) -> Result<Ticket, EnvelopeError> {
         Ticket::try_parse(self, s)
     }
 
     /// Seal Intake public fields as a Notice blob keyed by `ticket`.
     #[must_use]
-    pub fn serialize_notice(&self, ticket: &Ticket, intake: &Intake) -> String {
+    pub(crate) fn serialize_notice(&self, ticket: &Ticket, intake: &Intake) -> String {
         Notice::from_intake(self.policy, intake).serialize(self, ticket)
     }
 
     /// Parse a Notice blob with keys derived from `ticket`.
     ///
     /// `policy` must match this engine. `intake_pk` length must match that Policy.
-    pub fn try_parse_notice(&self, ticket: &Ticket, s: &str) -> Result<Notice, NoticeError> {
+    #[allow(dead_code)]
+    pub(crate) fn try_parse_notice(&self, ticket: &Ticket, s: &str) -> Result<Notice, NoticeError> {
         notice::try_parse_notice(self, ticket, s)
     }
 }
@@ -181,6 +204,10 @@ mod tests {
         let address = engine
             .try_new_billboard_address("wss://relay.example")
             .expect("addr");
+        assert_eq!(
+            engine.try_new_display_name("Ada").expect("name").as_str(),
+            "Ada"
+        );
         let board = engine.new_billboard(kind, address);
         assert_eq!(board.kind().as_str(), "nostr");
         assert_eq!(

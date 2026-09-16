@@ -31,7 +31,7 @@ pub const fn intake_pk_len(policy: Policy) -> usize {
 
 /// Derandomized Intake key-generation seed.
 ///
-/// [`super::Engine::try_new_invite`] concatenates two [`Random32`] draws.
+/// [`super::Engine::create_invite`] concatenates two [`Random32`] draws.
 /// [`Kem::generate`] is a function of [`Policy`] and this seed. Classic X25519
 /// and Hybrid X-Wing consume the first [`RANDOM32_LEN`] bytes; PostQuantum
 /// ML-KEM-768 consumes [`KEM_SEED_LEN`].
@@ -74,6 +74,7 @@ impl core::fmt::Debug for KemSeed {
 }
 
 /// Public and secret KEM bytes for an [`Intake`].
+#[derive(Clone)]
 pub struct IntakeKeypair {
     public: Vec<u8>,
     secret: Vec<u8>,
@@ -129,6 +130,7 @@ impl core::fmt::Display for IntakeError {
 impl std::error::Error for IntakeError {}
 
 /// Calling-card receiver: KEM keypair, Mailboxes, and Wires.
+#[derive(Clone)]
 pub struct Intake {
     keys: IntakeKeypair,
     mailboxes: Vec<Mailbox>,

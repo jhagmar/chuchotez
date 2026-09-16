@@ -15,7 +15,7 @@ for it. v1 pins HMAC-SHA-256 as the expand function, raw Deflate as compress,
 unpadded base64url as the QR alphabet, AES-256-GCM as the Notice AEAD, RFC 8785
 as canonical JSON, and the Intake KEM in `std_suite`: Classic X25519,
 PostQuantum ML-KEM-768, Hybrid X-Wing. The host may bind different
-implementations through `v1::Suite`. `try_new_invite` fails closed when the
+implementations through `v1::Suite`. `create_invite` fails closed when the
 suite cannot generate the engine’s `Policy`.
 
 ## Channels
@@ -59,9 +59,10 @@ uses `"webrtc"` / `"stun:stun.example"`.
 ## Invite
 
 `Invite` is the mint bundle: **Ticket** plus **Intake**.
-`Engine::try_new_invite` draws a `TicketSecret` (`Random32`) and a 64-byte
-`KemSeed` (two `Random32`) from `&impl Rng`. `Kem::generate` maps that seed to
-an `IntakeKeypair`. Equality compares Ticket and Intake. The Intake secret is
+`Engine::create_invite` draws a `ConversationId`, a `TicketSecret`
+(`Random32`), and a 64-byte `KemSeed` (two `Random32`) from `&dyn Rng`, then
+inserts `Inviter::InviteCreated`. `Kem::generate` maps that seed to an
+`IntakeKeypair`. Equality compares Ticket and Intake. The Intake secret is
 redacted in `Debug`.
 
 ### Ticket
@@ -84,9 +85,12 @@ fails closed. Layout version is the module (`v1` today).
 **Notice** is the Billboard body at the Tag. JSON members are `policy`,
 `intake_pk` (unpadded base64url), `mailboxes`, `wires`. Each mailbox and wire is
 `{ "kind", "address" }`. Unknown or missing members fail closed.
-`engine.serialize_notice(ticket, intake)` seals the blob.
-`engine.try_parse_notice(ticket, blob)` requires `policy` to match the engine
-and `intake_pk` length to match that Policy (32 / 1184 / 1216).
+`create_invite` Ok includes the compact Ticket string, the sealed Notice
+string, and the Billboard Tag. `receive_notice` opens a Notice blob; `policy`
+in the JSON is branded from the Notice. `intake_pk` length must match that
+Policy (32 / 1184 / 1216). Pass `accepted: &[engine.policy()]` when the host
+will continue only at this Engine’s Policy. A well-formed Notice whose Policy
+is outside `accepted` becomes `Failed::PolicyNotAccepted` (a logged `Ok`).
 
 ```
 key   = HKDF-Expand(Ticket bytes, info = "chuchotez/1/notice-aead-key")     // 32 bytes
@@ -105,14 +109,35 @@ Notice at the same Tag. Signatures and `MemberId` are a later slice.
 **Intake** is the calling-card receiver: `IntakeKeypair`, Mailboxes, and Wires.
 The inviter-only secret stays here.
 
-## Engine, Suite, and Rng
+## Engine, Suite, Rng, and EngineState
 
 A **Suite** is HMAC-SHA-256, raw Deflate, unpadded base64url, AES-256-GCM,
 RFC 8785, and the Intake KEM. An **Engine** is bound to one Suite and one
 `Policy`. The host constructs it with `v1::std_engine(Policy)` or
 `v1::Engine::new(suite, policy)`. Chuchotez stores no suite of its own.
 
-**Rng** is a host port. Engine methods that need entropy take `&impl Rng`.
+Public Engine methods drive or query `EngineState`. Hosts brand channels with
+`TryFrom` and `Billboard::new` (and mailbox/wire equivalents).
+
+`EngineState` is a map of `User` keyed by `UserId`. Each `User` is a map of
+`Identity` keyed by `IdentityId` (opaque 32 bytes at create; a later slice
+replaces this with the tagged digest of signature public keys). Each
+`Identity` holds `Option<DisplayName>` (`None` at create, UTF-8 cap
+`DISPLAY_NAME_MAX_LEN`) and a map of `Conversation` keyed by `ConversationId`.
+`Conversation` is `DirectMessage | Group | Synchronization`. `DirectMessage`
+is `Inviter | Invitee | Established | Failed`. This slice models
+`Inviter::{InviteCreated, NoticePinned}`, `Invitee::{TicketReceived,
+InviteReceived}`, and `Failed::PolicyNotAccepted`. `Group`,
+`Synchronization`, and `Established` are empty placeholders.
+
+A **Command** holds already-drawn artifacts. `apply` is deterministic.
+Successful named methods return sealed bytes: AES-256-GCM with the host DEK,
+nonce from `command_seq`, plaintext `deflate(RFC 8785)` with binaries as
+unpadded b64u. The host writes those bytes. `try_open_command` plus `apply`
+hydrates. Argon2 KEKs, a vault header, folded `EngineState` persist, and
+fold-and-truncate are a later slice.
+
+**Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`. Tests
 inject a seed. `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes.
 `KemSeed` is `KEM_SEED_LEN` (64) bytes from two `Random32` draws.
@@ -140,41 +165,46 @@ impl Rng for HostRng {
 }
 
 let engine: v1::Engine = v1::std_engine(v1::Policy::Classic);
-let board = engine.new_billboard(
-    engine.try_new_billboard_kind("nostr").expect("kind"),
-    engine
-        .try_new_billboard_address("wss://relay.example")
-        .expect("addr"),
+let board = v1::Billboard::new(
+    v1::BillboardKind::try_from("nostr").expect("kind"),
+    v1::BillboardAddress::try_from("wss://relay.example").expect("addr"),
 );
-let mailbox = engine.new_mailbox(
-    engine.try_new_mailbox_kind("nostr").expect("kind"),
-    engine
-        .try_new_mailbox_address("wss://mailbox.example")
-        .expect("addr"),
+let mailbox = v1::Mailbox::new(
+    v1::MailboxKind::try_from("nostr").expect("kind"),
+    v1::MailboxAddress::try_from("wss://mailbox.example").expect("addr"),
 );
-let wire = engine.new_wire(
-    engine.try_new_wire_kind("webrtc").expect("kind"),
-    engine
-        .try_new_wire_address("stun:stun.example")
-        .expect("addr"),
+let wire = v1::Wire::new(
+    v1::WireKind::try_from("webrtc").expect("kind"),
+    v1::WireAddress::try_from("stun:stun.example").expect("addr"),
 );
-let invite = engine
-    .try_new_invite(&HostRng, &[board], &[mailbox], &[wire])
-    .expect("invite");
-let ticket = invite.ticket();
-let intake = invite.intake();
-let tag = ticket.billboard_tag(&engine);
-let tag_key = ticket.mailbox_tag_key(&engine);
-let ticket_blob = ticket.serialize(&engine);
-let notice_blob = engine.serialize_notice(ticket, intake);
-let _ = (tag, tag_key, ticket_blob, notice_blob);
+let dek = v1::AeadKey::from_bytes([2; RANDOM32_LEN]);
+let (state, user_ok) = engine.create_user(v1::EngineState::new(), &HostRng, &dek);
+let user_id = user_ok.expect("user").user_id;
+let (state, id_ok) = engine.create_identity(state, &HostRng, &dek, user_id);
+let identity_id = id_ok.expect("identity").identity_id;
+let (state, invite_ok) = engine.create_invite(
+    state,
+    &HostRng,
+    &dek,
+    user_id,
+    identity_id,
+    std::slice::from_ref(&board),
+    std::slice::from_ref(&mailbox),
+    std::slice::from_ref(&wire),
+);
+let invite_ok = invite_ok.expect("invite");
+let ticket_blob = invite_ok.ticket_blob.clone();
+let notice_blob = invite_ok.notice_blob.clone();
+let tag = invite_ok.billboard_tag;
+let conversation_id = invite_ok.conversation_id;
+let _ = engine.mark_notices_pinned(state, &dek, user_id, identity_id, conversation_id);
+let _ = (tag, ticket_blob, notice_blob);
 ```
 
-The host shows `ticket_blob` as a QR or link. The invitee parses it, derives the
-Tag, looks up a mapper by Billboard `kind`, and fetches `notice_blob` at
-`address`. `engine.try_parse_notice(ticket, blob)` opens the Notice. Unknown
-`kind` skips to the next Billboard. Debug formatting of secrets, tags, keys, and
-Intake omits the raw bytes.
+The host shows `ticket_blob` as a QR or link after `NoticePinned`. The invitee
+calls `receive_ticket` with that blob, fetches the Notice, and calls
+`receive_notice`. Unknown Billboard `kind` skips to the next Billboard. Debug
+formatting of secrets, tags, keys, and Intake omits the raw bytes.
 
 ## Workspace
 
@@ -202,6 +232,7 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 - Pairwise streams, a group mesh, and Wire hop order after `Welcome`.
 - Group and Sync invite kinds (a Sync invite uses the compact envelope with a
   different kind byte).
-- Signed `FullInvite` and `MemberId`.
+- Argon2 KEKs, a vault header, folded `EngineState` persist, and
+  fold-and-truncate of the Command log.
 
 Chat and turn-based games remain host mappings onto these Channels.

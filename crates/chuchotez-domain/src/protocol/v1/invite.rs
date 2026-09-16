@@ -2,7 +2,7 @@
 
 use super::{Intake, IntakeError, KemError, Ticket, TicketError};
 
-/// Why [`super::Engine::try_new_invite`] failed.
+/// Why minting an Invite failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InviteError {
     /// Ticket Billboard list failed.
@@ -52,6 +52,7 @@ impl From<KemError> for InviteError {
 }
 
 /// Minted DM invite: Ticket and Intake.
+#[derive(Clone)]
 pub struct Invite {
     ticket: Ticket,
     intake: Intake,

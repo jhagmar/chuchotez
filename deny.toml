@@ -18,8 +18,12 @@ allow = [
 unused-allowed-license = "allow"
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
+skip = [
+    { crate = "shlex@1", reason = "bindgen 0.72 (crabgrind via libcrux-secrets) requires shlex 1; cc requires shlex 2" },
+    { crate = "syn@3", reason = "serde_derive (hax-lib-macros-types) requires syn 3; libcrux macros require syn 2" },
+]
 
 [sources]
 unknown-registry = "deny"
