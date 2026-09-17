@@ -1,47 +1,7 @@
 //! Shared kind and address grammar for Billboard, Mailbox, and Wire.
 
+use super::unicode::is_combining;
 use super::{ADDRESS_MAX_LEN, KIND_MAX_LEN};
-
-/// Combining-mark ranges (canonical combining class greater than zero).
-const COMBINING_RANGES: &[(u32, u32)] = &[
-    (0x0300, 0x036F),
-    (0x0483, 0x0489),
-    (0x0591, 0x05BD),
-    (0x05BF, 0x05BF),
-    (0x05C1, 0x05C2),
-    (0x05C4, 0x05C5),
-    (0x05C7, 0x05C7),
-    (0x0610, 0x061A),
-    (0x064B, 0x065F),
-    (0x0670, 0x0670),
-    (0x06D6, 0x06DC),
-    (0x06DF, 0x06E4),
-    (0x06E7, 0x06E8),
-    (0x06EA, 0x06ED),
-    (0x0711, 0x0711),
-    (0x0730, 0x074A),
-    (0x07A6, 0x07B0),
-    (0x07EB, 0x07F3),
-    (0x0816, 0x0819),
-    (0x081B, 0x0823),
-    (0x0825, 0x0827),
-    (0x0829, 0x082D),
-    (0x0859, 0x085B),
-    (0x08D3, 0x08E1),
-    (0x08E3, 0x0903),
-    (0x093A, 0x094F),
-    (0x0951, 0x0957),
-    (0x0962, 0x0963),
-    (0x1AB0, 0x1ACE),
-    (0x1DC0, 0x1DFF),
-    (0x20D0, 0x20F0),
-    (0xFE20, 0xFE2F),
-];
-
-pub(crate) fn is_combining(c: char) -> bool {
-    let u = u32::from(c);
-    COMBINING_RANGES.iter().any(|&(lo, hi)| u >= lo && u <= hi)
-}
 
 /// Why a mapper kind string was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,7 +91,7 @@ pub(crate) fn parse_address(value: &str) -> Result<String, AddressError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddressError, KindError, is_combining, parse_address, parse_kind};
+    use super::{AddressError, KindError, parse_address, parse_kind};
     use crate::protocol::v1::{ADDRESS_MAX_LEN, KIND_MAX_LEN};
 
     #[test]
@@ -170,10 +130,6 @@ mod tests {
             parse_address("cafe\u{0301}").unwrap_err(),
             AddressError::CombiningMark
         );
-        assert!(is_combining('\u{0301}'));
-        assert!(!is_combining('é'));
-        assert!(!is_combining('a'));
-        assert!(is_combining('\u{05BF}'));
         assert_eq!(parse_address("").unwrap_err(), AddressError::Empty);
         let long = "a".repeat(ADDRESS_MAX_LEN + 1);
         assert_eq!(

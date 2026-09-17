@@ -1,7 +1,7 @@
 //! Preferred display name on an [`super::Identity`].
 
 use super::DISPLAY_NAME_MAX_LEN;
-use crate::protocol::v1::channel;
+use crate::protocol::v1::unicode::is_combining;
 
 /// Why a display-name string was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,7 +56,7 @@ impl TryFrom<&str> for DisplayName {
         if value.chars().any(|c| c == '\0') {
             return Err(DisplayNameError::Nul);
         }
-        if value.chars().any(channel::is_combining) {
+        if value.chars().any(is_combining) {
             return Err(DisplayNameError::CombiningMark);
         }
         Ok(Self(value.to_owned()))
