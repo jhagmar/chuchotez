@@ -1,6 +1,6 @@
 //! Default portable v1 suite and engine.
 
-use crate::{AesGcm, Base64Ct, Deflate, LibcruxHmac, LibcruxKem, Rfc8785};
+use crate::{AesGcm, Base64Ct, Deflate, LibcruxHmac, LibcruxKem, LibcruxSign, Rfc8785};
 use chuchotez_domain::Policy;
 use chuchotez_domain::v1::{Engine, Suite};
 use std::sync::Arc;
@@ -15,6 +15,7 @@ pub fn std_suite() -> Suite {
         Arc::new(AesGcm),
         Arc::new(Rfc8785),
         Arc::new(LibcruxKem),
+        Arc::new(LibcruxSign),
     )
 }
 

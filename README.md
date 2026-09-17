@@ -22,57 +22,9 @@ chuchotez = { git = "https://github.com/jhagmar/chuchotez" }
 ```
 
 Construct a `v1::Engine` with `v1::std_engine(Policy)`. Pass `&dyn Rng`
-whenever the protocol needs entropy. The crate doctest is the sketch; fill
-`Random32` from a CSPRNG in a real host.
-
-```rust
-use chuchotez::v1;
-use chuchotez::{RANDOM32_LEN, Random32, Rng};
-
-struct HostRng;
-
-impl Rng for HostRng {
-    fn random32(&self) -> Random32 {
-        Random32::from_bytes([1; RANDOM32_LEN])
-    }
-}
-
-let engine: v1::Engine = v1::std_engine(v1::Policy::Classic);
-let board = v1::Billboard::new(
-    v1::BillboardKind::try_from("nostr").expect("kind"),
-    v1::BillboardAddress::try_from("wss://relay.example").expect("addr"),
-);
-let mailbox = v1::Mailbox::new(
-    v1::MailboxKind::try_from("nostr").expect("kind"),
-    v1::MailboxAddress::try_from("wss://mailbox.example").expect("addr"),
-);
-let wire = v1::Wire::new(
-    v1::WireKind::try_from("webrtc").expect("kind"),
-    v1::WireAddress::try_from("stun:stun.example").expect("addr"),
-);
-let dek = v1::AeadKey::from_bytes([2; RANDOM32_LEN]);
-let (state, user_ok) = engine.create_user(v1::EngineState::new(), &HostRng, &dek);
-let user_id = user_ok.expect("user").user_id;
-let (state, id_ok) = engine.create_identity(state, &HostRng, &dek, user_id);
-let identity_id = id_ok.expect("identity").identity_id;
-let (state, invite_ok) = engine.create_invite(
-    state,
-    &HostRng,
-    &dek,
-    user_id,
-    identity_id,
-    std::slice::from_ref(&board),
-    std::slice::from_ref(&mailbox),
-    std::slice::from_ref(&wire),
-);
-let invite_ok = invite_ok.expect("invite");
-let ticket_blob = invite_ok.ticket_blob.clone();
-let notice_blob = invite_ok.notice_blob.clone();
-let tag = invite_ok.billboard_tag;
-let conversation_id = invite_ok.conversation_id;
-let _ = engine.mark_notices_pinned(state, &dek, user_id, identity_id, conversation_id);
-let _ = (tag, ticket_blob, notice_blob);
-```
+whenever the protocol needs entropy. The crate doctest is the sketch:
+originate methods return the drawn id; write `PersistOk`, then Engine getters.
+Fill `Random32` from a CSPRNG in a real host.
 
 ## Workspace
 

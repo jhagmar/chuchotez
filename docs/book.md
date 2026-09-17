@@ -85,8 +85,9 @@ fails closed. Layout version is the module (`v1` today).
 **Notice** is the Billboard body at the Tag. JSON members are `policy`,
 `intake_pk` (unpadded base64url), `mailboxes`, `wires`. Each mailbox and wire is
 `{ "kind", "address" }`. Unknown or missing members fail closed.
-`create_invite` Ok includes the compact Ticket string, the sealed Notice
-string, and the Billboard Tag. `receive_notice` opens a Notice blob; `policy`
+After `create_invite`, Engine getters return the compact Ticket string, the
+sealed Notice string, and Billboard tags. `receive_notice` opens a Notice blob;
+`policy`
 in the JSON is branded from the Notice. `intake_pk` length must match that
 Policy (32 / 1184 / 1216). Pass `accepted: &[engine.policy()]` when the host
 will continue only at this Engine’s Policy. A well-formed Notice whose Policy
@@ -112,23 +113,28 @@ The inviter-only secret stays here.
 ## Engine, Suite, Rng, and EngineState
 
 A **Suite** is HMAC-SHA-256, raw Deflate, unpadded base64url, AES-256-GCM,
-RFC 8785, and the Intake KEM. An **Engine** is bound to one Suite and one
-`Policy`. The host constructs it with `v1::std_engine(Policy)` or
-`v1::Engine::new(suite, policy)`. Chuchotez stores no suite of its own.
+RFC 8785, the Intake KEM, and Sign generate. An **Engine** is bound to one
+Suite and one `Policy`. The host constructs it with `v1::std_engine(Policy)`
+or `v1::Engine::new(suite, policy)`. Chuchotez stores no suite of its own.
 
-Public Engine methods drive or query `EngineState`. Hosts brand channels with
-`TryFrom` and `Billboard::new` (and mailbox/wire equivalents).
+Public Engine methods drive or query `EngineState`. Mutators return
+`PersistOk`. `create_user`, `create_identity`, `create_invite`, and
+`receive_ticket` also return the drawn id. After a write, the host reads Ticket
+and Notice blobs, Billboard tags, and a CallingCard through Engine getters.
+Hosts brand channels with `TryFrom` and `Billboard::new` (and mailbox/wire
+equivalents).
 
 `EngineState` is a map of `User` keyed by `UserId`. Each `User` is a map of
 `Identity` keyed by `IdentityId` (opaque 32 bytes at create; a later slice
 replaces this with the tagged digest of signature public keys). Each
 `Identity` holds `Option<DisplayName>` (`None` at create, UTF-8 cap
-`DISPLAY_NAME_MAX_LEN`) and a map of `Conversation` keyed by `ConversationId`.
-`Conversation` is `DirectMessage | Group | Synchronization`. `DirectMessage`
-is `Inviter | Invitee | Established | Failed`. This slice models
+`DISPLAY_NAME_MAX_LEN`), Policy-matched encryption and signing keypairs, and
+a map of `Conversation` keyed by `ConversationId`. `Conversation` is
+`DirectMessage | Group | Synchronization`. `DirectMessage` is
+`Inviter | Invitee | Established | Failed`. This slice models
 `Inviter::{InviteCreated, NoticePinned}`, `Invitee::{TicketReceived,
-InviteReceived}`, and `Failed::PolicyNotAccepted`. `Group`,
-`Synchronization`, and `Established` are empty placeholders.
+InviteReceived, CallingCardCreated}`, and `Failed::PolicyNotAccepted`.
+`Group`, `Synchronization`, and `Established` are empty placeholders.
 
 A **Command** holds already-drawn artifacts. `apply` is deterministic.
 Successful named methods return sealed bytes: AES-256-GCM with the host DEK,
@@ -145,64 +151,18 @@ inject a seed. `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes.
 `v1::std_suite` ships HMAC-SHA-256 over `libcrux-hmac` (`LibcruxHmac`), raw
 Deflate over `flate2` (`miniz_oxide`, `Compression::best()`), unpadded base64url
 over `base64ct::Base64UrlUnpadded`, AES-256-GCM over `libcrux-aes`, RFC 8785 in
-`Rfc8785`, and Intake over `libcrux-kem` (`LibcruxKem`).
+`Rfc8785`, Intake over `libcrux-kem` (`LibcruxKem`), and Sign generate over
+`libcrux-ed25519` / `libcrux-ml-dsa` (`LibcruxSign`: Classic Ed25519,
+PostQuantum ML-DSA-65, Hybrid both concatenated). `SignSeed` is `SIGN_SEED_LEN`
+(64) bytes from two `Random32` draws.
 
 ## Call the library
 
-The facade crate is `chuchotez`. This example matches the crate doctest. Fill
-`Random32` from a CSPRNG in a real host.
-
-```rust
-use chuchotez::v1;
-use chuchotez::{RANDOM32_LEN, Random32, Rng};
-
-struct HostRng;
-
-impl Rng for HostRng {
-    fn random32(&self) -> Random32 {
-        Random32::from_bytes([1; RANDOM32_LEN])
-    }
-}
-
-let engine: v1::Engine = v1::std_engine(v1::Policy::Classic);
-let board = v1::Billboard::new(
-    v1::BillboardKind::try_from("nostr").expect("kind"),
-    v1::BillboardAddress::try_from("wss://relay.example").expect("addr"),
-);
-let mailbox = v1::Mailbox::new(
-    v1::MailboxKind::try_from("nostr").expect("kind"),
-    v1::MailboxAddress::try_from("wss://mailbox.example").expect("addr"),
-);
-let wire = v1::Wire::new(
-    v1::WireKind::try_from("webrtc").expect("kind"),
-    v1::WireAddress::try_from("stun:stun.example").expect("addr"),
-);
-let dek = v1::AeadKey::from_bytes([2; RANDOM32_LEN]);
-let (state, user_ok) = engine.create_user(v1::EngineState::new(), &HostRng, &dek);
-let user_id = user_ok.expect("user").user_id;
-let (state, id_ok) = engine.create_identity(state, &HostRng, &dek, user_id);
-let identity_id = id_ok.expect("identity").identity_id;
-let (state, invite_ok) = engine.create_invite(
-    state,
-    &HostRng,
-    &dek,
-    user_id,
-    identity_id,
-    std::slice::from_ref(&board),
-    std::slice::from_ref(&mailbox),
-    std::slice::from_ref(&wire),
-);
-let invite_ok = invite_ok.expect("invite");
-let ticket_blob = invite_ok.ticket_blob.clone();
-let notice_blob = invite_ok.notice_blob.clone();
-let tag = invite_ok.billboard_tag;
-let conversation_id = invite_ok.conversation_id;
-let _ = engine.mark_notices_pinned(state, &dek, user_id, identity_id, conversation_id);
-let _ = (tag, ticket_blob, notice_blob);
-```
-
-The host shows `ticket_blob` as a QR or link after `NoticePinned`. The invitee
-calls `receive_ticket` with that blob, fetches the Notice, and calls
+The facade crate is `chuchotez`. The crate doctest is the host sketch: pin
+from getter blobs; after `InviteReceived`, `set_display_name` and
+`create_calling_card`. Fill `Random32` from a CSPRNG in a real host. The host
+shows the Ticket blob as a QR or link after `NoticePinned`. The invitee calls
+`receive_ticket` with that blob, fetches the Notice, and calls
 `receive_notice`. Unknown Billboard `kind` skips to the next Billboard. Debug
 formatting of secrets, tags, keys, and Intake omits the raw bytes.
 
@@ -227,6 +187,7 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 
 ## Later slices
 
+- Wrap, sign, and send a CallingCard.
 - Fetching a Notice at a Billboard Tag over a mapper.
 - Expanding a Message-bin coordinate from a Tag Key and a time bin.
 - Pairwise streams, a group mesh, and Wire hop order after `Welcome`.

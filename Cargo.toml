@@ -25,6 +25,8 @@ base64ct = { version = "1.8", default-features = false, features = ["alloc"] }
 libcrux-hmac = "0.0.8"
 libcrux-aes = "0.0.9"
 libcrux-kem = "0.0.9"
+libcrux-ed25519 = "0.0.9"
+libcrux-ml-dsa = { version = "0.0.10", default-features = false, features = ["mldsa65"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

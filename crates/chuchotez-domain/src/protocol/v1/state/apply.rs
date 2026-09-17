@@ -37,6 +37,8 @@ fn apply_inner(state: &mut EngineState, command: &Command) -> Result<(), ApplyEr
         Command::CreateIdentity {
             user_id,
             identity_id,
+            encryption,
+            signing,
         } => {
             let user = user_mut(state, user_id)?;
             if user.identities().contains_key(identity_id) {
@@ -45,7 +47,10 @@ fn apply_inner(state: &mut EngineState, command: &Command) -> Result<(), ApplyEr
                     identity_id: *identity_id,
                 });
             }
-            user.identities_mut().insert(*identity_id, Identity::new());
+            user.identities_mut().insert(
+                *identity_id,
+                Identity::new(encryption.clone(), signing.clone()),
+            );
             Ok(())
         }
         Command::DeleteUser { user_id } => {
@@ -217,6 +222,34 @@ fn apply_inner(state: &mut EngineState, command: &Command) -> Result<(), ApplyEr
                 });
             };
             *conversation = Conversation::DirectMessage(DirectMessage::Failed(failed.clone()));
+            Ok(())
+        }
+        Command::CreateCallingCard {
+            user_id,
+            identity_id,
+            conversation_id,
+            card,
+        } => {
+            let identity = identity_mut(state, user_id, identity_id)?;
+            let conversation = conversation_mut(identity, user_id, identity_id, conversation_id)?;
+            let Conversation::DirectMessage(DirectMessage::Invitee(Invitee::InviteReceived {
+                ticket,
+                notice,
+            })) = conversation
+            else {
+                return Err(ApplyError::UnexpectedPhase {
+                    user_id: *user_id,
+                    identity_id: *identity_id,
+                    conversation_id: *conversation_id,
+                    found: conversation.phase(),
+                });
+            };
+            *conversation =
+                Conversation::DirectMessage(DirectMessage::Invitee(Invitee::CallingCardCreated {
+                    ticket: ticket.clone(),
+                    notice: notice.clone(),
+                    card: card.clone(),
+                }));
             Ok(())
         }
     }

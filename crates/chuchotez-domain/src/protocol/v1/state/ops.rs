@@ -1,125 +1,70 @@
 //! Named Engine methods that drive [`super::EngineState`].
 
 use super::{
-    ApplyError, Command, Conversation, ConversationId, CreateIdentityError, CreateInviteError,
-    CreateUserError, DeleteConversationError, DeleteIdentityError, DeleteUserError, DirectMessage,
-    DisplayName, EngineState, Failed, IdentityId, Invitee, MarkNoticesPinnedError, PersistError,
-    PersistedCommand, ReceiveNoticeError, ReceiveTicketError, SetDisplayNameError,
-    UnsetDisplayNameError, UserId,
+    ApplyError, CallingCard, Command, Conversation, ConversationId, CreateCallingCardError,
+    CreateIdentityError, CreateInviteError, CreateUserError, DeleteConversationError,
+    DeleteIdentityError, DeleteUserError, DirectMessage, DisplayName, EngineState, Failed,
+    IdentityId, Invitee, Inviter, MarkNoticesPinnedError, PersistError, PersistedCommand,
+    QueryError, ReceiveNoticeError, ReceiveTicketError, SetDisplayNameError, UnsetDisplayNameError,
+    UserId,
 };
-use crate::protocol::v1::{AeadKey, Billboard, BillboardTag, Mailbox, Wire, notice};
+use crate::protocol::v1::{
+    AeadKey, Billboard, BillboardTag, IdentityKemKeypair, Invite, KemSeed, Mailbox, SignSeed, Wire,
+    notice,
+};
 use crate::protocol::{Policy, Rng};
 
-/// Success from [`crate::protocol::v1::Engine::create_user`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateUserOk {
-    /// Drawn id.
-    pub user_id: UserId,
-    /// Sealed Command.
-    pub persist: PersistedCommand,
-}
-
-/// Success from [`crate::protocol::v1::Engine::create_identity`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateIdentityOk {
-    /// Drawn id.
-    pub identity_id: IdentityId,
-    /// Sealed Command.
-    pub persist: PersistedCommand,
-}
-
-/// Success from a delete or display-name Command.
+/// Success from a named method that drives [`EngineState`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistOk {
     /// Sealed Command.
     pub persist: PersistedCommand,
 }
 
-/// Success from [`crate::protocol::v1::Engine::create_invite`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateInviteOk {
-    /// Drawn conversation id.
-    pub conversation_id: ConversationId,
-    /// Sealed Command.
-    pub persist: PersistedCommand,
-    /// Compact Ticket blob for the host to present after pin.
-    pub ticket_blob: String,
-    /// Sealed Notice blob for the host to pin.
-    pub notice_blob: String,
-    /// Billboard Tag derived from the Ticket.
-    pub billboard_tag: BillboardTag,
-}
-
-/// Success from [`crate::protocol::v1::Engine::receive_ticket`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReceiveTicketOk {
-    /// Drawn conversation id.
-    pub conversation_id: ConversationId,
-    /// Sealed Command.
-    pub persist: PersistedCommand,
-}
-
-/// Success from [`crate::protocol::v1::Engine::receive_notice`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReceiveNoticeOk {
-    /// Policy was in the allowlist.
-    Accepted {
-        /// Sealed Command.
-        persist: PersistedCommand,
-    },
-    /// Policy was outside the allowlist. Conversation is [`super::Failed`].
-    Refused {
-        /// Sealed Command.
-        persist: PersistedCommand,
-        /// Policy published in the Notice.
-        found: Policy,
-    },
-}
-
-impl ReceiveNoticeOk {
-    /// Sealed Command for this outcome.
-    #[must_use]
-    pub fn persist(&self) -> &PersistedCommand {
-        match self {
-            Self::Accepted { persist } => persist,
-            Self::Refused { persist, .. } => persist,
-        }
-    }
-}
-
 impl crate::protocol::v1::Engine {
-    /// Insert a user. Draws [`UserId`] from `rng`.
+    /// Insert a user. Draws [`UserId`] from `rng` and returns it.
     pub fn create_user(
         &self,
         state: EngineState,
         rng: &dyn Rng,
         dek: &AeadKey,
-    ) -> (EngineState, Result<CreateUserOk, CreateUserError>) {
+    ) -> (EngineState, UserId, Result<PersistOk, CreateUserError>) {
         let user_id = UserId::from_random32(rng.random32());
         if state.user(&user_id).is_some() {
-            return (state, Err(CreateUserError::DuplicateUser(user_id)));
+            return (state, user_id, Err(CreateUserError::DuplicateUser(user_id)));
         }
-        let cmd = Command::CreateUser { user_id };
-        match self.commit(state, dek, &cmd) {
-            (state, Ok(persist)) => (state, Ok(CreateUserOk { user_id, persist })),
-            (state, Err(err)) => (state, Err(map_create_user(err))),
-        }
+        with_id(
+            user_id,
+            self.commit_persist(state, dek, Command::CreateUser { user_id })
+                .map_err_state(map_create_user),
+        )
     }
 
-    /// Insert an identity under `user_id`. Draws [`IdentityId`] from `rng`.
+    /// Insert an identity under `user_id`. Draws [`IdentityId`] and keypair seeds from `rng` and returns the id.
     pub fn create_identity(
         &self,
         state: EngineState,
         rng: &dyn Rng,
         dek: &AeadKey,
         user_id: UserId,
-    ) -> (EngineState, Result<CreateIdentityOk, CreateIdentityError>) {
+    ) -> (
+        EngineState,
+        IdentityId,
+        Result<PersistOk, CreateIdentityError>,
+    ) {
         let identity_id = IdentityId::from_random32(rng.random32());
         match state.user(&user_id) {
-            None => return (state, Err(CreateIdentityError::UnknownUser(user_id))),
+            None => {
+                return (
+                    state,
+                    identity_id,
+                    Err(CreateIdentityError::UnknownUser(user_id)),
+                );
+            }
             Some(user) if user.identity(&identity_id).is_some() => {
                 return (
                     state,
+                    identity_id,
                     Err(CreateIdentityError::DuplicateIdentity {
                         user_id,
                         identity_id,
@@ -128,20 +73,34 @@ impl crate::protocol::v1::Engine {
             }
             Some(_) => {}
         }
-        let cmd = Command::CreateIdentity {
-            user_id,
-            identity_id,
+        let kem_seed = KemSeed::from_pair(rng.random32(), rng.random32());
+        let intake = match self.kem().generate(self.policy(), &kem_seed) {
+            Ok(keys) => keys,
+            Err(err) => return (state, identity_id, Err(CreateIdentityError::Kem(err))),
         };
-        match self.commit(state, dek, &cmd) {
-            (state, Ok(persist)) => (
+        let encryption = IdentityKemKeypair::from_parts(
+            intake.public_bytes().to_vec(),
+            intake.secret_bytes().to_vec(),
+        );
+        let sign_seed = SignSeed::from_pair(rng.random32(), rng.random32());
+        let signing = match self.sign().generate(self.policy(), &sign_seed) {
+            Ok(keys) => keys,
+            Err(err) => return (state, identity_id, Err(CreateIdentityError::Sign(err))),
+        };
+        with_id(
+            identity_id,
+            self.commit_persist(
                 state,
-                Ok(CreateIdentityOk {
+                dek,
+                Command::CreateIdentity {
+                    user_id,
                     identity_id,
-                    persist,
-                }),
-            ),
-            (state, Err(err)) => (state, Err(map_create_identity(err))),
-        }
+                    encryption,
+                    signing,
+                },
+            )
+            .map_err_state(map_create_identity),
+        )
     }
 
     /// Remove a user and nested identities and conversations.
@@ -235,7 +194,8 @@ impl crate::protocol::v1::Engine {
         .map_err_state(map_unset_display_name)
     }
 
-    /// Mint an Invite into [`super::Inviter::InviteCreated`].
+    /// Mint an Invite into [`super::Inviter::InviteCreated`]. Returns the drawn
+    /// [`ConversationId`].
     #[allow(clippy::too_many_arguments)]
     pub fn create_invite(
         &self,
@@ -247,14 +207,25 @@ impl crate::protocol::v1::Engine {
         billboards: &[Billboard],
         mailboxes: &[Mailbox],
         wires: &[Wire],
-    ) -> (EngineState, Result<CreateInviteOk, CreateInviteError>) {
+    ) -> (
+        EngineState,
+        ConversationId,
+        Result<PersistOk, CreateInviteError>,
+    ) {
         let conversation_id = ConversationId::from_random32(rng.random32());
         match state.user(&user_id) {
-            None => return (state, Err(CreateInviteError::UnknownUser(user_id))),
+            None => {
+                return (
+                    state,
+                    conversation_id,
+                    Err(CreateInviteError::UnknownUser(user_id)),
+                );
+            }
             Some(user) => match user.identity(&identity_id) {
                 None => {
                     return (
                         state,
+                        conversation_id,
                         Err(CreateInviteError::UnknownIdentity {
                             user_id,
                             identity_id,
@@ -264,6 +235,7 @@ impl crate::protocol::v1::Engine {
                 Some(identity) if identity.conversation(&conversation_id).is_some() => {
                     return (
                         state,
+                        conversation_id,
                         Err(CreateInviteError::DuplicateConversation {
                             user_id,
                             identity_id,
@@ -276,30 +248,22 @@ impl crate::protocol::v1::Engine {
         }
         let invite = match self.try_new_invite(rng, billboards, mailboxes, wires) {
             Ok(invite) => invite,
-            Err(err) => return (state, Err(CreateInviteError::Invite(err))),
+            Err(err) => return (state, conversation_id, Err(CreateInviteError::Invite(err))),
         };
-        let ticket_blob = invite.ticket().serialize(self);
-        let notice_blob = self.serialize_notice(invite.ticket(), invite.intake());
-        let billboard_tag = invite.ticket().billboard_tag(self);
-        let cmd = Command::CreateInvite {
-            user_id,
-            identity_id,
+        with_id(
             conversation_id,
-            invite,
-        };
-        match self.commit(state, dek, &cmd) {
-            (state, Ok(persist)) => (
+            self.commit_persist(
                 state,
-                Ok(CreateInviteOk {
+                dek,
+                Command::CreateInvite {
+                    user_id,
+                    identity_id,
                     conversation_id,
-                    persist,
-                    ticket_blob,
-                    notice_blob,
-                    billboard_tag,
-                }),
-            ),
-            (state, Err(err)) => (state, Err(map_create_invite(err))),
-        }
+                    invite,
+                },
+            )
+            .map_err_state(map_create_invite),
+        )
     }
 
     /// Record that the Notice is pinned on every Billboard in the Invite.
@@ -324,6 +288,7 @@ impl crate::protocol::v1::Engine {
     }
 
     /// Parse a compact Ticket blob and insert [`super::Invitee::TicketReceived`].
+    /// Returns the drawn [`ConversationId`].
     pub fn receive_ticket(
         &self,
         state: EngineState,
@@ -332,18 +297,31 @@ impl crate::protocol::v1::Engine {
         user_id: UserId,
         identity_id: IdentityId,
         ticket_blob: &str,
-    ) -> (EngineState, Result<ReceiveTicketOk, ReceiveTicketError>) {
+    ) -> (
+        EngineState,
+        ConversationId,
+        Result<PersistOk, ReceiveTicketError>,
+    ) {
+        let conversation_id = ConversationId::from_random32(rng.random32());
         let ticket = match self.try_parse_ticket(ticket_blob) {
             Ok(ticket) => ticket,
-            Err(err) => return (state, Err(ReceiveTicketError::Ticket(err))),
+            Err(err) => {
+                return (state, conversation_id, Err(ReceiveTicketError::Ticket(err)));
+            }
         };
-        let conversation_id = ConversationId::from_random32(rng.random32());
         match state.user(&user_id) {
-            None => return (state, Err(ReceiveTicketError::UnknownUser(user_id))),
+            None => {
+                return (
+                    state,
+                    conversation_id,
+                    Err(ReceiveTicketError::UnknownUser(user_id)),
+                );
+            }
             Some(user) => match user.identity(&identity_id) {
                 None => {
                     return (
                         state,
+                        conversation_id,
                         Err(ReceiveTicketError::UnknownIdentity {
                             user_id,
                             identity_id,
@@ -353,6 +331,7 @@ impl crate::protocol::v1::Engine {
                 Some(identity) if identity.conversation(&conversation_id).is_some() => {
                     return (
                         state,
+                        conversation_id,
                         Err(ReceiveTicketError::DuplicateConversation {
                             user_id,
                             identity_id,
@@ -363,25 +342,23 @@ impl crate::protocol::v1::Engine {
                 Some(_) => {}
             },
         }
-        let cmd = Command::ReceiveTicket {
-            user_id,
-            identity_id,
+        with_id(
             conversation_id,
-            ticket,
-        };
-        match self.commit(state, dek, &cmd) {
-            (state, Ok(persist)) => (
+            self.commit_persist(
                 state,
-                Ok(ReceiveTicketOk {
+                dek,
+                Command::ReceiveTicket {
+                    user_id,
+                    identity_id,
                     conversation_id,
-                    persist,
-                }),
-            ),
-            (state, Err(err)) => (state, Err(map_receive_ticket(err))),
-        }
+                    ticket,
+                },
+            )
+            .map_err_state(map_receive_ticket),
+        )
     }
 
-    /// Open a Notice blob. Allowlist decides [`ReceiveNoticeOk::Accepted`] vs refuse.
+    /// Open a Notice blob. Allowlist decides InviteReceived vs [`super::Failed`].
     #[allow(clippy::too_many_arguments)]
     pub fn receive_notice(
         &self,
@@ -392,7 +369,7 @@ impl crate::protocol::v1::Engine {
         conversation_id: ConversationId,
         notice_blob: &str,
         accepted: &[Policy],
-    ) -> (EngineState, Result<ReceiveNoticeOk, ReceiveNoticeError>) {
+    ) -> (EngineState, Result<PersistOk, ReceiveNoticeError>) {
         let ticket = match lookup_conversation(&state, user_id, identity_id, conversation_id) {
             Lookup::Ok(Conversation::DirectMessage(DirectMessage::Invitee(
                 Invitee::TicketReceived { ticket },
@@ -452,17 +429,167 @@ impl crate::protocol::v1::Engine {
                 failed: Failed::PolicyNotAccepted { ticket, notice },
             }
         };
-        let accepted_ok = accepted.contains(&found);
         match self.commit(state, dek, &cmd) {
-            (state, Ok(persist)) => {
-                let ok = if accepted_ok {
-                    ReceiveNoticeOk::Accepted { persist }
-                } else {
-                    ReceiveNoticeOk::Refused { persist, found }
-                };
-                (state, Ok(ok))
-            }
+            (state, Ok(persist)) => (state, Ok(PersistOk { persist })),
             (state, Err(err)) => (state, Err(map_receive_notice(err))),
+        }
+    }
+
+    /// Mint a CallingCard from [`super::Invitee::InviteReceived`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_calling_card(
+        &self,
+        state: EngineState,
+        rng: &dyn Rng,
+        dek: &AeadKey,
+        user_id: UserId,
+        identity_id: IdentityId,
+        conversation_id: ConversationId,
+        mailboxes: &[Mailbox],
+        wires: &[Wire],
+    ) -> (EngineState, Result<PersistOk, CreateCallingCardError>) {
+        let identity = match state.user(&user_id) {
+            None => return (state, Err(CreateCallingCardError::UnknownUser(user_id))),
+            Some(user) => match user.identity(&identity_id) {
+                None => {
+                    return (
+                        state,
+                        Err(CreateCallingCardError::UnknownIdentity {
+                            user_id,
+                            identity_id,
+                        }),
+                    );
+                }
+                Some(identity) => identity,
+            },
+        };
+        match identity.conversation(&conversation_id) {
+            None => {
+                return (
+                    state,
+                    Err(CreateCallingCardError::UnknownConversation {
+                        user_id,
+                        identity_id,
+                        conversation_id,
+                    }),
+                );
+            }
+            Some(Conversation::DirectMessage(DirectMessage::Invitee(
+                Invitee::InviteReceived { .. },
+            ))) => {}
+            Some(found) => {
+                let found = found.phase();
+                return (
+                    state,
+                    Err(CreateCallingCardError::UnexpectedPhase {
+                        user_id,
+                        identity_id,
+                        conversation_id,
+                        found,
+                    }),
+                );
+            }
+        }
+        let display_name = match identity.display_name() {
+            Some(name) => name.clone(),
+            None => return (state, Err(CreateCallingCardError::UnsetDisplayName)),
+        };
+        let card = match self.try_new_calling_card(
+            rng,
+            display_name,
+            identity.encryption().public_bytes().to_vec(),
+            identity.signing().public_bytes().to_vec(),
+            mailboxes.to_vec(),
+            wires.to_vec(),
+        ) {
+            Ok(card) => card,
+            Err(err) => return (state, Err(CreateCallingCardError::CallingCard(err))),
+        };
+        self.commit_persist(
+            state,
+            dek,
+            Command::CreateCallingCard {
+                user_id,
+                identity_id,
+                conversation_id,
+                card,
+            },
+        )
+        .map_err_state(map_create_calling_card)
+    }
+
+    /// Compact Ticket string for an Inviter conversation.
+    pub fn ticket_blob(
+        &self,
+        state: &EngineState,
+        user_id: UserId,
+        identity_id: IdentityId,
+        conversation_id: ConversationId,
+    ) -> Result<String, QueryError> {
+        Ok(lookup_invite(state, user_id, identity_id, conversation_id)?
+            .ticket()
+            .serialize(self))
+    }
+
+    /// Sealed Notice string for an Inviter conversation.
+    pub fn notice_blob(
+        &self,
+        state: &EngineState,
+        user_id: UserId,
+        identity_id: IdentityId,
+        conversation_id: ConversationId,
+    ) -> Result<String, QueryError> {
+        let invite = lookup_invite(state, user_id, identity_id, conversation_id)?;
+        Ok(self.serialize_notice(invite.ticket(), invite.intake()))
+    }
+
+    /// Billboard tags, one per Billboard on the Ticket.
+    pub fn billboard_tags(
+        &self,
+        state: &EngineState,
+        user_id: UserId,
+        identity_id: IdentityId,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<BillboardTag>, QueryError> {
+        let invite = lookup_invite(state, user_id, identity_id, conversation_id)?;
+        let tag = invite.ticket().billboard_tag(self);
+        Ok(invite
+            .ticket()
+            .billboards()
+            .iter()
+            .map(|_| tag.clone())
+            .collect())
+    }
+
+    /// CallingCard for [`super::Invitee::CallingCardCreated`].
+    pub fn calling_card<'a>(
+        &self,
+        state: &'a EngineState,
+        user_id: UserId,
+        identity_id: IdentityId,
+        conversation_id: ConversationId,
+    ) -> Result<&'a CallingCard, QueryError> {
+        let _ = self;
+        match lookup_conversation(state, user_id, identity_id, conversation_id) {
+            Lookup::Ok(Conversation::DirectMessage(DirectMessage::Invitee(
+                Invitee::CallingCardCreated { card, .. },
+            ))) => Ok(card),
+            Lookup::UnknownUser => Err(QueryError::UnknownUser(user_id)),
+            Lookup::UnknownIdentity => Err(QueryError::UnknownIdentity {
+                user_id,
+                identity_id,
+            }),
+            Lookup::UnknownConversation => Err(QueryError::UnknownConversation {
+                user_id,
+                identity_id,
+                conversation_id,
+            }),
+            Lookup::Ok(found) => Err(QueryError::UnexpectedPhase {
+                user_id,
+                identity_id,
+                conversation_id,
+                found: found.phase(),
+            }),
         }
     }
 
@@ -498,6 +625,13 @@ impl crate::protocol::v1::Engine {
             (state, Err(err)) => (state, Err(err)),
         }
     }
+}
+
+fn with_id<Id, T, E>(
+    id: Id,
+    outcome: (EngineState, Result<T, E>),
+) -> (EngineState, Id, Result<T, E>) {
+    (outcome.0, id, outcome.1)
 }
 
 trait MapErrState<T, E> {
@@ -544,6 +678,35 @@ fn lookup_conversation(
                 Some(conversation) => Lookup::Ok(conversation),
             },
         },
+    }
+}
+
+fn lookup_invite(
+    state: &EngineState,
+    user_id: UserId,
+    identity_id: IdentityId,
+    conversation_id: ConversationId,
+) -> Result<&Invite, QueryError> {
+    match lookup_conversation(state, user_id, identity_id, conversation_id) {
+        Lookup::Ok(Conversation::DirectMessage(DirectMessage::Inviter(
+            Inviter::InviteCreated { invite } | Inviter::NoticePinned { invite },
+        ))) => Ok(invite),
+        Lookup::UnknownUser => Err(QueryError::UnknownUser(user_id)),
+        Lookup::UnknownIdentity => Err(QueryError::UnknownIdentity {
+            user_id,
+            identity_id,
+        }),
+        Lookup::UnknownConversation => Err(QueryError::UnknownConversation {
+            user_id,
+            identity_id,
+            conversation_id,
+        }),
+        Lookup::Ok(found) => Err(QueryError::UnexpectedPhase {
+            user_id,
+            identity_id,
+            conversation_id,
+            found: found.phase(),
+        }),
     }
 }
 
@@ -776,6 +939,42 @@ fn map_receive_notice(err: CommitError) -> ReceiveNoticeError {
     }
 }
 
+fn map_create_calling_card(err: CommitError) -> CreateCallingCardError {
+    match err {
+        CommitError::SeqOverflow => CreateCallingCardError::SeqOverflow,
+        CommitError::Persist(err) => CreateCallingCardError::Persist(err),
+        CommitError::Apply(ApplyError::UnknownUser(id)) => CreateCallingCardError::UnknownUser(id),
+        CommitError::Apply(ApplyError::UnknownIdentity {
+            user_id,
+            identity_id,
+        }) => CreateCallingCardError::UnknownIdentity {
+            user_id,
+            identity_id,
+        },
+        CommitError::Apply(ApplyError::UnknownConversation {
+            user_id,
+            identity_id,
+            conversation_id,
+        }) => CreateCallingCardError::UnknownConversation {
+            user_id,
+            identity_id,
+            conversation_id,
+        },
+        CommitError::Apply(ApplyError::UnexpectedPhase {
+            user_id,
+            identity_id,
+            conversation_id,
+            found,
+        }) => CreateCallingCardError::UnexpectedPhase {
+            user_id,
+            identity_id,
+            conversation_id,
+            found,
+        },
+        CommitError::Apply(_) => CreateCallingCardError::SeqOverflow,
+    }
+}
+
 #[cfg(test)]
 mod map_tests {
     use super::*;
@@ -827,7 +1026,7 @@ mod map_tests {
         let persist = PersistError::TooShort;
         for apply in every_apply() {
             let _ = format!(
-                "{}{}{}{}{}{}{}{}{}{}{}",
+                "{}{}{}{}{}{}{}{}{}{}{}{}",
                 map_create_user(CommitError::Apply(apply.clone())),
                 map_create_identity(CommitError::Apply(apply.clone())),
                 map_delete_user(CommitError::Apply(apply.clone())),
@@ -839,6 +1038,7 @@ mod map_tests {
                 map_mark_pinned(CommitError::Apply(apply.clone())),
                 map_receive_ticket(CommitError::Apply(apply.clone())),
                 map_receive_notice(CommitError::Apply(apply.clone())),
+                map_create_calling_card(CommitError::Apply(apply.clone())),
             );
         }
         let _ = (
@@ -863,7 +1063,9 @@ mod map_tests {
             map_receive_ticket(CommitError::SeqOverflow),
             map_receive_ticket(CommitError::Persist(persist.clone())),
             map_receive_notice(CommitError::SeqOverflow),
-            map_receive_notice(CommitError::Persist(persist)),
+            map_receive_notice(CommitError::Persist(persist.clone())),
+            map_create_calling_card(CommitError::SeqOverflow),
+            map_create_calling_card(CommitError::Persist(persist)),
         );
         let (u, i, c) = ids();
         assert!(!format!("{}", ApplyError::UnknownUser(u)).is_empty());

@@ -1,6 +1,7 @@
 //! Host-owned conversation state, Commands, and named Engine methods.
 
 mod apply;
+mod calling_card;
 mod command;
 mod display_name;
 mod errors;
@@ -12,17 +13,17 @@ mod tree;
 #[cfg(test)]
 mod flow;
 
+pub use calling_card::{CallingCard, CallingCardError};
 pub use command::Command;
 pub use display_name::{DisplayName, DisplayNameError};
 pub use errors::{
-    ApplyError, CreateIdentityError, CreateInviteError, CreateUserError, DeleteConversationError,
-    DeleteIdentityError, DeleteUserError, MarkNoticesPinnedError, PersistError, ReceiveNoticeError,
-    ReceiveTicketError, SetDisplayNameError, UnsetDisplayNameError,
+    ApplyError, CreateCallingCardError, CreateIdentityError, CreateInviteError, CreateUserError,
+    DeleteConversationError, DeleteIdentityError, DeleteUserError, MarkNoticesPinnedError,
+    PersistError, QueryError, ReceiveNoticeError, ReceiveTicketError, SetDisplayNameError,
+    UnsetDisplayNameError,
 };
 pub use ids::{ConversationId, IdentityId, UserId};
-pub use ops::{
-    CreateIdentityOk, CreateInviteOk, CreateUserOk, PersistOk, ReceiveNoticeOk, ReceiveTicketOk,
-};
+pub use ops::PersistOk;
 pub use persist::PersistedCommand;
 pub use tree::{
     Conversation, ConversationPhase, DirectMessage, EngineState, Established, Failed, Group,

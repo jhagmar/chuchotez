@@ -3,7 +3,8 @@
 use super::{
     AddressError, Billboard, BillboardAddress, BillboardKind, DisplayName, DisplayNameError,
     EnvelopeError, Intake, Invite, InviteError, KemSeed, KindError, Mailbox, MailboxAddress,
-    MailboxKind, Notice, NoticeError, Suite, Ticket, Wire, WireAddress, WireKind, notice,
+    MailboxKind, MailboxTagKey, Notice, NoticeError, Suite, Ticket, Wire, WireAddress, WireKind,
+    notice,
 };
 use crate::protocol::{Policy, Rng};
 
@@ -66,10 +67,16 @@ impl Engine {
         self.suite.canonical_json()
     }
 
-    /// Intake keypair generator.
+    /// Intake and identity encryption keypair generator.
     #[must_use]
     pub(crate) fn kem(&self) -> &dyn super::Kem {
         self.suite.kem()
+    }
+
+    /// Identity signing keypair generator.
+    #[must_use]
+    pub(crate) fn sign(&self) -> &dyn super::Sign {
+        self.suite.sign()
     }
 
     /// Parse and brand a Billboard mapper key.
@@ -152,6 +159,28 @@ impl Engine {
         let keys = self.kem().generate(self.policy, &seed)?;
         let intake = Intake::from_parts(keys, mailboxes.to_vec(), wires.to_vec())?;
         Ok(Invite::from_parts(ticket, intake))
+    }
+
+    /// Mint a CallingCard: display name, identity public keys, fresh mailbox tag, channels.
+    pub(crate) fn try_new_calling_card(
+        &self,
+        rng: &dyn Rng,
+        display_name: DisplayName,
+        encryption_pk: Vec<u8>,
+        signing_pk: Vec<u8>,
+        mailboxes: Vec<Mailbox>,
+        wires: Vec<Wire>,
+    ) -> Result<super::CallingCard, super::CallingCardError> {
+        let _ = self;
+        let mailbox_tag_key = MailboxTagKey::from_bytes(rng.random32().into_bytes());
+        super::CallingCard::from_parts(
+            display_name,
+            encryption_pk,
+            signing_pk,
+            mailbox_tag_key,
+            mailboxes,
+            wires,
+        )
     }
 
     /// Parse a compact DM Ticket blob using this engine's codecs.
@@ -254,6 +283,19 @@ mod tests {
                 .unwrap_err(),
             InviteError::Intake(crate::protocol::v1::IntakeError::EmptyMailboxes)
         );
+        assert_eq!(
+            engine
+                .try_new_calling_card(
+                    &SeedRng([3; SECRET_LEN]),
+                    engine.try_new_display_name("Ada").expect("name"),
+                    vec![1],
+                    vec![2],
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap_err(),
+            crate::protocol::v1::CallingCardError::EmptyMailboxes
+        );
         let _ = engine.clone();
         let key = crate::protocol::v1::HmacSha256Key::from_bytes([0; SECRET_LEN]);
         let _ = engine.hmac().mac(&key, b"");
@@ -265,5 +307,6 @@ mod tests {
         let _ = engine
             .canonical_json()
             .encode(&crate::protocol::v1::Json::Null);
+        let _ = engine.sign();
     }
 }
