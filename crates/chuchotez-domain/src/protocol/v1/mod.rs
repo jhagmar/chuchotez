@@ -19,6 +19,7 @@ mod notice;
 mod state;
 mod suite;
 mod ticket;
+mod unicode;
 mod wire;
 
 #[cfg(test)]
