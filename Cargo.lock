@@ -113,8 +113,10 @@ dependencies = [
  "chuchotez-domain",
  "flate2",
  "libcrux-aes",
+ "libcrux-ed25519",
  "libcrux-hmac",
  "libcrux-kem",
+ "libcrux-ml-dsa",
 ]
 
 [[package]]
@@ -342,6 +344,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libcrux-ed25519"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc463d32f41c47e03dc664547596928a13cb3d79c03453a9b3fe654649313982"
+dependencies = [
+ "libcrux-hacl-rs",
+ "libcrux-macros",
+ "libcrux-sha2",
+]
+
+[[package]]
 name = "libcrux-hacl-rs"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -395,6 +408,21 @@ checksum = "ffd6aa2dcd5be681662001b81d493f1569c6d49a32361f470b0c955465cd0338"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "libcrux-ml-dsa"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "783ebed7cb27de6d44ef2aa662648d1a0869694f2f754f2f1ed45e959ef3b48e"
+dependencies = [
+ "core-models",
+ "hax-lib",
+ "libcrux-intrinsics",
+ "libcrux-macros",
+ "libcrux-platform",
+ "libcrux-secrets",
+ "libcrux-sha3",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
 name = "chuchotez-adapters"
-description = "Shipped pure adapters for Chuchotez (libcrux HMAC-SHA-256, AES-256-GCM, and KEM; raw Deflate; unpadded base64url; RFC 8785)"
+description = "Shipped pure adapters for Chuchotez (libcrux HMAC-SHA-256, AES-256-GCM, KEM, Ed25519, and ML-DSA-65; raw Deflate; unpadded base64url; RFC 8785)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,8 @@ flate2.workspace = true
 libcrux-hmac.workspace = true
 libcrux-aes.workspace = true
 libcrux-kem.workspace = true
+libcrux-ed25519.workspace = true
+libcrux-ml-dsa.workspace = true
 
 [lints]
 workspace = true

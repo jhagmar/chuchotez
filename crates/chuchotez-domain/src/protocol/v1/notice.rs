@@ -771,6 +771,7 @@ mod tests {
                 Arc::new(ExpandingOpenAead),
                 Arc::new(fixtures::DetJson),
                 Arc::new(fixtures::EchoKem),
+                Arc::new(fixtures::EchoSign),
             ),
             Policy::Hybrid,
         );

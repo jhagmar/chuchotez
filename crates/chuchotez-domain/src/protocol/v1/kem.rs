@@ -80,6 +80,47 @@ pub struct IntakeKeypair {
     secret: Vec<u8>,
 }
 
+/// Public and secret KEM bytes for an [`super::Identity`].
+#[derive(Clone)]
+pub struct IdentityKemKeypair {
+    public: Vec<u8>,
+    secret: Vec<u8>,
+}
+
+impl IdentityKemKeypair {
+    /// Wrap public and secret key bytes from a KEM adapter.
+    #[must_use]
+    pub fn from_parts(public: Vec<u8>, secret: Vec<u8>) -> Self {
+        Self { public, secret }
+    }
+
+    /// Encapsulation-key bytes.
+    #[must_use]
+    pub fn public_bytes(&self) -> &[u8] {
+        &self.public
+    }
+
+    /// Decapsulation-key bytes.
+    #[must_use]
+    pub fn secret_bytes(&self) -> &[u8] {
+        &self.secret
+    }
+}
+
+impl PartialEq for IdentityKemKeypair {
+    fn eq(&self, other: &Self) -> bool {
+        self.public == other.public && self.secret == other.secret
+    }
+}
+
+impl Eq for IdentityKemKeypair {}
+
+impl core::fmt::Debug for IdentityKemKeypair {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("IdentityKemKeypair(..)")
+    }
+}
+
 impl IntakeKeypair {
     /// Wrap public and secret key bytes from a KEM adapter.
     #[must_use]
@@ -340,5 +381,10 @@ mod tests {
         assert_eq!(intake_pk_len(Policy::Classic), 32);
         assert_eq!(intake_pk_len(Policy::PostQuantum), 1184);
         assert_eq!(intake_pk_len(Policy::Hybrid), 1216);
+        let id_keys = super::IdentityKemKeypair::from_parts(vec![9], vec![8]);
+        assert_eq!(id_keys.public_bytes(), &[9]);
+        assert_eq!(id_keys.secret_bytes(), &[8]);
+        assert_eq!(format!("{id_keys:?}"), "IdentityKemKeypair(..)");
+        assert_eq!(id_keys, id_keys.clone());
     }
 }

@@ -8,6 +8,7 @@ mod compress;
 mod hmac;
 mod json;
 mod kem;
+mod sign;
 pub mod v1;
 
 pub use aead::AesGcm;
@@ -16,3 +17,4 @@ pub use compress::Deflate;
 pub use hmac::LibcruxHmac;
 pub use json::Rfc8785;
 pub use kem::LibcruxKem;
+pub use sign::LibcruxSign;

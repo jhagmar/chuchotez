@@ -1,9 +1,9 @@
 //! v1 capability bag.
 
-use super::{Aead, Base64Url, CanonicalJson, Compress, HmacSha256, Kem};
+use super::{Aead, Base64Url, CanonicalJson, Compress, HmacSha256, Kem, Sign};
 use std::sync::Arc;
 
-/// HMAC, compress, b64u, AEAD, canonical JSON, and KEM a host binds to a v1 [`super::Engine`].
+/// HMAC, compress, b64u, AEAD, canonical JSON, KEM, and Sign a host binds to a v1 [`super::Engine`].
 #[derive(Clone)]
 pub struct Suite {
     hmac: Arc<dyn HmacSha256 + Send + Sync>,
@@ -12,6 +12,7 @@ pub struct Suite {
     aead: Arc<dyn Aead + Send + Sync>,
     json: Arc<dyn CanonicalJson + Send + Sync>,
     kem: Arc<dyn Kem + Send + Sync>,
+    sign: Arc<dyn Sign + Send + Sync>,
 }
 
 impl Suite {
@@ -24,6 +25,7 @@ impl Suite {
         aead: Arc<dyn Aead + Send + Sync>,
         json: Arc<dyn CanonicalJson + Send + Sync>,
         kem: Arc<dyn Kem + Send + Sync>,
+        sign: Arc<dyn Sign + Send + Sync>,
     ) -> Self {
         Self {
             hmac,
@@ -32,6 +34,7 @@ impl Suite {
             aead,
             json,
             kem,
+            sign,
         }
     }
 
@@ -65,16 +68,24 @@ impl Suite {
         &*self.json
     }
 
-    /// Intake keypair generator.
+    /// Intake and identity encryption keypair generator.
     #[must_use]
     pub(crate) fn kem(&self) -> &dyn Kem {
         &*self.kem
+    }
+
+    /// Identity signing keypair generator.
+    #[must_use]
+    pub(crate) fn sign(&self) -> &dyn Sign {
+        &*self.sign
     }
 }
 
 impl core::fmt::Debug for Suite {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("Suite { hmac: .., compress: .., b64u: .., aead: .., json: .., kem: .. }")
+        f.write_str(
+            "Suite { hmac: .., compress: .., b64u: .., aead: .., json: .., kem: .., sign: .. }",
+        )
     }
 }
 
@@ -85,7 +96,8 @@ mod tests {
     use crate::protocol::v1::{
         Aead, AeadError, AeadKey, AeadNonce, Base64Url, Base64UrlError, CanonicalJson,
         CanonicalJsonError, Compress, CompressError, HmacSha256, HmacSha256Key, HmacSha256Mac,
-        IntakeKeypair, Json, KEM_SEED_LEN, Kem, KemError, KemSeed, SECRET_LEN,
+        IdentitySignKeypair, IntakeKeypair, Json, KEM_SEED_LEN, Kem, KemError, KemSeed, SECRET_LEN,
+        SIGN_SEED_LEN, Sign, SignError, SignSeed,
     };
     use std::sync::Arc;
 
@@ -169,6 +181,18 @@ mod tests {
         }
     }
 
+    struct EmptySign;
+
+    impl Sign for EmptySign {
+        fn generate(
+            &self,
+            policy: Policy,
+            _seed: &SignSeed,
+        ) -> Result<IdentitySignKeypair, SignError> {
+            Err(SignError::UnsupportedPolicy(policy))
+        }
+    }
+
     fn suite() -> Suite {
         Suite::new(
             Arc::new(ConstHmac(1)),
@@ -177,6 +201,7 @@ mod tests {
             Arc::new(EmptyAead),
             Arc::new(EmptyJson),
             Arc::new(EmptyKem),
+            Arc::new(EmptySign),
         )
     }
 
@@ -185,7 +210,7 @@ mod tests {
         let suite = suite();
         assert_eq!(
             format!("{suite:?}"),
-            "Suite { hmac: .., compress: .., b64u: .., aead: .., json: .., kem: .. }"
+            "Suite { hmac: .., compress: .., b64u: .., aead: .., json: .., kem: .., sign: .. }"
         );
         assert_eq!(
             suite
@@ -225,6 +250,13 @@ mod tests {
                 .generate(Policy::Hybrid, &KemSeed::from_bytes([0; KEM_SEED_LEN]))
                 .unwrap_err(),
             KemError::UnsupportedPolicy(Policy::Hybrid)
+        );
+        assert_eq!(
+            suite
+                .sign()
+                .generate(Policy::Hybrid, &SignSeed::from_bytes([0; SIGN_SEED_LEN]))
+                .unwrap_err(),
+            SignError::UnsupportedPolicy(Policy::Hybrid)
         );
         let _ = suite.clone();
     }

@@ -3,8 +3,9 @@
 use super::{
     Aead, AeadError, AeadKey, AeadNonce, Base64Url, Base64UrlError, Billboard, BillboardAddress,
     BillboardKind, CanonicalJson, CanonicalJsonError, Compress, CompressError, Engine, HmacSha256,
-    HmacSha256Key, HmacSha256Mac, IntakeKeypair, Json, Kem, KemError, KemSeed, Mailbox,
-    MailboxAddress, MailboxKind, Policy, SECRET_LEN, Suite, Ticket, Wire, WireAddress, WireKind,
+    HmacSha256Key, HmacSha256Mac, IdentitySignKeypair, IntakeKeypair, Json, Kem, KemError, KemSeed,
+    Mailbox, MailboxAddress, MailboxKind, Policy, SECRET_LEN, Sign, SignError, SignSeed, Suite,
+    Ticket, Wire, WireAddress, WireKind, sign_pk_len,
 };
 use crate::protocol::{Random32, Rng};
 use std::cell::Cell;
@@ -477,6 +478,43 @@ impl Kem for EchoKem {
     }
 }
 
+/// Echoes seed bytes as a policy-sized signing keypair.
+pub(crate) struct EchoSign;
+
+impl Sign for EchoSign {
+    fn generate(&self, policy: Policy, seed: &SignSeed) -> Result<IdentitySignKeypair, SignError> {
+        let seed32 = &seed.as_bytes()[..SECRET_LEN];
+        let n = sign_pk_len(policy);
+        let mut public = vec![0u8; n];
+        for (i, byte) in public.iter_mut().enumerate() {
+            *byte = seed32[i % SECRET_LEN];
+        }
+        Ok(IdentitySignKeypair::from_parts(public, seed32.to_vec()))
+    }
+}
+
+/// Always fails [`Kem::generate`].
+pub(crate) struct FailingKem;
+
+impl Kem for FailingKem {
+    fn generate(&self, policy: Policy, _seed: &KemSeed) -> Result<IntakeKeypair, KemError> {
+        Err(KemError::UnsupportedPolicy(policy))
+    }
+}
+
+/// Always fails [`Sign::generate`].
+pub(crate) struct FailingSign;
+
+impl Sign for FailingSign {
+    fn generate(
+        &self,
+        _policy: Policy,
+        _seed: &SignSeed,
+    ) -> Result<IdentitySignKeypair, SignError> {
+        Err(SignError::KeyGen)
+    }
+}
+
 pub(crate) fn engine_with(
     compress: Arc<dyn Compress + Send + Sync>,
     b64u: Arc<dyn Base64Url + Send + Sync>,
@@ -489,6 +527,7 @@ pub(crate) fn engine_with(
             Arc::new(XorAead),
             Arc::new(DetJson),
             Arc::new(EchoKem),
+            Arc::new(EchoSign),
         ),
         Policy::Hybrid,
     )
@@ -507,6 +546,7 @@ pub(crate) fn engine_custom(
             aead,
             json,
             Arc::new(EchoKem),
+            Arc::new(EchoSign),
         ),
         Policy::Hybrid,
     )
@@ -525,6 +565,7 @@ pub(crate) fn engine_with_policy(policy: Policy) -> Engine {
             Arc::new(XorAead),
             Arc::new(DetJson),
             Arc::new(EchoKem),
+            Arc::new(EchoSign),
         ),
         policy,
     )
@@ -559,6 +600,25 @@ pub(crate) fn engine_with_hmac(hmac: Arc<dyn HmacSha256 + Send + Sync>) -> Engin
             Arc::new(XorAead),
             Arc::new(DetJson),
             Arc::new(EchoKem),
+            Arc::new(EchoSign),
+        ),
+        Policy::Hybrid,
+    )
+}
+
+pub(crate) fn engine_with_kem_sign(
+    kem: Arc<dyn Kem + Send + Sync>,
+    sign: Arc<dyn Sign + Send + Sync>,
+) -> Engine {
+    Engine::new(
+        Suite::new(
+            Arc::new(XorHmac),
+            Arc::new(IdentityCompress),
+            Arc::new(HexB64),
+            Arc::new(XorAead),
+            Arc::new(DetJson),
+            kem,
+            sign,
         ),
         Policy::Hybrid,
     )

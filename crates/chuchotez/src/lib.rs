@@ -37,11 +37,9 @@
 //! assert_eq!(board.address().as_str(), "wss://relay.example");
 //!
 //! let dek = v1::AeadKey::from_bytes([2; RANDOM32_LEN]);
-//! let (state, user_ok) = engine.create_user(v1::EngineState::new(), &HostRng, &dek);
-//! let user_id = user_ok.expect("user").user_id;
-//! let (state, id_ok) = engine.create_identity(state, &HostRng, &dek, user_id);
-//! let identity_id = id_ok.expect("identity").identity_id;
-//! let (state, invite_ok) = engine.create_invite(
+//! let (state, user_id, _) = engine.create_user(v1::EngineState::new(), &HostRng, &dek);
+//! let (state, identity_id, _) = engine.create_identity(state, &HostRng, &dek, user_id);
+//! let (state, conversation_id, _) = engine.create_invite(
 //!     state,
 //!     &HostRng,
 //!     &dek,
@@ -51,16 +49,40 @@
 //!     std::slice::from_ref(&mailbox),
 //!     std::slice::from_ref(&wire),
 //! );
-//! let invite_ok = invite_ok.expect("invite");
-//! let ticket_blob = invite_ok.ticket_blob.clone();
-//! let notice_blob = invite_ok.notice_blob.clone();
-//! let tag = invite_ok.billboard_tag;
-//! let conversation_id = invite_ok.conversation_id;
+//! let ticket_blob = engine
+//!     .ticket_blob(&state, user_id, identity_id, conversation_id)
+//!     .expect("ticket");
+//! let notice_blob = engine
+//!     .notice_blob(&state, user_id, identity_id, conversation_id)
+//!     .expect("notice");
+//! let tags = engine
+//!     .billboard_tags(&state, user_id, identity_id, conversation_id)
+//!     .expect("tags");
 //! let (state, _) = engine.mark_notices_pinned(state, &dek, user_id, identity_id, conversation_id);
-//! let _ = (state, tag.as_bytes(), ticket_blob, notice_blob);
+//! let (invitee, iu, _) = engine.create_user(v1::EngineState::new(), &HostRng, &dek);
+//! let (invitee, ii, _) = engine.create_identity(invitee, &HostRng, &dek, iu);
+//! let (invitee, icid, _) = engine.receive_ticket(invitee, &HostRng, &dek, iu, ii, &ticket_blob);
+//! let (invitee, _) =
+//!     engine.receive_notice(invitee, &dek, iu, ii, icid, &notice_blob, &[v1::Policy::Classic]);
+//! let name = engine.try_new_display_name("Ada").expect("name");
+//! let (invitee, _) = engine.set_display_name(invitee, &dek, iu, ii, name);
+//! let (invitee, _) = engine.create_calling_card(
+//!     invitee,
+//!     &HostRng,
+//!     &dek,
+//!     iu,
+//!     ii,
+//!     icid,
+//!     std::slice::from_ref(&mailbox),
+//!     std::slice::from_ref(&wire),
+//! );
+//! let _ = engine.calling_card(&invitee, iu, ii, icid).expect("card");
+//! let _ = (state, tags[0].as_bytes(), ticket_blob, notice_blob);
 //! ```
 
-pub use chuchotez_adapters::{AesGcm, Base64Ct, Deflate, LibcruxHmac, LibcruxKem, Rfc8785};
+pub use chuchotez_adapters::{
+    AesGcm, Base64Ct, Deflate, LibcruxHmac, LibcruxKem, LibcruxSign, Rfc8785,
+};
 pub use chuchotez_domain::{Policy, RANDOM32_LEN, Random32, Random32Bytes, Rng, VERSION, protocol};
 
 /// First on-wire layout: engine, Invite, and portable adapters.
@@ -121,11 +143,11 @@ mod tests {
         let rng = CounterRng::new();
         let dek = dek();
         let (board, mailbox, wire) = channels(&engine);
-        let (state, user_ok) = engine.create_user(v1::EngineState::new(), &rng, &dek);
-        let user_id = user_ok.expect("user").user_id;
-        let (state, id_ok) = engine.create_identity(state, &rng, &dek, user_id);
-        let identity_id = id_ok.expect("identity").identity_id;
-        let (state, invite_ok) = engine.create_invite(
+        let (state, user_id, user_ok) = engine.create_user(v1::EngineState::new(), &rng, &dek);
+        user_ok.expect("user");
+        let (state, identity_id, id_ok) = engine.create_identity(state, &rng, &dek, user_id);
+        id_ok.expect("identity");
+        let (state, conversation_id, invite_ok) = engine.create_invite(
             state,
             &rng,
             &dek,
@@ -137,10 +159,15 @@ mod tests {
         );
         let invite_ok = invite_ok.expect("invite");
         assert_eq!(format!("{:?}", invite_ok.persist), "PersistedCommand(..)");
-        let ticket_blob = invite_ok.ticket_blob.clone();
-        let notice_blob = invite_ok.notice_blob.clone();
-        let tag = invite_ok.billboard_tag;
-        let conversation_id = invite_ok.conversation_id;
+        let ticket_blob = engine
+            .ticket_blob(&state, user_id, identity_id, conversation_id)
+            .expect("ticket");
+        let notice_blob = engine
+            .notice_blob(&state, user_id, identity_id, conversation_id)
+            .expect("notice");
+        let tags = engine
+            .billboard_tags(&state, user_id, identity_id, conversation_id)
+            .expect("tags");
         let (state, pin) =
             engine.mark_notices_pinned(state, &dek, user_id, identity_id, conversation_id);
         pin.expect("pin");
@@ -155,19 +182,19 @@ mod tests {
                 .phase(),
             v1::ConversationPhase::InviterNoticePinned
         );
-        assert_ne!(tag.as_bytes(), &[0u8; RANDOM32_LEN]);
+        assert_ne!(tags[0].as_bytes(), &[0u8; RANDOM32_LEN]);
         assert!(!ticket_blob.contains('='));
 
         let rng = CounterRng::new();
-        let (invitee, ok) = engine.create_user(v1::EngineState::new(), &rng, &dek);
-        let iu = ok.expect("iu").user_id;
-        let (invitee, ok) = engine.create_identity(invitee, &rng, &dek, iu);
-        let ii = ok.expect("ii").identity_id;
-        let (invitee, ok) = engine.receive_ticket(invitee, &rng, &dek, iu, ii, &ticket_blob);
-        let cid = ok.expect("t").conversation_id;
+        let (invitee, iu, ok) = engine.create_user(v1::EngineState::new(), &rng, &dek);
+        ok.expect("iu");
+        let (invitee, ii, ok) = engine.create_identity(invitee, &rng, &dek, iu);
+        ok.expect("ii");
+        let (invitee, cid, ok) = engine.receive_ticket(invitee, &rng, &dek, iu, ii, &ticket_blob);
+        ok.expect("t");
         let (invitee, ok) =
             engine.receive_notice(invitee, &dek, iu, ii, cid, &notice_blob, &[Policy::Classic]);
-        let persist = ok.expect("n").persist().clone();
+        let persist = ok.expect("n").persist.clone();
         let cmd = engine
             .try_open_command(&dek, persist.as_bytes())
             .expect("open");
@@ -188,6 +215,19 @@ mod tests {
         let name = v1::DisplayName::try_from("Ada").expect("name");
         let (invitee, set_ok) = engine.set_display_name(invitee, &dek, iu, ii, name);
         set_ok.expect("set");
+        let (invitee, card_ok) = engine.create_calling_card(
+            invitee,
+            &rng,
+            &dek,
+            iu,
+            ii,
+            cid,
+            std::slice::from_ref(&mailbox),
+            std::slice::from_ref(&wire),
+        );
+        card_ok.expect("card");
+        let card = engine.calling_card(&invitee, iu, ii, cid).expect("get");
+        assert_eq!(card.display_name().as_str(), "Ada");
         let (invitee, unset_ok) = engine.unset_display_name(invitee, &dek, iu, ii);
         unset_ok.expect("unset");
         let (invitee, del_c) = engine.delete_conversation(invitee, &dek, iu, ii, cid);
@@ -206,11 +246,11 @@ mod tests {
         let hybrid = v1::std_engine(Policy::Hybrid);
         let rng = CounterRng::new();
         let (board, mailbox, _) = channels(&hybrid);
-        let (state, ok) = hybrid.create_user(v1::EngineState::new(), &rng, &dek);
-        let uid = ok.expect("hu").user_id;
-        let (state, ok) = hybrid.create_identity(state, &rng, &dek, uid);
-        let iid = ok.expect("hi").identity_id;
-        let (_, ok) = hybrid.create_invite(
+        let (state, uid, ok) = hybrid.create_user(v1::EngineState::new(), &rng, &dek);
+        ok.expect("hu");
+        let (state, iid, ok) = hybrid.create_identity(state, &rng, &dek, uid);
+        ok.expect("hi");
+        let (state, cid, ok) = hybrid.create_invite(
             state,
             &rng,
             &dek,
@@ -220,7 +260,8 @@ mod tests {
             std::slice::from_ref(&mailbox),
             &[],
         );
-        let notice_blob = ok.expect("hinv").notice_blob;
+        ok.expect("hinv");
+        let notice_blob = hybrid.notice_blob(&state, uid, iid, cid).expect("hn");
         assert!(notice_blob.len() > 8);
     }
 }

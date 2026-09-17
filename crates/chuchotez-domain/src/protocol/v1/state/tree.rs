@@ -1,7 +1,8 @@
 //! Host-owned conversation tree: users, identities, conversations.
 
+use super::CallingCard;
 use super::{ConversationId, DisplayName, IdentityId, UserId};
-use crate::protocol::v1::{Invite, Notice, Ticket};
+use crate::protocol::v1::{IdentityKemKeypair, IdentitySignKeypair, Invite, Notice, Ticket};
 use std::collections::BTreeMap;
 
 /// Host-owned handle tree. Mutations go through [`crate::protocol::v1::Engine`] methods.
@@ -79,22 +80,41 @@ impl User {
     }
 }
 
-/// Local persona. Public keys wait for the signature-key slice.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Local persona with Policy-matched encryption and signing keypairs.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Identity {
     display_name: Option<DisplayName>,
+    encryption: IdentityKemKeypair,
+    signing: IdentitySignKeypair,
     conversations: BTreeMap<ConversationId, Conversation>,
 }
 
 impl Identity {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(encryption: IdentityKemKeypair, signing: IdentitySignKeypair) -> Self {
+        Self {
+            display_name: None,
+            encryption,
+            signing,
+            conversations: BTreeMap::new(),
+        }
     }
 
     /// Preferred display name. `None` at create.
     #[must_use]
     pub const fn display_name(&self) -> Option<&DisplayName> {
         self.display_name.as_ref()
+    }
+
+    /// Identity encryption keypair.
+    #[must_use]
+    pub const fn encryption(&self) -> &IdentityKemKeypair {
+        &self.encryption
+    }
+
+    /// Identity signing keypair.
+    #[must_use]
+    pub const fn signing(&self) -> &IdentitySignKeypair {
+        &self.signing
     }
 
     /// Conversations keyed by [`ConversationId`].
@@ -120,6 +140,7 @@ impl Identity {
 
 /// Conversation ADT. Group and Synchronization are placeholders this slice.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Conversation {
     /// Direct-message handshake and session.
     DirectMessage(DirectMessage),
@@ -172,6 +193,15 @@ pub enum Invitee {
         /// Billboard plaintext.
         notice: Notice,
     },
+    /// Local CallingCard minted. Wrap and send are a later slice.
+    CallingCardCreated {
+        /// QR capability.
+        ticket: Ticket,
+        /// Billboard plaintext.
+        notice: Notice,
+        /// Minted card.
+        card: CallingCard,
+    },
 }
 
 /// Handshake complete. No fields this slice.
@@ -209,6 +239,8 @@ pub enum ConversationPhase {
     InviteeTicketReceived,
     /// [`Invitee::InviteReceived`].
     InviteeInviteReceived,
+    /// [`Invitee::CallingCardCreated`].
+    InviteeCallingCardCreated,
     /// [`DirectMessage::Established`].
     Established,
     /// [`DirectMessage::Failed`].
@@ -235,6 +267,9 @@ impl Conversation {
             }
             Self::DirectMessage(DirectMessage::Invitee(Invitee::InviteReceived { .. })) => {
                 ConversationPhase::InviteeInviteReceived
+            }
+            Self::DirectMessage(DirectMessage::Invitee(Invitee::CallingCardCreated { .. })) => {
+                ConversationPhase::InviteeCallingCardCreated
             }
             Self::DirectMessage(DirectMessage::Established(_)) => ConversationPhase::Established,
             Self::DirectMessage(DirectMessage::Failed(_)) => ConversationPhase::Failed,
@@ -265,7 +300,13 @@ mod tests {
         );
         let user = User::new();
         assert!(user.identities().is_empty());
-        let identity = Identity::new();
+        let identity = Identity::new(
+            crate::protocol::v1::IdentityKemKeypair::from_parts(vec![1], vec![2]),
+            crate::protocol::v1::IdentitySignKeypair::from_parts(vec![3], vec![4]),
+        );
+        assert!(identity.display_name().is_none());
+        assert_eq!(identity.encryption().public_bytes(), &[1]);
+        assert_eq!(identity.signing().public_bytes(), &[3]);
         assert!(identity.display_name().is_none());
         assert!(identity.conversations().is_empty());
         let g = Conversation::Group(Group);
@@ -326,6 +367,39 @@ mod tests {
             ticket: fixtures::sample_ticket(2),
         }));
         assert_eq!(tr.phase(), ConversationPhase::InviteeTicketReceived);
+        let notice = crate::protocol::v1::Notice::from_intake(crate::protocol::Policy::Hybrid, &{
+            let engine = fixtures::test_engine();
+            engine
+                .try_new_invite(
+                    &fixtures::SeedRng(fixtures::fill(0x11)),
+                    &[fixtures::sample_billboard()],
+                    &[fixtures::sample_mailbox()],
+                    &[],
+                )
+                .expect("invite")
+                .intake()
+                .clone()
+        });
+        let ir = Conversation::DirectMessage(DirectMessage::Invitee(Invitee::InviteReceived {
+            ticket: fixtures::sample_ticket(2),
+            notice: notice.clone(),
+        }));
+        assert_eq!(ir.phase(), ConversationPhase::InviteeInviteReceived);
+        let card = crate::protocol::v1::CallingCard::from_parts(
+            crate::protocol::v1::DisplayName::try_from("Ada").expect("name"),
+            vec![1],
+            vec![2],
+            crate::protocol::v1::MailboxTagKey::from_bytes([7; 32]),
+            vec![fixtures::sample_mailbox()],
+            Vec::new(),
+        )
+        .expect("card");
+        let cc = Conversation::DirectMessage(DirectMessage::Invitee(Invitee::CallingCardCreated {
+            ticket: fixtures::sample_ticket(2),
+            notice,
+            card,
+        }));
+        assert_eq!(cc.phase(), ConversationPhase::InviteeCallingCardCreated);
         let failed =
             Conversation::DirectMessage(DirectMessage::Failed(Failed::PolicyNotAccepted {
                 ticket: fixtures::sample_ticket(1),

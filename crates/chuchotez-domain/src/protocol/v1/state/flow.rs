@@ -4,7 +4,7 @@ use super::{
     ApplyError, Command, Conversation, ConversationId, ConversationPhase, CreateIdentityError,
     CreateInviteError, CreateUserError, DeleteConversationError, DeleteIdentityError,
     DeleteUserError, DirectMessage, DisplayName, EngineState, Failed, IdentityId, Invitee,
-    MarkNoticesPinnedError, PersistError, ReceiveNoticeError, ReceiveNoticeOk, ReceiveTicketError,
+    MarkNoticesPinnedError, PersistError, ReceiveNoticeError, ReceiveTicketError,
     SetDisplayNameError, UnsetDisplayNameError, UserId,
 };
 use crate::protocol::v1::{
@@ -34,6 +34,16 @@ fn missing_id() -> UserId {
     UserId::from_bytes([0xff; RANDOM32_LEN])
 }
 
+fn sample_keys() -> (
+    crate::protocol::v1::IdentityKemKeypair,
+    crate::protocol::v1::IdentitySignKeypair,
+) {
+    (
+        crate::protocol::v1::IdentityKemKeypair::from_parts(vec![1], vec![2]),
+        crate::protocol::v1::IdentitySignKeypair::from_parts(vec![3], vec![4]),
+    )
+}
+
 struct HostRng;
 
 impl Rng for HostRng {
@@ -49,16 +59,15 @@ fn inviter_invitee_persist_replay_and_refuse() {
     let rng = fixtures::CounterRng::new();
     let (board, mailbox, wire) = sample_channels();
 
-    let (state, user_ok) = engine.create_user(EngineState::new(), &rng, &dek);
+    let (state, user_id, user_ok) = engine.create_user(EngineState::new(), &rng, &dek);
     let user_ok = user_ok.expect("user");
-    let user_id = user_ok.user_id;
     assert_eq!(format!("{:?}", user_ok.persist), "PersistedCommand(..)");
     assert!(!user_ok.persist.as_bytes().is_empty());
     let _ = user_ok.persist.clone().into_bytes();
 
-    let (state, id_ok) = engine.create_identity(state, &rng, &dek, user_id);
+    let (state, identity_id, id_ok) = engine.create_identity(state, &rng, &dek, user_id);
     let id_ok = id_ok.expect("identity");
-    let identity_id = id_ok.identity_id;
+    let _ = format!("{id_ok:?}");
     assert!(
         state
             .user(&user_id)
@@ -67,6 +76,28 @@ fn inviter_invitee_persist_replay_and_refuse() {
             .expect("i")
             .display_name()
             .is_none()
+    );
+    assert_eq!(
+        state
+            .user(&user_id)
+            .expect("u")
+            .identity(&identity_id)
+            .expect("i")
+            .encryption()
+            .public_bytes()
+            .len(),
+        crate::protocol::v1::intake_pk_len(Policy::Hybrid)
+    );
+    assert_eq!(
+        state
+            .user(&user_id)
+            .expect("u")
+            .identity(&identity_id)
+            .expect("i")
+            .signing()
+            .public_bytes()
+            .len(),
+        crate::protocol::v1::sign_pk_len(Policy::Hybrid)
     );
 
     let name = DisplayName::try_from("Ada").expect("name");
@@ -101,7 +132,7 @@ fn inviter_invitee_persist_replay_and_refuse() {
             .is_none()
     );
 
-    let (state, invite_ok) = engine.create_invite(
+    let (state, conversation_id, invite_ok) = engine.create_invite(
         state,
         &rng,
         &dek,
@@ -112,9 +143,16 @@ fn inviter_invitee_persist_replay_and_refuse() {
         std::slice::from_ref(&wire),
     );
     let invite_ok = invite_ok.expect("invite");
-    let conversation_id = invite_ok.conversation_id;
-    let _ = (invite_ok.ticket_blob.clone(), invite_ok.notice_blob.clone());
-    assert!(!invite_ok.billboard_tag.as_bytes().iter().all(|b| *b == 0) || true);
+    let _ticket_blob = engine
+        .ticket_blob(&state, user_id, identity_id, conversation_id)
+        .expect("ticket");
+    let _notice_blob = engine
+        .notice_blob(&state, user_id, identity_id, conversation_id)
+        .expect("notice");
+    let tags = engine
+        .billboard_tags(&state, user_id, identity_id, conversation_id)
+        .expect("tags");
+    assert_eq!(tags.len(), 1);
     let _ = format!("{invite_ok:?}");
     assert_eq!(
         state
@@ -147,15 +185,13 @@ fn inviter_invitee_persist_replay_and_refuse() {
     let rng = fixtures::CounterRng::new();
     let mut blobs = Vec::new();
     let mut live = EngineState::new();
-    let (s, ok) = engine.create_user(live, &rng, &dek);
+    let (s, uid, ok) = engine.create_user(live, &rng, &dek);
     live = s;
-    let uid = ok.as_ref().expect("u").user_id;
     blobs.push(ok.expect("u").persist.as_bytes().to_vec());
-    let (s, ok) = engine.create_identity(live, &rng, &dek, uid);
+    let (s, iid, ok) = engine.create_identity(live, &rng, &dek, uid);
     live = s;
-    let iid = ok.as_ref().expect("i").identity_id;
     blobs.push(ok.expect("i").persist.as_bytes().to_vec());
-    let (s, ok) = engine.create_invite(
+    let (s, cid, ok) = engine.create_invite(
         live,
         &rng,
         &dek,
@@ -166,9 +202,12 @@ fn inviter_invitee_persist_replay_and_refuse() {
         std::slice::from_ref(&wire),
     );
     live = s;
-    let cid = ok.as_ref().expect("c").conversation_id;
-    let ticket_blob = ok.as_ref().expect("c").ticket_blob.clone();
-    let notice_blob = ok.as_ref().expect("c").notice_blob.clone();
+    let ticket_blob = engine
+        .ticket_blob(&live, uid, iid, cid)
+        .expect("ticket get");
+    let notice_blob = engine
+        .notice_blob(&live, uid, iid, cid)
+        .expect("notice get");
     blobs.push(ok.expect("c").persist.as_bytes().to_vec());
     let (s, ok) = engine.mark_notices_pinned(live, &dek, uid, iid, cid);
     live = s;
@@ -182,16 +221,27 @@ fn inviter_invitee_persist_replay_and_refuse() {
         folded = next;
     }
     assert_eq!(folded, live);
+    assert_eq!(
+        engine.ticket_blob(&folded, uid, iid, cid).expect("ht"),
+        engine.ticket_blob(&live, uid, iid, cid).expect("lt")
+    );
+    assert_eq!(
+        engine.notice_blob(&folded, uid, iid, cid).expect("hn"),
+        engine.notice_blob(&live, uid, iid, cid).expect("ln")
+    );
+    assert_eq!(
+        engine.billboard_tags(&folded, uid, iid, cid).expect("hg"),
+        engine.billboard_tags(&live, uid, iid, cid).expect("lg")
+    );
 
     let rng = fixtures::CounterRng::new();
-    let (invitee, ok) = engine.create_user(EngineState::new(), &rng, &dek);
-    let invitee_user = ok.expect("iu").user_id;
-    let (invitee, ok) = engine.create_identity(invitee, &rng, &dek, invitee_user);
-    let invitee_id = ok.expect("ii").identity_id;
-    let (invitee, ok) =
+    let (invitee, invitee_user, ok) = engine.create_user(EngineState::new(), &rng, &dek);
+    ok.expect("iu");
+    let (invitee, invitee_id, ok) = engine.create_identity(invitee, &rng, &dek, invitee_user);
+    ok.expect("ii");
+    let (invitee, invitee_cid, ok) =
         engine.receive_ticket(invitee, &rng, &dek, invitee_user, invitee_id, &ticket_blob);
     let recv = ok.expect("ticket");
-    let invitee_cid = recv.conversation_id;
     engine
         .try_open_command(&dek, recv.persist.as_bytes())
         .expect("open ticket cmd");
@@ -217,7 +267,7 @@ fn inviter_invitee_persist_replay_and_refuse() {
         &[Policy::Hybrid],
     );
     let accepted = ok.expect("notice");
-    let persist = accepted.persist().clone();
+    let persist = accepted.persist.clone();
     let cmd = engine
         .try_open_command(&dek, persist.as_bytes())
         .expect("open notice");
@@ -244,14 +294,7 @@ fn inviter_invitee_persist_replay_and_refuse() {
         &[Policy::Classic],
     );
     let refused = ok.expect("refuse");
-    assert!(matches!(
-        refused,
-        ReceiveNoticeOk::Refused {
-            found: Policy::Hybrid,
-            ..
-        }
-    ));
-    let persist = refused.persist().clone();
+    let persist = refused.persist.clone();
     let cmd = engine
         .try_open_command(&dek, persist.as_bytes())
         .expect("open fail");
@@ -310,28 +353,28 @@ fn named_method_errors() {
     let missing_i = IdentityId::from_bytes([0xee; RANDOM32_LEN]);
     let missing_c = ConversationId::from_bytes([0xdd; RANDOM32_LEN]);
 
-    let (state, err) =
+    let (state, _, err) =
         engine.create_user(EngineState::new().with_command_seq(u64::MAX), &rng, &dek);
     assert_eq!(err.unwrap_err(), CreateUserError::SeqOverflow);
     assert_eq!(state.command_seq(), u64::MAX);
 
-    let (state, ok) = engine.create_user(EngineState::new(), &HostRng, &dek);
-    let user_id = ok.expect("u").user_id;
-    let (state, err) = engine.create_user(state, &HostRng, &dek);
+    let (state, user_id, ok) = engine.create_user(EngineState::new(), &HostRng, &dek);
+    ok.expect("u");
+    let (state, _, err) = engine.create_user(state, &HostRng, &dek);
     assert!(matches!(
         err.unwrap_err(),
         CreateUserError::DuplicateUser(_)
     ));
 
-    let (state, err) = engine.create_identity(state.clone(), &rng, &dek, missing_u);
+    let (state, _, err) = engine.create_identity(state.clone(), &rng, &dek, missing_u);
     assert_eq!(
         err.unwrap_err(),
         CreateIdentityError::UnknownUser(missing_u)
     );
 
-    let (state, ok) = engine.create_identity(state, &HostRng, &dek, user_id);
-    let identity_id = ok.expect("i").identity_id;
-    let (state, err) = engine.create_identity(state, &HostRng, &dek, user_id);
+    let (state, identity_id, ok) = engine.create_identity(state, &HostRng, &dek, user_id);
+    ok.expect("i");
+    let (state, _, err) = engine.create_identity(state, &HostRng, &dek, user_id);
     assert!(matches!(
         err.unwrap_err(),
         CreateIdentityError::DuplicateIdentity { .. }
@@ -422,7 +465,7 @@ fn named_method_errors() {
                 std::slice::from_ref(&mailbox),
                 &[]
             )
-            .1
+            .2
             .unwrap_err(),
         CreateInviteError::UnknownUser(_)
     ));
@@ -438,7 +481,7 @@ fn named_method_errors() {
                 std::slice::from_ref(&mailbox),
                 &[]
             )
-            .1
+            .2
             .unwrap_err(),
         CreateInviteError::UnknownIdentity { .. }
     ));
@@ -454,14 +497,14 @@ fn named_method_errors() {
                 std::slice::from_ref(&mailbox),
                 &[]
             )
-            .1
+            .2
             .unwrap_err(),
         CreateInviteError::Invite(InviteError::Ticket(
             crate::protocol::v1::TicketError::EmptyBillboards
         ))
     );
 
-    let (state, invite_ok) = engine.create_invite(
+    let (state, cid, invite_ok) = engine.create_invite(
         state,
         &rng,
         &dek,
@@ -471,7 +514,7 @@ fn named_method_errors() {
         std::slice::from_ref(&mailbox),
         std::slice::from_ref(&wire),
     );
-    let cid = invite_ok.expect("inv").conversation_id;
+    invite_ok.expect("inv");
     let occupy = ConversationId::from_bytes([1; RANDOM32_LEN]);
     let minted = engine
         .try_new_invite(
@@ -491,7 +534,7 @@ fn named_method_errors() {
         },
     );
     occupied.expect("occupy");
-    let (state, err) = engine.create_invite(
+    let (state, _, err) = engine.create_invite(
         state,
         &HostRng,
         &dek,
@@ -545,7 +588,7 @@ fn named_method_errors() {
     assert!(matches!(
         engine
             .receive_ticket(state.clone(), &rng, &dek, missing_u, missing_i, "!!!!")
-            .1
+            .2
             .unwrap_err(),
         ReceiveTicketError::Ticket(_)
     ));
@@ -561,21 +604,21 @@ fn named_method_errors() {
     assert!(matches!(
         engine
             .receive_ticket(state.clone(), &HostRng, &dek, user_id, identity_id, &blob)
-            .1
+            .2
             .unwrap_err(),
         ReceiveTicketError::DuplicateConversation { .. }
     ));
     assert!(matches!(
         engine
             .receive_ticket(state.clone(), &rng, &dek, missing_u, missing_i, &blob)
-            .1
+            .2
             .unwrap_err(),
         ReceiveTicketError::UnknownUser(_)
     ));
     assert!(matches!(
         engine
             .receive_ticket(state.clone(), &rng, &dek, user_id, missing_i, &blob)
-            .1
+            .2
             .unwrap_err(),
         ReceiveTicketError::UnknownIdentity { .. }
     ));
@@ -644,8 +687,9 @@ fn named_method_errors() {
         }
     ));
 
-    let (st, tok) = engine.receive_ticket(state.clone(), &rng, &dek, user_id, identity_id, &blob);
-    let tcid = tok.expect("t").conversation_id;
+    let (st, tcid, tok) =
+        engine.receive_ticket(state.clone(), &rng, &dek, user_id, identity_id, &blob);
+    tok.expect("t");
     assert!(matches!(
         engine
             .receive_notice(
@@ -687,7 +731,7 @@ fn named_method_errors() {
                 identity_id,
                 &blob
             )
-            .1
+            .2
             .unwrap_err(),
         ReceiveTicketError::SeqOverflow
     );
@@ -699,7 +743,7 @@ fn named_method_errors() {
                 &dek,
                 user_id
             )
-            .1
+            .2
             .unwrap_err(),
         CreateIdentityError::SeqOverflow
     );
@@ -715,7 +759,7 @@ fn named_method_errors() {
                 std::slice::from_ref(&mailbox),
                 std::slice::from_ref(&wire)
             )
-            .1
+            .2
             .unwrap_err(),
         CreateInviteError::SeqOverflow
     );
@@ -807,7 +851,7 @@ fn apply_and_persist_errors() {
         engine.try_open_command(&dek, &short).unwrap_err(),
         PersistError::TooShort
     );
-    let (s, ok) = engine.create_user(EngineState::new(), &HostRng, &dek);
+    let (s, _, ok) = engine.create_user(EngineState::new(), &HostRng, &dek);
     let blob = ok.expect("p").persist;
     let other = AeadKey::from_bytes([0x99; RANDOM32_LEN]);
     assert!(matches!(
@@ -838,11 +882,14 @@ fn apply_and_persist_errors() {
             .unwrap_err(),
         ApplyError::DuplicateUser(_)
     ));
+    let (enc, sig) = sample_keys();
     let (state, _) = engine.apply(
         state,
         &Command::CreateIdentity {
             user_id: uid,
             identity_id: iid,
+            encryption: enc.clone(),
+            signing: sig.clone(),
         },
     );
     assert!(matches!(
@@ -852,6 +899,8 @@ fn apply_and_persist_errors() {
                 &Command::CreateIdentity {
                     user_id: uid,
                     identity_id: iid,
+                    encryption: enc,
+                    signing: sig,
                 },
             )
             .1
@@ -977,6 +1026,31 @@ fn apply_and_persist_errors() {
         format!("{}", PersistError::Notice(NoticeError::Empty)),
         format!("{}", PersistError::Intake(IntakeError::EmptyMailboxes)),
         format!("{}", PersistError::DisplayName(DisplayNameError::Empty)),
+        format!(
+            "{}",
+            PersistError::CallingCard(crate::protocol::v1::CallingCardError::EmptyMailboxes)
+        ),
+        format!(
+            "{}",
+            CreateIdentityError::Kem(crate::protocol::v1::KemError::KeyGen)
+        ),
+        format!(
+            "{}",
+            CreateIdentityError::Sign(crate::protocol::v1::SignError::KeyGen)
+        ),
+        format!("{}", super::CreateCallingCardError::UnsetDisplayName),
+        format!(
+            "{}",
+            super::CreateCallingCardError::CallingCard(
+                crate::protocol::v1::CallingCardError::EmptyMailboxes
+            )
+        ),
+        format!(
+            "{}",
+            super::CreateCallingCardError::Persist(PersistError::TooShort)
+        ),
+        format!("{}", super::QueryError::UnknownUser(missing_id())),
+        format!("{:?}", ConversationPhase::InviteeCallingCardCreated),
         format!("{:?}", ConversationPhase::Group),
     ];
     assert!(displays.iter().all(|s| !s.is_empty()));
@@ -993,6 +1067,12 @@ fn apply_and_persist_errors() {
     );
     assert!(
         std::error::Error::source(&PersistError::DisplayName(DisplayNameError::Empty)).is_some()
+    );
+    assert!(
+        std::error::Error::source(&PersistError::CallingCard(
+            crate::protocol::v1::CallingCardError::EmptyMailboxes
+        ))
+        .is_some()
     );
     assert!(std::error::Error::source(&PersistError::TooShort).is_none());
     let _ = format!("{:?}", Json::Null);
@@ -1108,6 +1188,72 @@ fn persist_json_fail_closed() {
                 "user_id".into(),
                 Json::String(engine.b64u().encode(&[1u8; 32])),
             ),
+            (
+                "identity_id".into(),
+                Json::String(engine.b64u().encode(&[2u8; 32])),
+            ),
+        ]),
+        Json::Object(vec![
+            ("v".into(), Json::String("1".into())),
+            ("op".into(), Json::String("create_calling_card".into())),
+            (
+                "user_id".into(),
+                Json::String(engine.b64u().encode(&[1u8; 32])),
+            ),
+            (
+                "identity_id".into(),
+                Json::String(engine.b64u().encode(&[2u8; 32])),
+            ),
+            (
+                "conversation_id".into(),
+                Json::String(engine.b64u().encode(&[3u8; 32])),
+            ),
+            ("name".into(), Json::String("Ada".into())),
+            (
+                "encryption_pk".into(),
+                Json::String(engine.b64u().encode(&[4u8; 32])),
+            ),
+            (
+                "signing_pk".into(),
+                Json::String(engine.b64u().encode(&[5u8; 32])),
+            ),
+            (
+                "mailbox_tag_key".into(),
+                Json::String(engine.b64u().encode(&[6u8; 32])),
+            ),
+            ("mailboxes".into(), Json::Array(Vec::new())),
+            ("wires".into(), Json::Array(Vec::new())),
+        ]),
+        Json::Object(vec![
+            ("v".into(), Json::String("1".into())),
+            ("op".into(), Json::String("create_calling_card".into())),
+            (
+                "user_id".into(),
+                Json::String(engine.b64u().encode(&[1u8; 32])),
+            ),
+            (
+                "identity_id".into(),
+                Json::String(engine.b64u().encode(&[2u8; 32])),
+            ),
+            (
+                "conversation_id".into(),
+                Json::String(engine.b64u().encode(&[3u8; 32])),
+            ),
+            ("name".into(), Json::String("Ada".into())),
+            (
+                "encryption_pk".into(),
+                Json::String(engine.b64u().encode(&[4u8; 32])),
+            ),
+            (
+                "signing_pk".into(),
+                Json::String(engine.b64u().encode(&[5u8; 32])),
+            ),
+            (
+                "mailbox_tag_key".into(),
+                Json::String(engine.b64u().encode(&[6u8; 8])),
+            ),
+            ("mailboxes".into(), Json::Array(Vec::new())),
+            ("wires".into(), Json::Array(Vec::new())),
         ]),
         Json::Object(vec![
             ("v".into(), Json::String("1".into())),
@@ -1706,7 +1852,7 @@ fn persist_size_limits_and_commit_persist() {
     ));
     let live = engine
         .create_user(EngineState::new(), &HostRng, &dek)
-        .1
+        .2
         .expect("user")
         .persist;
     let codec = fixtures::engine_with(
@@ -1720,11 +1866,11 @@ fn persist_size_limits_and_commit_persist() {
 
     let rng = fixtures::CounterRng::new();
     let (board, mailbox, wire) = sample_channels();
-    let (state, user_ok) = engine.create_user(EngineState::new(), &rng, &dek);
-    let user_id = user_ok.expect("u").user_id;
-    let (state, id_ok) = engine.create_identity(state, &rng, &dek, user_id);
-    let identity_id = id_ok.expect("i").identity_id;
-    let (_inviter, invite_ok) = engine.create_invite(
+    let (state, user_id, user_ok) = engine.create_user(EngineState::new(), &rng, &dek);
+    user_ok.expect("u");
+    let (state, identity_id, id_ok) = engine.create_identity(state, &rng, &dek, user_id);
+    id_ok.expect("i");
+    let (inviter, inviter_cid, invite_ok) = engine.create_invite(
         state,
         &rng,
         &dek,
@@ -1734,25 +1880,496 @@ fn persist_size_limits_and_commit_persist() {
         std::slice::from_ref(&mailbox),
         std::slice::from_ref(&wire),
     );
-    let invite_ok = invite_ok.expect("inv");
-    let ticket_blob = invite_ok.ticket_blob.clone();
-    let notice_blob = invite_ok.notice_blob.clone();
+    invite_ok.expect("inv");
+    let ticket_blob = engine
+        .ticket_blob(&inviter, user_id, identity_id, inviter_cid)
+        .expect("ticket");
+    let notice_blob = engine
+        .notice_blob(&inviter, user_id, identity_id, inviter_cid)
+        .expect("notice");
     let rng = fixtures::CounterRng::new();
-    let (invitee, ok) = engine.create_user(EngineState::new(), &rng, &dek);
-    let iu = ok.expect("iu").user_id;
-    let (invitee, ok) = engine.create_identity(invitee, &rng, &dek, iu);
-    let ii = ok.expect("ii").identity_id;
-    let (invitee, ok) = engine.receive_ticket(invitee, &rng, &dek, iu, ii, &ticket_blob);
-    let cid = ok.expect("t").conversation_id;
+    let (invitee, iu, ok) = engine.create_user(EngineState::new(), &rng, &dek);
+    ok.expect("iu");
+    let (invitee, ii, ok) = engine.create_identity(invitee, &rng, &dek, iu);
+    ok.expect("ii");
+    let (invitee, cid, ok) = engine.receive_ticket(invitee, &rng, &dek, iu, ii, &ticket_blob);
+    ok.expect("t");
     let (_, persist_err) =
         exploding.receive_notice(invitee, &dek, iu, ii, cid, &notice_blob, &[Policy::Hybrid]);
     assert!(matches!(
         persist_err.unwrap_err(),
         ReceiveNoticeError::Persist(PersistError::TooLong)
     ));
-    let (_, create_err) = exploding.create_user(EngineState::new(), &HostRng, &dek);
+    let (_, _, create_err) = exploding.create_user(EngineState::new(), &HostRng, &dek);
     assert!(matches!(
         create_err.unwrap_err(),
         CreateUserError::Persist(PersistError::TooLong)
     ));
+}
+
+#[test]
+fn calling_card_mint_getters_and_errors() {
+    use super::{CreateCallingCardError, QueryError};
+    use crate::protocol::v1::{CallingCardError, MAILBOX_MAX_COUNT, WIRE_MAX_COUNT, sign_pk_len};
+    use std::sync::Arc;
+
+    let dek = dek();
+    for policy in [Policy::Classic, Policy::PostQuantum, Policy::Hybrid] {
+        let engine = fixtures::engine_with_policy(policy);
+        let rng = fixtures::CounterRng::new();
+        let (state, uid, ok) = engine.create_user(EngineState::new(), &rng, &dek);
+        ok.expect("u");
+        let (state, iid, ok) = engine.create_identity(state, &rng, &dek, uid);
+        ok.expect("i");
+        let identity = state.user(&uid).expect("u").identity(&iid).expect("i");
+        assert_eq!(
+            identity.encryption().public_bytes().len(),
+            crate::protocol::v1::intake_pk_len(policy)
+        );
+        assert_eq!(identity.signing().public_bytes().len(), sign_pk_len(policy));
+    }
+
+    let fail_kem = fixtures::engine_with_kem_sign(
+        Arc::new(fixtures::FailingKem),
+        Arc::new(fixtures::EchoSign),
+    );
+    let rng = fixtures::CounterRng::new();
+    let (state, uid, ok) = fail_kem.create_user(EngineState::new(), &rng, &dek);
+    ok.expect("u");
+    assert!(matches!(
+        fail_kem
+            .create_identity(state, &rng, &dek, uid)
+            .2
+            .unwrap_err(),
+        CreateIdentityError::Kem(_)
+    ));
+
+    let fail_sign = fixtures::engine_with_kem_sign(
+        Arc::new(fixtures::EchoKem),
+        Arc::new(fixtures::FailingSign),
+    );
+    let rng = fixtures::CounterRng::new();
+    let (state, uid, ok) = fail_sign.create_user(EngineState::new(), &rng, &dek);
+    ok.expect("u");
+    assert!(matches!(
+        fail_sign
+            .create_identity(state, &rng, &dek, uid)
+            .2
+            .unwrap_err(),
+        CreateIdentityError::Sign(_)
+    ));
+
+    let engine = engine();
+    let rng = fixtures::CounterRng::new();
+    let (board, mailbox, wire) = sample_channels();
+    let (state, uid, ok) = engine.create_user(EngineState::new(), &rng, &dek);
+    ok.expect("u");
+    let (state, iid, ok) = engine.create_identity(state, &rng, &dek, uid);
+    ok.expect("i");
+    let missing_u = missing_id();
+    let missing_i = IdentityId::from_bytes([0xee; RANDOM32_LEN]);
+    let missing_c = ConversationId::from_bytes([0xdd; RANDOM32_LEN]);
+
+    assert!(matches!(
+        engine
+            .create_calling_card(
+                state.clone(),
+                &rng,
+                &dek,
+                missing_u,
+                missing_i,
+                missing_c,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::UnknownUser(_)
+    ));
+    assert!(matches!(
+        engine
+            .create_calling_card(
+                state.clone(),
+                &rng,
+                &dek,
+                uid,
+                missing_i,
+                missing_c,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::UnknownIdentity { .. }
+    ));
+    assert!(matches!(
+        engine
+            .ticket_blob(&state, missing_u, missing_i, missing_c)
+            .unwrap_err(),
+        QueryError::UnknownUser(_)
+    ));
+    assert!(matches!(
+        engine
+            .ticket_blob(&state, uid, missing_i, missing_c)
+            .unwrap_err(),
+        QueryError::UnknownIdentity { .. }
+    ));
+    assert!(matches!(
+        engine.ticket_blob(&state, uid, iid, missing_c).unwrap_err(),
+        QueryError::UnknownConversation { .. }
+    ));
+    assert!(matches!(
+        engine
+            .calling_card(&state, missing_u, missing_i, missing_c)
+            .unwrap_err(),
+        QueryError::UnknownUser(_)
+    ));
+    assert!(matches!(
+        engine
+            .calling_card(&state, uid, missing_i, missing_c)
+            .unwrap_err(),
+        QueryError::UnknownIdentity { .. }
+    ));
+    assert!(matches!(
+        engine
+            .calling_card(&state, uid, iid, missing_c)
+            .unwrap_err(),
+        QueryError::UnknownConversation { .. }
+    ));
+    assert!(matches!(
+        engine
+            .create_calling_card(
+                state.clone(),
+                &rng,
+                &dek,
+                uid,
+                iid,
+                missing_c,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::UnknownConversation { .. }
+    ));
+    assert!(matches!(
+        engine
+            .create_calling_card(
+                state.clone(),
+                &rng,
+                &dek,
+                uid,
+                iid,
+                missing_c,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::UnknownConversation { .. }
+    ));
+
+    let (inviter, inv_cid, ok) = engine.create_invite(
+        state.clone(),
+        &rng,
+        &dek,
+        uid,
+        iid,
+        std::slice::from_ref(&board),
+        std::slice::from_ref(&mailbox),
+        std::slice::from_ref(&wire),
+    );
+    ok.expect("inv");
+    assert!(matches!(
+        engine
+            .create_calling_card(
+                inviter.clone(),
+                &rng,
+                &dek,
+                uid,
+                iid,
+                inv_cid,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::UnexpectedPhase {
+            found: ConversationPhase::InviterInviteCreated,
+            ..
+        }
+    ));
+    assert!(matches!(
+        engine
+            .calling_card(&inviter, uid, iid, inv_cid)
+            .unwrap_err(),
+        QueryError::UnexpectedPhase { .. }
+    ));
+    let ticket_blob = engine.ticket_blob(&inviter, uid, iid, inv_cid).expect("t");
+    let notice_blob = engine.notice_blob(&inviter, uid, iid, inv_cid).expect("n");
+
+    let rng = fixtures::CounterRng::new();
+    let (invitee, iu, ok) = engine.create_user(EngineState::new(), &rng, &dek);
+    ok.expect("iu");
+    let (invitee, ii, ok) = engine.create_identity(invitee, &rng, &dek, iu);
+    ok.expect("ii");
+    assert_eq!(
+        engine
+            .create_calling_card(
+                invitee.clone(),
+                &rng,
+                &dek,
+                iu,
+                ii,
+                missing_c,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::UnknownConversation {
+            user_id: iu,
+            identity_id: ii,
+            conversation_id: missing_c,
+        }
+    );
+    let (invitee, cid, ok) = engine.receive_ticket(invitee, &rng, &dek, iu, ii, &ticket_blob);
+    ok.expect("ticket");
+    assert!(matches!(
+        engine.ticket_blob(&invitee, iu, ii, cid).unwrap_err(),
+        QueryError::UnexpectedPhase {
+            found: ConversationPhase::InviteeTicketReceived,
+            ..
+        }
+    ));
+    assert!(matches!(
+        engine.notice_blob(&invitee, iu, ii, cid).unwrap_err(),
+        QueryError::UnexpectedPhase { .. }
+    ));
+    assert!(matches!(
+        engine.billboard_tags(&invitee, iu, ii, cid).unwrap_err(),
+        QueryError::UnexpectedPhase { .. }
+    ));
+    let (invitee, ok) =
+        engine.receive_notice(invitee, &dek, iu, ii, cid, &notice_blob, &[Policy::Hybrid]);
+    ok.expect("notice");
+    assert_eq!(
+        engine
+            .create_calling_card(
+                invitee.clone(),
+                &rng,
+                &dek,
+                iu,
+                ii,
+                cid,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::UnsetDisplayName
+    );
+    let name = DisplayName::try_from("Ada").expect("name");
+    let (invitee, ok) = engine.set_display_name(invitee, &dek, iu, ii, name.clone());
+    ok.expect("set");
+    assert_eq!(
+        engine
+            .create_calling_card(invitee.clone(), &rng, &dek, iu, ii, cid, &[], &[])
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::CallingCard(CallingCardError::EmptyMailboxes)
+    );
+    let many_m = vec![mailbox.clone(); MAILBOX_MAX_COUNT + 1];
+    assert_eq!(
+        engine
+            .create_calling_card(invitee.clone(), &rng, &dek, iu, ii, cid, &many_m, &[])
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::CallingCard(CallingCardError::TooManyMailboxes)
+    );
+    let many_w = vec![wire.clone(); WIRE_MAX_COUNT + 1];
+    assert_eq!(
+        engine
+            .create_calling_card(
+                invitee.clone(),
+                &rng,
+                &dek,
+                iu,
+                ii,
+                cid,
+                std::slice::from_ref(&mailbox),
+                &many_w
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::CallingCard(CallingCardError::TooManyWires)
+    );
+    assert_eq!(
+        engine
+            .create_calling_card(
+                invitee.clone().with_command_seq(u64::MAX),
+                &rng,
+                &dek,
+                iu,
+                ii,
+                cid,
+                std::slice::from_ref(&mailbox),
+                &[]
+            )
+            .1
+            .unwrap_err(),
+        CreateCallingCardError::SeqOverflow
+    );
+
+    let (minted, ok) = engine.create_calling_card(
+        invitee.clone(),
+        &rng,
+        &dek,
+        iu,
+        ii,
+        cid,
+        std::slice::from_ref(&mailbox),
+        std::slice::from_ref(&wire),
+    );
+    let persist = ok.expect("card").persist;
+    let cmd = engine
+        .try_open_command(&dek, persist.as_bytes())
+        .expect("open card");
+    assert!(matches!(cmd, Command::CreateCallingCard { .. }));
+    assert_eq!(
+        minted
+            .user(&iu)
+            .expect("u")
+            .identity(&ii)
+            .expect("i")
+            .conversation(&cid)
+            .expect("c")
+            .phase(),
+        ConversationPhase::InviteeCallingCardCreated
+    );
+    let card = engine.calling_card(&minted, iu, ii, cid).expect("get");
+    assert_eq!(card.display_name(), &name);
+    assert_eq!(card.mailboxes().len(), 1);
+    assert_eq!(card.wires().len(), 1);
+    let enc_pk = minted
+        .user(&iu)
+        .expect("u")
+        .identity(&ii)
+        .expect("i")
+        .encryption()
+        .public_bytes();
+    assert_eq!(card.encryption_pk(), enc_pk);
+
+    let cmd = engine
+        .try_open_command(&dek, persist.as_bytes())
+        .expect("reopen");
+    let (hydrated, result) = engine.apply(invitee, &cmd);
+    result.expect("apply card");
+    assert_eq!(
+        engine.calling_card(&hydrated, iu, ii, cid).expect("h"),
+        engine.calling_card(&minted, iu, ii, cid).expect("m")
+    );
+
+    let (unset, ok) = engine.unset_display_name(minted.clone(), &dek, iu, ii);
+    ok.expect("unset");
+    assert!(
+        unset
+            .user(&iu)
+            .expect("u")
+            .identity(&ii)
+            .expect("i")
+            .display_name()
+            .is_none()
+    );
+    let card_after = engine.calling_card(&unset, iu, ii, cid).expect("kept");
+    assert_eq!(card_after.display_name(), &name);
+
+    let (enc, sig) = sample_keys();
+    let (state, _) = engine.apply(EngineState::new(), &Command::CreateUser { user_id: uid });
+    let (state, _) = engine.apply(
+        state,
+        &Command::CreateIdentity {
+            user_id: uid,
+            identity_id: iid,
+            encryption: enc,
+            signing: sig,
+        },
+    );
+    let card = crate::protocol::v1::CallingCard::from_parts(
+        name,
+        vec![1],
+        vec![2],
+        crate::protocol::v1::MailboxTagKey::from_bytes([9; RANDOM32_LEN]),
+        vec![mailbox],
+        Vec::new(),
+    )
+    .expect("parts");
+    assert!(matches!(
+        engine
+            .apply(
+                inviter,
+                &Command::CreateCallingCard {
+                    user_id: uid,
+                    identity_id: iid,
+                    conversation_id: inv_cid,
+                    card: card.clone(),
+                },
+            )
+            .1
+            .unwrap_err(),
+        ApplyError::UnexpectedPhase {
+            found: ConversationPhase::InviterInviteCreated,
+            ..
+        }
+    ));
+    assert!(matches!(
+        engine
+            .apply(
+                state,
+                &Command::CreateCallingCard {
+                    user_id: uid,
+                    identity_id: iid,
+                    conversation_id: missing_c,
+                    card,
+                },
+            )
+            .1
+            .unwrap_err(),
+        ApplyError::UnknownConversation { .. }
+    ));
+
+    let _ = format!("{}", CreateCallingCardError::UnknownUser(missing_u));
+    let _ = format!(
+        "{}",
+        CreateCallingCardError::UnknownIdentity {
+            user_id: missing_u,
+            identity_id: missing_i,
+        }
+    );
+    let _ = format!(
+        "{}",
+        QueryError::UnknownIdentity {
+            user_id: missing_u,
+            identity_id: missing_i,
+        }
+    );
+    let _ = format!(
+        "{}",
+        QueryError::UnknownConversation {
+            user_id: missing_u,
+            identity_id: missing_i,
+            conversation_id: missing_c,
+        }
+    );
+    let _ = format!(
+        "{}",
+        QueryError::UnexpectedPhase {
+            user_id: missing_u,
+            identity_id: missing_i,
+            conversation_id: missing_c,
+            found: ConversationPhase::Failed,
+        }
+    );
+    let _ = &CreateCallingCardError::UnsetDisplayName as &dyn std::error::Error;
+    let _ = &QueryError::UnknownUser(missing_u) as &dyn std::error::Error;
 }

@@ -2,8 +2,8 @@
 
 use super::{ConversationId, ConversationPhase, DisplayNameError, IdentityId, UserId};
 use crate::protocol::v1::{
-    AeadError, CanonicalJsonError, CompressError, EnvelopeError, IntakeError, InviteError,
-    NoticeError,
+    AeadError, CallingCardError, CanonicalJsonError, CompressError, EnvelopeError, IntakeError,
+    InviteError, KemError, NoticeError, SignError,
 };
 
 /// Why [`crate::protocol::v1::Engine::apply`] failed. State is unchanged.
@@ -140,6 +140,8 @@ pub enum PersistError {
     Intake(IntakeError),
     /// Nested display name failed.
     DisplayName(DisplayNameError),
+    /// Nested CallingCard failed.
+    CallingCard(CallingCardError),
     /// [`u64::MAX`] sequence cannot be sealed.
     SeqOverflow,
 }
@@ -162,6 +164,7 @@ impl core::fmt::Display for PersistError {
             Self::Notice(err) => write!(f, "persisted command notice: {err}"),
             Self::Intake(err) => write!(f, "persisted command intake: {err}"),
             Self::DisplayName(err) => write!(f, "persisted command display name: {err}"),
+            Self::CallingCard(err) => write!(f, "persisted command calling card: {err}"),
             Self::SeqOverflow => f.write_str("command sequence overflow"),
         }
     }
@@ -177,6 +180,7 @@ impl std::error::Error for PersistError {
             Self::Notice(err) => Some(err),
             Self::Intake(err) => Some(err),
             Self::DisplayName(err) => Some(err),
+            Self::CallingCard(err) => Some(err),
             Self::TooShort
             | Self::TooLong
             | Self::InvalidVersion
@@ -213,10 +217,90 @@ pub enum CreateIdentityError {
         /// Conflicting identity.
         identity_id: IdentityId,
     },
+    /// Encryption key generation failed.
+    Kem(KemError),
+    /// Signing key generation failed.
+    Sign(SignError),
     /// Sequence cannot increment.
     SeqOverflow,
     /// Sealing the Command failed.
     Persist(PersistError),
+}
+
+/// Why [`crate::protocol::v1::Engine::create_calling_card`] failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CreateCallingCardError {
+    /// No such user.
+    UnknownUser(UserId),
+    /// No such identity.
+    UnknownIdentity {
+        /// Parent user.
+        user_id: UserId,
+        /// Missing identity.
+        identity_id: IdentityId,
+    },
+    /// No such conversation.
+    UnknownConversation {
+        /// Parent user.
+        user_id: UserId,
+        /// Parent identity.
+        identity_id: IdentityId,
+        /// Missing conversation.
+        conversation_id: ConversationId,
+    },
+    /// Conversation is not [`super::Invitee::InviteReceived`].
+    UnexpectedPhase {
+        /// Parent user.
+        user_id: UserId,
+        /// Parent identity.
+        identity_id: IdentityId,
+        /// Conversation.
+        conversation_id: ConversationId,
+        /// Phase that was found.
+        found: ConversationPhase,
+    },
+    /// Identity has no display name.
+    UnsetDisplayName,
+    /// Mailbox or wire list failed the card gates.
+    CallingCard(CallingCardError),
+    /// Sequence cannot increment.
+    SeqOverflow,
+    /// Sealing the Command failed.
+    Persist(PersistError),
+}
+
+/// Why an Engine query getter failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryError {
+    /// No such user.
+    UnknownUser(UserId),
+    /// No such identity.
+    UnknownIdentity {
+        /// Parent user.
+        user_id: UserId,
+        /// Missing identity.
+        identity_id: IdentityId,
+    },
+    /// No such conversation.
+    UnknownConversation {
+        /// Parent user.
+        user_id: UserId,
+        /// Parent identity.
+        identity_id: IdentityId,
+        /// Missing conversation.
+        conversation_id: ConversationId,
+    },
+    /// Conversation phase does not expose this artifact.
+    UnexpectedPhase {
+        /// Parent user.
+        user_id: UserId,
+        /// Parent identity.
+        identity_id: IdentityId,
+        /// Conversation.
+        conversation_id: ConversationId,
+        /// Phase that was found.
+        found: ConversationPhase,
+    },
 }
 
 /// Why [`crate::protocol::v1::Engine::delete_user`] failed.
@@ -514,8 +598,60 @@ impl core::fmt::Display for CreateIdentityError {
                 user_id,
                 identity_id,
             } => write!(f, "duplicate identity {identity_id:?} under {user_id:?}"),
+            Self::Kem(err) => write!(f, "identity kem: {err}"),
+            Self::Sign(err) => write!(f, "identity sign: {err}"),
             Self::SeqOverflow => f.write_str("command sequence overflow"),
             Self::Persist(err) => write!(f, "persist: {err}"),
+        }
+    }
+}
+
+impl core::fmt::Display for CreateCallingCardError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnknownUser(id) => write_unknown_user(f, id),
+            Self::UnknownIdentity {
+                user_id,
+                identity_id,
+            } => write_unknown_identity(f, user_id, identity_id),
+            Self::UnknownConversation {
+                user_id,
+                identity_id,
+                conversation_id,
+            } => write_unknown_conversation(f, user_id, identity_id, conversation_id),
+            Self::UnexpectedPhase {
+                user_id,
+                identity_id,
+                conversation_id,
+                found,
+            } => write_phase(f, user_id, identity_id, conversation_id, found),
+            Self::UnsetDisplayName => f.write_str("identity display name is unset"),
+            Self::CallingCard(err) => write!(f, "calling card: {err}"),
+            Self::SeqOverflow => f.write_str("command sequence overflow"),
+            Self::Persist(err) => write!(f, "persist: {err}"),
+        }
+    }
+}
+
+impl core::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnknownUser(id) => write_unknown_user(f, id),
+            Self::UnknownIdentity {
+                user_id,
+                identity_id,
+            } => write_unknown_identity(f, user_id, identity_id),
+            Self::UnknownConversation {
+                user_id,
+                identity_id,
+                conversation_id,
+            } => write_unknown_conversation(f, user_id, identity_id, conversation_id),
+            Self::UnexpectedPhase {
+                user_id,
+                identity_id,
+                conversation_id,
+                found,
+            } => write_phase(f, user_id, identity_id, conversation_id, found),
         }
     }
 }
@@ -691,6 +827,8 @@ macro_rules! impl_std_error {
 impl_std_error!(
     CreateUserError,
     CreateIdentityError,
+    CreateCallingCardError,
+    QueryError,
     DeleteUserError,
     DeleteIdentityError,
     DeleteConversationError,

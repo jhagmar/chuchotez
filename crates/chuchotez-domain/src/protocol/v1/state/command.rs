@@ -1,7 +1,7 @@
 //! Deterministic log records. Artifacts are already drawn.
 
-use super::{ConversationId, DisplayName, Failed, IdentityId, UserId};
-use crate::protocol::v1::{Invite, Notice, Ticket};
+use super::{CallingCard, ConversationId, DisplayName, Failed, IdentityId, UserId};
+use crate::protocol::v1::{IdentityKemKeypair, IdentitySignKeypair, Invite, Notice, Ticket};
 
 /// One recorded mutation of [`super::EngineState`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +17,10 @@ pub enum Command {
         user_id: UserId,
         /// Drawn [`IdentityId`].
         identity_id: IdentityId,
+        /// Policy-matched encryption keypair.
+        encryption: IdentityKemKeypair,
+        /// Policy-matched signing keypair.
+        signing: IdentitySignKeypair,
     },
     /// Remove a user and nested identities and conversations.
     DeleteUser {
@@ -107,5 +111,16 @@ pub enum Command {
         conversation_id: ConversationId,
         /// Failure payload.
         failed: Failed,
+    },
+    /// [`super::Invitee::InviteReceived`] to [`super::Invitee::CallingCardCreated`].
+    CreateCallingCard {
+        /// Parent user.
+        user_id: UserId,
+        /// Parent identity.
+        identity_id: IdentityId,
+        /// Conversation.
+        conversation_id: ConversationId,
+        /// Minted card.
+        card: CallingCard,
     },
 }

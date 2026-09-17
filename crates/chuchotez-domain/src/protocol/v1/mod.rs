@@ -16,6 +16,7 @@ mod json;
 mod kem;
 mod mailbox;
 mod notice;
+mod sign;
 mod state;
 mod suite;
 mod ticket;
@@ -38,20 +39,25 @@ pub use hmac::{HmacSha256, HmacSha256Key, HmacSha256Mac};
 pub use invite::{Invite, InviteError};
 pub use json::{CanonicalJson, CanonicalJsonError, Json};
 pub use kem::{
-    CLASSIC_INTAKE_PK_LEN, Intake, IntakeError, IntakeKeypair, KEM_SEED_LEN, Kem, KemError,
-    KemSeed, KemSeedBytes, MLKEM768_INTAKE_PK_LEN, XWING_INTAKE_PK_LEN, intake_pk_len,
+    CLASSIC_INTAKE_PK_LEN, IdentityKemKeypair, Intake, IntakeError, IntakeKeypair, KEM_SEED_LEN,
+    Kem, KemError, KemSeed, KemSeedBytes, MLKEM768_INTAKE_PK_LEN, XWING_INTAKE_PK_LEN,
+    intake_pk_len,
 };
 pub use mailbox::{Mailbox, MailboxAddress, MailboxAddressError, MailboxKind, MailboxKindError};
 pub use notice::{Notice, NoticeError};
+pub use sign::{
+    CLASSIC_SIGN_PK_LEN, HYBRID_SIGN_PK_LEN, IdentitySignKeypair, MLDSA65_SIGN_PK_LEN,
+    SIGN_SEED_LEN, Sign, SignError, SignSeed, SignSeedBytes, sign_pk_len,
+};
 pub use state::{
     ApplyError, COMMAND_MAX_COMPRESSED, COMMAND_MAX_PERSIST_LEN, COMMAND_MAX_UNCOMPRESSED,
-    COMMAND_PERSIST_VERSION, COMMAND_SCHEMA_VERSION, Command, Conversation, ConversationId,
-    ConversationPhase, CreateIdentityError, CreateIdentityOk, CreateInviteError, CreateInviteOk,
-    CreateUserError, CreateUserOk, DISPLAY_NAME_MAX_LEN, DeleteConversationError,
+    COMMAND_PERSIST_VERSION, COMMAND_SCHEMA_VERSION, CallingCard, CallingCardError, Command,
+    Conversation, ConversationId, ConversationPhase, CreateCallingCardError, CreateIdentityError,
+    CreateInviteError, CreateUserError, DISPLAY_NAME_MAX_LEN, DeleteConversationError,
     DeleteIdentityError, DeleteUserError, DirectMessage, DisplayName, DisplayNameError,
     EngineState, Established, Failed, Group, Identity, IdentityId, Invitee, Inviter,
-    MarkNoticesPinnedError, PersistError, PersistOk, PersistedCommand, ReceiveNoticeError,
-    ReceiveNoticeOk, ReceiveTicketError, ReceiveTicketOk, SetDisplayNameError, Synchronization,
+    MarkNoticesPinnedError, PersistError, PersistOk, PersistedCommand, QueryError,
+    ReceiveNoticeError, ReceiveTicketError, SetDisplayNameError, Synchronization,
     UnsetDisplayNameError, User, UserId,
 };
 pub use suite::Suite;
