@@ -32,8 +32,7 @@ impl Engine {
     }
 
     /// Brand a preferred display name with the address gate.
-    pub fn try_new_display_name(&self, name: &str) -> Result<DisplayName, DisplayNameError> {
-        let _ = self;
+    pub fn try_new_display_name(name: &str) -> Result<DisplayName, DisplayNameError> {
         DisplayName::try_from(name)
     }
 
@@ -81,14 +80,13 @@ impl Engine {
 
     /// Parse and brand a Billboard mapper key.
     #[allow(dead_code)]
-    pub(crate) fn try_new_billboard_kind(&self, kind: &str) -> Result<BillboardKind, KindError> {
+    pub(crate) fn try_new_billboard_kind(kind: &str) -> Result<BillboardKind, KindError> {
         BillboardKind::try_from(kind)
     }
 
     /// Parse and brand a Billboard address.
     #[allow(dead_code)]
     pub(crate) fn try_new_billboard_address(
-        &self,
         address: &str,
     ) -> Result<BillboardAddress, AddressError> {
         BillboardAddress::try_from(address)
@@ -97,52 +95,45 @@ impl Engine {
     /// Bind a validated kind to a validated address.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn new_billboard(
-        &self,
-        kind: BillboardKind,
-        address: BillboardAddress,
-    ) -> Billboard {
+    pub(crate) fn new_billboard(kind: BillboardKind, address: BillboardAddress) -> Billboard {
         Billboard::new(kind, address)
     }
 
     /// Parse and brand a Mailbox mapper key.
     #[allow(dead_code)]
-    pub(crate) fn try_new_mailbox_kind(&self, kind: &str) -> Result<MailboxKind, KindError> {
+    pub(crate) fn try_new_mailbox_kind(kind: &str) -> Result<MailboxKind, KindError> {
         MailboxKind::try_from(kind)
     }
 
     /// Parse and brand a Mailbox address.
     #[allow(dead_code)]
-    pub(crate) fn try_new_mailbox_address(
-        &self,
-        address: &str,
-    ) -> Result<MailboxAddress, AddressError> {
+    pub(crate) fn try_new_mailbox_address(address: &str) -> Result<MailboxAddress, AddressError> {
         MailboxAddress::try_from(address)
     }
 
     /// Bind a validated Mailbox kind to a validated address.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn new_mailbox(&self, kind: MailboxKind, address: MailboxAddress) -> Mailbox {
+    pub(crate) fn new_mailbox(kind: MailboxKind, address: MailboxAddress) -> Mailbox {
         Mailbox::new(kind, address)
     }
 
     /// Parse and brand a Wire mapper key.
     #[allow(dead_code)]
-    pub(crate) fn try_new_wire_kind(&self, kind: &str) -> Result<WireKind, KindError> {
+    pub(crate) fn try_new_wire_kind(kind: &str) -> Result<WireKind, KindError> {
         WireKind::try_from(kind)
     }
 
     /// Parse and brand a Wire address.
     #[allow(dead_code)]
-    pub(crate) fn try_new_wire_address(&self, address: &str) -> Result<WireAddress, AddressError> {
+    pub(crate) fn try_new_wire_address(address: &str) -> Result<WireAddress, AddressError> {
         WireAddress::try_from(address)
     }
 
     /// Bind a validated Wire kind to a validated address.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn new_wire(&self, kind: WireKind, address: WireAddress) -> Wire {
+    pub(crate) fn new_wire(kind: WireKind, address: WireAddress) -> Wire {
         Wire::new(kind, address)
     }
 
@@ -163,7 +154,6 @@ impl Engine {
 
     /// Mint a CallingCard: display name, identity public keys, fresh mailbox tag, channels.
     pub(crate) fn try_new_calling_card(
-        &self,
         rng: &dyn Rng,
         display_name: DisplayName,
         encryption_pk: Vec<u8>,
@@ -171,7 +161,6 @@ impl Engine {
         mailboxes: Vec<Mailbox>,
         wires: Vec<Wire>,
     ) -> Result<super::CallingCard, super::CallingCardError> {
-        let _ = self;
         let mailbox_tag_key = MailboxTagKey::from_bytes(rng.random32().into_bytes());
         super::CallingCard::from_parts(
             display_name,
@@ -212,7 +201,7 @@ impl core::fmt::Debug for Engine {
 #[cfg(test)]
 mod tests {
     use crate::protocol::v1::{
-        AddressError, InviteError, KindError, SECRET_LEN, TicketError, fixtures,
+        AddressError, Engine, InviteError, KindError, SECRET_LEN, TicketError, fixtures,
     };
     use crate::protocol::{Policy, Random32, Rng};
 
@@ -229,36 +218,30 @@ mod tests {
         let engine = fixtures::test_engine();
         assert_eq!(format!("{engine:?}"), "Engine { suite: .. }");
         assert_eq!(engine.policy(), Policy::Hybrid);
-        let kind = engine.try_new_billboard_kind("nostr").expect("kind");
-        let address = engine
-            .try_new_billboard_address("wss://relay.example")
-            .expect("addr");
+        let kind = Engine::try_new_billboard_kind("nostr").expect("kind");
+        let address = Engine::try_new_billboard_address("wss://relay.example").expect("addr");
         assert_eq!(
-            engine.try_new_display_name("Ada").expect("name").as_str(),
+            Engine::try_new_display_name("Ada").expect("name").as_str(),
             "Ada"
         );
-        let board = engine.new_billboard(kind, address);
+        let board = Engine::new_billboard(kind, address);
         assert_eq!(board.kind().as_str(), "nostr");
         assert_eq!(
-            engine.try_new_billboard_kind("").unwrap_err(),
+            Engine::try_new_billboard_kind("").unwrap_err(),
             KindError::Empty
         );
         assert_eq!(
-            engine.try_new_billboard_address("").unwrap_err(),
+            Engine::try_new_billboard_address("").unwrap_err(),
             AddressError::Empty
         );
-        let mailbox = engine.new_mailbox(
-            engine.try_new_mailbox_kind("nostr").expect("kind"),
-            engine
-                .try_new_mailbox_address("wss://mailbox.example")
-                .expect("addr"),
+        let mailbox = Engine::new_mailbox(
+            Engine::try_new_mailbox_kind("nostr").expect("kind"),
+            Engine::try_new_mailbox_address("wss://mailbox.example").expect("addr"),
         );
         assert_eq!(mailbox.kind().as_str(), "nostr");
-        let wire = engine.new_wire(
-            engine.try_new_wire_kind("webrtc").expect("kind"),
-            engine
-                .try_new_wire_address("stun:stun.example")
-                .expect("addr"),
+        let wire = Engine::new_wire(
+            Engine::try_new_wire_kind("webrtc").expect("kind"),
+            Engine::try_new_wire_address("stun:stun.example").expect("addr"),
         );
         assert_eq!(wire.kind().as_str(), "webrtc");
         assert_eq!(
@@ -284,16 +267,15 @@ mod tests {
             InviteError::Intake(crate::protocol::v1::IntakeError::EmptyMailboxes)
         );
         assert_eq!(
-            engine
-                .try_new_calling_card(
-                    &SeedRng([3; SECRET_LEN]),
-                    engine.try_new_display_name("Ada").expect("name"),
-                    vec![1],
-                    vec![2],
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .unwrap_err(),
+            Engine::try_new_calling_card(
+                &SeedRng([3; SECRET_LEN]),
+                Engine::try_new_display_name("Ada").expect("name"),
+                vec![1],
+                vec![2],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap_err(),
             crate::protocol::v1::CallingCardError::EmptyMailboxes
         );
         let _ = engine.clone();

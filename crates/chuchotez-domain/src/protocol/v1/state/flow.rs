@@ -9,8 +9,8 @@ use super::{
 };
 use crate::protocol::v1::{
     AeadError, AeadKey, Billboard, COMMAND_MAX_COMPRESSED, COMMAND_MAX_PERSIST_LEN,
-    COMMAND_SCHEMA_VERSION, CanonicalJsonError, CompressError, DisplayNameError, EnvelopeError,
-    IntakeError, InviteError, Json, Mailbox, NoticeError, fixtures,
+    COMMAND_SCHEMA_VERSION, CanonicalJsonError, CompressError, DisplayNameError, Engine,
+    EnvelopeError, IntakeError, InviteError, Json, Mailbox, NoticeError, fixtures,
 };
 use crate::protocol::{Policy, RANDOM32_LEN, Random32, Rng};
 
@@ -18,7 +18,7 @@ fn dek() -> AeadKey {
     AeadKey::from_bytes([0x42; RANDOM32_LEN])
 }
 
-fn engine() -> crate::protocol::v1::Engine {
+fn engine() -> Engine {
     fixtures::test_engine()
 }
 
@@ -42,6 +42,23 @@ fn sample_keys() -> (
         crate::protocol::v1::IdentityKemKeypair::from_parts(vec![1], vec![2]),
         crate::protocol::v1::IdentitySignKeypair::from_parts(vec![3], vec![4]),
     )
+}
+
+fn conversation(
+    state: &EngineState,
+    user_id: UserId,
+    identity_id: IdentityId,
+    conversation_id: ConversationId,
+) -> &Conversation {
+    Engine::get_conversation(state, user_id, identity_id, conversation_id).expect("conversation")
+}
+
+fn inviter_invite(conv: &Conversation) -> &crate::protocol::v1::Invite {
+    conv.as_inviter().expect("inviter").invite()
+}
+
+fn calling_card_of(conv: &Conversation) -> &super::CallingCard {
+    conv.as_invitee().and_then(Invitee::card).expect("card")
 }
 
 struct HostRng;
@@ -143,15 +160,12 @@ fn inviter_invitee_persist_replay_and_refuse() {
         std::slice::from_ref(&wire),
     );
     let invite_ok = invite_ok.expect("invite");
-    let _ticket_blob = engine
-        .ticket_blob(&state, user_id, identity_id, conversation_id)
-        .expect("ticket");
-    let _notice_blob = engine
-        .notice_blob(&state, user_id, identity_id, conversation_id)
-        .expect("notice");
-    let tags = engine
-        .billboard_tags(&state, user_id, identity_id, conversation_id)
-        .expect("tags");
+    let tags = {
+        let invite = inviter_invite(conversation(&state, user_id, identity_id, conversation_id));
+        let _ticket_blob = invite.ticket_blob(&engine);
+        let _notice_blob = invite.notice_blob(&engine);
+        invite.billboard_tags(&engine)
+    };
     assert_eq!(tags.len(), 1);
     let _ = format!("{invite_ok:?}");
     assert_eq!(
@@ -202,12 +216,10 @@ fn inviter_invitee_persist_replay_and_refuse() {
         std::slice::from_ref(&wire),
     );
     live = s;
-    let ticket_blob = engine
-        .ticket_blob(&live, uid, iid, cid)
-        .expect("ticket get");
-    let notice_blob = engine
-        .notice_blob(&live, uid, iid, cid)
-        .expect("notice get");
+    let (ticket_blob, notice_blob) = {
+        let invite = inviter_invite(conversation(&live, uid, iid, cid));
+        (invite.ticket_blob(&engine), invite.notice_blob(&engine))
+    };
     blobs.push(ok.expect("c").persist.as_bytes().to_vec());
     let (s, ok) = engine.mark_notices_pinned(live, &dek, uid, iid, cid);
     live = s;
@@ -216,22 +228,22 @@ fn inviter_invitee_persist_replay_and_refuse() {
     let mut folded = EngineState::new();
     for blob in &blobs {
         let cmd = engine.try_open_command(&dek, blob).expect("open");
-        let (next, result) = engine.apply(folded, &cmd);
+        let (next, result) = Engine::apply(folded, &cmd);
         result.expect("apply");
         folded = next;
     }
     assert_eq!(folded, live);
     assert_eq!(
-        engine.ticket_blob(&folded, uid, iid, cid).expect("ht"),
-        engine.ticket_blob(&live, uid, iid, cid).expect("lt")
+        inviter_invite(conversation(&folded, uid, iid, cid)).ticket_blob(&engine),
+        inviter_invite(conversation(&live, uid, iid, cid)).ticket_blob(&engine)
     );
     assert_eq!(
-        engine.notice_blob(&folded, uid, iid, cid).expect("hn"),
-        engine.notice_blob(&live, uid, iid, cid).expect("ln")
+        inviter_invite(conversation(&folded, uid, iid, cid)).notice_blob(&engine),
+        inviter_invite(conversation(&live, uid, iid, cid)).notice_blob(&engine)
     );
     assert_eq!(
-        engine.billboard_tags(&folded, uid, iid, cid).expect("hg"),
-        engine.billboard_tags(&live, uid, iid, cid).expect("lg")
+        inviter_invite(conversation(&folded, uid, iid, cid)).billboard_tags(&engine),
+        inviter_invite(conversation(&live, uid, iid, cid)).billboard_tags(&engine)
     );
 
     let rng = fixtures::CounterRng::new();
@@ -524,7 +536,7 @@ fn named_method_errors() {
             std::slice::from_ref(&wire),
         )
         .expect("mint occupy");
-    let (state, occupied) = engine.apply(
+    let (state, occupied) = Engine::apply(
         state,
         &Command::CreateInvite {
             user_id,
@@ -821,14 +833,14 @@ fn apply_and_persist_errors() {
     let engine = engine();
     let dek = dek();
     let missing_u = missing_id();
-    let (state, err) = engine.apply(
+    let (state, err) = Engine::apply(
         EngineState::new(),
         &Command::DeleteUser { user_id: missing_u },
     );
     assert_eq!(err.unwrap_err(), ApplyError::UnknownUser(missing_u));
     assert_eq!(state, EngineState::new());
 
-    let (state, _) = engine.apply(
+    let (state, _) = Engine::apply(
         EngineState::new().with_command_seq(u64::MAX),
         &Command::CreateUser {
             user_id: UserId::from_bytes([1; RANDOM32_LEN]),
@@ -874,16 +886,15 @@ fn apply_and_persist_errors() {
             std::slice::from_ref(&wire),
         )
         .expect("invite");
-    let (state, _) = engine.apply(EngineState::new(), &Command::CreateUser { user_id: uid });
+    let (state, _) = Engine::apply(EngineState::new(), &Command::CreateUser { user_id: uid });
     assert!(matches!(
-        engine
-            .apply(state.clone(), &Command::CreateUser { user_id: uid })
+        Engine::apply(state.clone(), &Command::CreateUser { user_id: uid })
             .1
             .unwrap_err(),
         ApplyError::DuplicateUser(_)
     ));
     let (enc, sig) = sample_keys();
-    let (state, _) = engine.apply(
+    let (state, _) = Engine::apply(
         state,
         &Command::CreateIdentity {
             user_id: uid,
@@ -893,18 +904,17 @@ fn apply_and_persist_errors() {
         },
     );
     assert!(matches!(
-        engine
-            .apply(
-                state.clone(),
-                &Command::CreateIdentity {
-                    user_id: uid,
-                    identity_id: iid,
-                    encryption: enc,
-                    signing: sig,
-                },
-            )
-            .1
-            .unwrap_err(),
+        Engine::apply(
+            state.clone(),
+            &Command::CreateIdentity {
+                user_id: uid,
+                identity_id: iid,
+                encryption: enc,
+                signing: sig,
+            },
+        )
+        .1
+        .unwrap_err(),
         ApplyError::DuplicateIdentity { .. }
     ));
     let create = Command::CreateInvite {
@@ -913,10 +923,10 @@ fn apply_and_persist_errors() {
         conversation_id: cid,
         invite: invite.clone(),
     };
-    let (state, ok) = engine.apply(state, &create);
+    let (state, ok) = Engine::apply(state, &create);
     ok.expect("first invite");
     assert!(matches!(
-        engine.apply(state.clone(), &create).1.unwrap_err(),
+        Engine::apply(state.clone(), &create).1.unwrap_err(),
         ApplyError::DuplicateConversation { .. }
     ));
     let recv = Command::ReceiveTicket {
@@ -926,44 +936,42 @@ fn apply_and_persist_errors() {
         ticket: invite.ticket().clone(),
     };
     assert!(matches!(
-        engine.apply(state.clone(), &recv).1.unwrap_err(),
+        Engine::apply(state.clone(), &recv).1.unwrap_err(),
         ApplyError::DuplicateConversation { .. }
     ));
     let notice = crate::protocol::v1::Notice::from_intake(Policy::Hybrid, invite.intake());
     assert!(matches!(
-        engine
-            .apply(
-                state.clone(),
-                &Command::ReceiveNotice {
-                    user_id: uid,
-                    identity_id: iid,
-                    conversation_id: cid,
-                    notice: notice.clone(),
-                }
-            )
-            .1
-            .unwrap_err(),
+        Engine::apply(
+            state.clone(),
+            &Command::ReceiveNotice {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: cid,
+                notice: notice.clone(),
+            }
+        )
+        .1
+        .unwrap_err(),
         ApplyError::UnexpectedPhase {
             found: ConversationPhase::InviterInviteCreated,
             ..
         }
     ));
     assert!(matches!(
-        engine
-            .apply(
-                state,
-                &Command::FailConversation {
-                    user_id: uid,
-                    identity_id: iid,
-                    conversation_id: cid,
-                    failed: Failed::PolicyNotAccepted {
-                        ticket: invite.ticket().clone(),
-                        notice,
-                    },
-                }
-            )
-            .1
-            .unwrap_err(),
+        Engine::apply(
+            state,
+            &Command::FailConversation {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: cid,
+                failed: Failed::PolicyNotAccepted {
+                    ticket: invite.ticket().clone(),
+                    notice,
+                },
+            }
+        )
+        .1
+        .unwrap_err(),
         ApplyError::UnexpectedPhase {
             found: ConversationPhase::InviterInviteCreated,
             ..
@@ -1881,12 +1889,9 @@ fn persist_size_limits_and_commit_persist() {
         std::slice::from_ref(&wire),
     );
     invite_ok.expect("inv");
-    let ticket_blob = engine
-        .ticket_blob(&inviter, user_id, identity_id, inviter_cid)
-        .expect("ticket");
-    let notice_blob = engine
-        .notice_blob(&inviter, user_id, identity_id, inviter_cid)
-        .expect("notice");
+    let invite = inviter_invite(conversation(&inviter, user_id, identity_id, inviter_cid));
+    let ticket_blob = invite.ticket_blob(&engine);
+    let notice_blob = invite.notice_blob(&engine);
     let rng = fixtures::CounterRng::new();
     let (invitee, iu, ok) = engine.create_user(EngineState::new(), &rng, &dek);
     ok.expect("iu");
@@ -2003,37 +2008,15 @@ fn calling_card_mint_getters_and_errors() {
         CreateCallingCardError::UnknownIdentity { .. }
     ));
     assert!(matches!(
-        engine
-            .ticket_blob(&state, missing_u, missing_i, missing_c)
-            .unwrap_err(),
+        Engine::get_conversation(&state, missing_u, missing_i, missing_c).unwrap_err(),
         QueryError::UnknownUser(_)
     ));
     assert!(matches!(
-        engine
-            .ticket_blob(&state, uid, missing_i, missing_c)
-            .unwrap_err(),
+        Engine::get_conversation(&state, uid, missing_i, missing_c).unwrap_err(),
         QueryError::UnknownIdentity { .. }
     ));
     assert!(matches!(
-        engine.ticket_blob(&state, uid, iid, missing_c).unwrap_err(),
-        QueryError::UnknownConversation { .. }
-    ));
-    assert!(matches!(
-        engine
-            .calling_card(&state, missing_u, missing_i, missing_c)
-            .unwrap_err(),
-        QueryError::UnknownUser(_)
-    ));
-    assert!(matches!(
-        engine
-            .calling_card(&state, uid, missing_i, missing_c)
-            .unwrap_err(),
-        QueryError::UnknownIdentity { .. }
-    ));
-    assert!(matches!(
-        engine
-            .calling_card(&state, uid, iid, missing_c)
-            .unwrap_err(),
+        Engine::get_conversation(&state, uid, iid, missing_c).unwrap_err(),
         QueryError::UnknownConversation { .. }
     ));
     assert!(matches!(
@@ -2099,14 +2082,15 @@ fn calling_card_mint_getters_and_errors() {
             ..
         }
     ));
-    assert!(matches!(
-        engine
-            .calling_card(&inviter, uid, iid, inv_cid)
-            .unwrap_err(),
-        QueryError::UnexpectedPhase { .. }
-    ));
-    let ticket_blob = engine.ticket_blob(&inviter, uid, iid, inv_cid).expect("t");
-    let notice_blob = engine.notice_blob(&inviter, uid, iid, inv_cid).expect("n");
+    assert!(
+        conversation(&inviter, uid, iid, inv_cid)
+            .as_invitee()
+            .and_then(Invitee::card)
+            .is_none()
+    );
+    let invite = inviter_invite(conversation(&inviter, uid, iid, inv_cid));
+    let ticket_blob = invite.ticket_blob(&engine);
+    let notice_blob = invite.notice_blob(&engine);
 
     let rng = fixtures::CounterRng::new();
     let (invitee, iu, ok) = engine.create_user(EngineState::new(), &rng, &dek);
@@ -2135,21 +2119,7 @@ fn calling_card_mint_getters_and_errors() {
     );
     let (invitee, cid, ok) = engine.receive_ticket(invitee, &rng, &dek, iu, ii, &ticket_blob);
     ok.expect("ticket");
-    assert!(matches!(
-        engine.ticket_blob(&invitee, iu, ii, cid).unwrap_err(),
-        QueryError::UnexpectedPhase {
-            found: ConversationPhase::InviteeTicketReceived,
-            ..
-        }
-    ));
-    assert!(matches!(
-        engine.notice_blob(&invitee, iu, ii, cid).unwrap_err(),
-        QueryError::UnexpectedPhase { .. }
-    ));
-    assert!(matches!(
-        engine.billboard_tags(&invitee, iu, ii, cid).unwrap_err(),
-        QueryError::UnexpectedPhase { .. }
-    ));
+    assert!(conversation(&invitee, iu, ii, cid).as_inviter().is_none());
     let (invitee, ok) =
         engine.receive_notice(invitee, &dek, iu, ii, cid, &notice_blob, &[Policy::Hybrid]);
     ok.expect("notice");
@@ -2247,7 +2217,7 @@ fn calling_card_mint_getters_and_errors() {
             .phase(),
         ConversationPhase::InviteeCallingCardCreated
     );
-    let card = engine.calling_card(&minted, iu, ii, cid).expect("get");
+    let card = calling_card_of(conversation(&minted, iu, ii, cid));
     assert_eq!(card.display_name(), &name);
     assert_eq!(card.mailboxes().len(), 1);
     assert_eq!(card.wires().len(), 1);
@@ -2263,11 +2233,11 @@ fn calling_card_mint_getters_and_errors() {
     let cmd = engine
         .try_open_command(&dek, persist.as_bytes())
         .expect("reopen");
-    let (hydrated, result) = engine.apply(invitee, &cmd);
+    let (hydrated, result) = Engine::apply(invitee, &cmd);
     result.expect("apply card");
     assert_eq!(
-        engine.calling_card(&hydrated, iu, ii, cid).expect("h"),
-        engine.calling_card(&minted, iu, ii, cid).expect("m")
+        calling_card_of(conversation(&hydrated, iu, ii, cid)),
+        calling_card_of(conversation(&minted, iu, ii, cid))
     );
 
     let (unset, ok) = engine.unset_display_name(minted.clone(), &dek, iu, ii);
@@ -2281,12 +2251,12 @@ fn calling_card_mint_getters_and_errors() {
             .display_name()
             .is_none()
     );
-    let card_after = engine.calling_card(&unset, iu, ii, cid).expect("kept");
+    let card_after = calling_card_of(conversation(&unset, iu, ii, cid));
     assert_eq!(card_after.display_name(), &name);
 
     let (enc, sig) = sample_keys();
-    let (state, _) = engine.apply(EngineState::new(), &Command::CreateUser { user_id: uid });
-    let (state, _) = engine.apply(
+    let (state, _) = Engine::apply(EngineState::new(), &Command::CreateUser { user_id: uid });
+    let (state, _) = Engine::apply(
         state,
         &Command::CreateIdentity {
             user_id: uid,
@@ -2305,36 +2275,34 @@ fn calling_card_mint_getters_and_errors() {
     )
     .expect("parts");
     assert!(matches!(
-        engine
-            .apply(
-                inviter,
-                &Command::CreateCallingCard {
-                    user_id: uid,
-                    identity_id: iid,
-                    conversation_id: inv_cid,
-                    card: card.clone(),
-                },
-            )
-            .1
-            .unwrap_err(),
+        Engine::apply(
+            inviter,
+            &Command::CreateCallingCard {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: inv_cid,
+                card: card.clone(),
+            },
+        )
+        .1
+        .unwrap_err(),
         ApplyError::UnexpectedPhase {
             found: ConversationPhase::InviterInviteCreated,
             ..
         }
     ));
     assert!(matches!(
-        engine
-            .apply(
-                state,
-                &Command::CreateCallingCard {
-                    user_id: uid,
-                    identity_id: iid,
-                    conversation_id: missing_c,
-                    card,
-                },
-            )
-            .1
-            .unwrap_err(),
+        Engine::apply(
+            state,
+            &Command::CreateCallingCard {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: missing_c,
+                card,
+            },
+        )
+        .1
+        .unwrap_err(),
         ApplyError::UnknownConversation { .. }
     ));
 
@@ -2359,15 +2327,6 @@ fn calling_card_mint_getters_and_errors() {
             user_id: missing_u,
             identity_id: missing_i,
             conversation_id: missing_c,
-        }
-    );
-    let _ = format!(
-        "{}",
-        QueryError::UnexpectedPhase {
-            user_id: missing_u,
-            identity_id: missing_i,
-            conversation_id: missing_c,
-            found: ConversationPhase::Failed,
         }
     );
     let _ = &CreateCallingCardError::UnsetDisplayName as &dyn std::error::Error;

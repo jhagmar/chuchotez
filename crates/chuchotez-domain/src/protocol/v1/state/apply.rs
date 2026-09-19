@@ -8,7 +8,6 @@ use super::{
 impl crate::protocol::v1::Engine {
     /// Fold `command` into `state`. No entropy. On `Err`, returned state is unchanged.
     pub fn apply(
-        &self,
         mut state: EngineState,
         command: &Command,
     ) -> (EngineState, Result<(), ApplyError>) {

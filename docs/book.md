@@ -85,9 +85,7 @@ fails closed. Layout version is the module (`v1` today).
 **Notice** is the Billboard body at the Tag. JSON members are `policy`,
 `intake_pk` (unpadded base64url), `mailboxes`, `wires`. Each mailbox and wire is
 `{ "kind", "address" }`. Unknown or missing members fail closed.
-After `create_invite`, Engine getters return the compact Ticket string, the
-sealed Notice string, and Billboard tags. `receive_notice` opens a Notice blob;
-`policy`
+`receive_notice` opens a Notice blob; `policy`
 in the JSON is branded from the Notice. `intake_pk` length must match that
 Policy (32 / 1184 / 1216). Pass `accepted: &[engine.policy()]` when the host
 will continue only at this Engine’s Policy. A well-formed Notice whose Policy
@@ -119,10 +117,11 @@ or `v1::Engine::new(suite, policy)`. Chuchotez stores no suite of its own.
 
 Public Engine methods drive or query `EngineState`. Mutators return
 `PersistOk`. `create_user`, `create_identity`, `create_invite`, and
-`receive_ticket` also return the drawn id. After a write, the host reads Ticket
-and Notice blobs, Billboard tags, and a CallingCard through Engine getters.
-Hosts brand channels with `TryFrom` and `Billboard::new` (and mailbox/wire
-equivalents).
+`receive_ticket` also return the drawn id. `get_conversation` returns the
+conversation ADT. Match `Inviter::InviteCreated` (or `NoticePinned`) for
+`Invite::ticket_blob`, `notice_blob`, and `billboard_tags`. Match
+`Invitee::CallingCardCreated` for the card. Hosts brand channels with
+`TryFrom` and `Billboard::new` (and mailbox/wire equivalents).
 
 `EngineState` is a map of `User` keyed by `UserId`. Each `User` is a map of
 `Identity` keyed by `IdentityId` (opaque 32 bytes at create; a later slice
@@ -159,7 +158,7 @@ PostQuantum ML-DSA-65, Hybrid both concatenated). `SignSeed` is `SIGN_SEED_LEN`
 ## Call the library
 
 The facade crate is `chuchotez`. The crate doctest is the host sketch: pin
-from getter blobs; after `InviteReceived`, `set_display_name` and
+from `Invite` blobs; after `InviteReceived`, `set_display_name` and
 `create_calling_card`. Fill `Random32` from a CSPRNG in a real host. The host
 shows the Ticket blob as a QR or link after `NoticePinned`. The invitee calls
 `receive_ticket` with that blob, fetches the Notice, and calls

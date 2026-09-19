@@ -1,16 +1,14 @@
 //! Named Engine methods that drive [`super::EngineState`].
 
 use super::{
-    ApplyError, CallingCard, Command, Conversation, ConversationId, CreateCallingCardError,
-    CreateIdentityError, CreateInviteError, CreateUserError, DeleteConversationError,
-    DeleteIdentityError, DeleteUserError, DirectMessage, DisplayName, EngineState, Failed,
-    IdentityId, Invitee, Inviter, MarkNoticesPinnedError, PersistError, PersistedCommand,
-    QueryError, ReceiveNoticeError, ReceiveTicketError, SetDisplayNameError, UnsetDisplayNameError,
-    UserId,
+    ApplyError, Command, Conversation, ConversationId, CreateCallingCardError, CreateIdentityError,
+    CreateInviteError, CreateUserError, DeleteConversationError, DeleteIdentityError,
+    DeleteUserError, DirectMessage, DisplayName, EngineState, Failed, IdentityId, Invitee,
+    MarkNoticesPinnedError, PersistError, PersistedCommand, QueryError, ReceiveNoticeError,
+    ReceiveTicketError, SetDisplayNameError, UnsetDisplayNameError, UserId,
 };
 use crate::protocol::v1::{
-    AeadKey, Billboard, BillboardTag, IdentityKemKeypair, Invite, KemSeed, Mailbox, SignSeed, Wire,
-    notice,
+    AeadKey, Billboard, IdentityKemKeypair, KemSeed, Mailbox, SignSeed, Wire, notice,
 };
 use crate::protocol::{Policy, Rng};
 
@@ -494,7 +492,7 @@ impl crate::protocol::v1::Engine {
             Some(name) => name.clone(),
             None => return (state, Err(CreateCallingCardError::UnsetDisplayName)),
         };
-        let card = match self.try_new_calling_card(
+        let card = match Self::try_new_calling_card(
             rng,
             display_name,
             identity.encryption().public_bytes().to_vec(),
@@ -518,62 +516,19 @@ impl crate::protocol::v1::Engine {
         .map_err_state(map_create_calling_card)
     }
 
-    /// Compact Ticket string for an Inviter conversation.
-    pub fn ticket_blob(
-        &self,
+    /// Look up a conversation.
+    ///
+    /// Match the returned ADT for artifacts: [`super::Inviter::InviteCreated`]
+    /// holds [`crate::protocol::v1::Invite`]; [`super::Invitee::CallingCardCreated`]
+    /// holds the card.
+    pub fn get_conversation(
         state: &EngineState,
         user_id: UserId,
         identity_id: IdentityId,
         conversation_id: ConversationId,
-    ) -> Result<String, QueryError> {
-        Ok(lookup_invite(state, user_id, identity_id, conversation_id)?
-            .ticket()
-            .serialize(self))
-    }
-
-    /// Sealed Notice string for an Inviter conversation.
-    pub fn notice_blob(
-        &self,
-        state: &EngineState,
-        user_id: UserId,
-        identity_id: IdentityId,
-        conversation_id: ConversationId,
-    ) -> Result<String, QueryError> {
-        let invite = lookup_invite(state, user_id, identity_id, conversation_id)?;
-        Ok(self.serialize_notice(invite.ticket(), invite.intake()))
-    }
-
-    /// Billboard tags, one per Billboard on the Ticket.
-    pub fn billboard_tags(
-        &self,
-        state: &EngineState,
-        user_id: UserId,
-        identity_id: IdentityId,
-        conversation_id: ConversationId,
-    ) -> Result<Vec<BillboardTag>, QueryError> {
-        let invite = lookup_invite(state, user_id, identity_id, conversation_id)?;
-        let tag = invite.ticket().billboard_tag(self);
-        Ok(invite
-            .ticket()
-            .billboards()
-            .iter()
-            .map(|_| tag.clone())
-            .collect())
-    }
-
-    /// CallingCard for [`super::Invitee::CallingCardCreated`].
-    pub fn calling_card<'a>(
-        &self,
-        state: &'a EngineState,
-        user_id: UserId,
-        identity_id: IdentityId,
-        conversation_id: ConversationId,
-    ) -> Result<&'a CallingCard, QueryError> {
-        let _ = self;
+    ) -> Result<&Conversation, QueryError> {
         match lookup_conversation(state, user_id, identity_id, conversation_id) {
-            Lookup::Ok(Conversation::DirectMessage(DirectMessage::Invitee(
-                Invitee::CallingCardCreated { card, .. },
-            ))) => Ok(card),
+            Lookup::Ok(conversation) => Ok(conversation),
             Lookup::UnknownUser => Err(QueryError::UnknownUser(user_id)),
             Lookup::UnknownIdentity => Err(QueryError::UnknownIdentity {
                 user_id,
@@ -583,12 +538,6 @@ impl crate::protocol::v1::Engine {
                 user_id,
                 identity_id,
                 conversation_id,
-            }),
-            Lookup::Ok(found) => Err(QueryError::UnexpectedPhase {
-                user_id,
-                identity_id,
-                conversation_id,
-                found: found.phase(),
             }),
         }
     }
@@ -607,7 +556,7 @@ impl crate::protocol::v1::Engine {
             Ok(persist) => persist,
             Err(err) => return (state, Err(CommitError::Persist(err))),
         };
-        let (state, result) = self.apply(state, cmd);
+        let (state, result) = Self::apply(state, cmd);
         match result {
             Ok(()) => (state, Ok(persist)),
             Err(err) => (state, Err(CommitError::Apply(err))),
@@ -678,35 +627,6 @@ fn lookup_conversation(
                 Some(conversation) => Lookup::Ok(conversation),
             },
         },
-    }
-}
-
-fn lookup_invite(
-    state: &EngineState,
-    user_id: UserId,
-    identity_id: IdentityId,
-    conversation_id: ConversationId,
-) -> Result<&Invite, QueryError> {
-    match lookup_conversation(state, user_id, identity_id, conversation_id) {
-        Lookup::Ok(Conversation::DirectMessage(DirectMessage::Inviter(
-            Inviter::InviteCreated { invite } | Inviter::NoticePinned { invite },
-        ))) => Ok(invite),
-        Lookup::UnknownUser => Err(QueryError::UnknownUser(user_id)),
-        Lookup::UnknownIdentity => Err(QueryError::UnknownIdentity {
-            user_id,
-            identity_id,
-        }),
-        Lookup::UnknownConversation => Err(QueryError::UnknownConversation {
-            user_id,
-            identity_id,
-            conversation_id,
-        }),
-        Lookup::Ok(found) => Err(QueryError::UnexpectedPhase {
-            user_id,
-            identity_id,
-            conversation_id,
-            found: found.phase(),
-        }),
     }
 }
 

@@ -178,6 +178,16 @@ pub enum Inviter {
     },
 }
 
+impl Inviter {
+    /// Ticket plus Intake.
+    #[must_use]
+    pub const fn invite(&self) -> &Invite {
+        match self {
+            Self::InviteCreated { invite } | Self::NoticePinned { invite } => invite,
+        }
+    }
+}
+
 /// Invitee-side DM phases.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Invitee {
@@ -202,6 +212,17 @@ pub enum Invitee {
         /// Minted card.
         card: CallingCard,
     },
+}
+
+impl Invitee {
+    /// Minted card at [`Self::CallingCardCreated`].
+    #[must_use]
+    pub const fn card(&self) -> Option<&CallingCard> {
+        match self {
+            Self::CallingCardCreated { card, .. } => Some(card),
+            _ => None,
+        }
+    }
 }
 
 /// Handshake complete. No fields this slice.
@@ -275,6 +296,24 @@ impl Conversation {
             Self::DirectMessage(DirectMessage::Failed(_)) => ConversationPhase::Failed,
             Self::Group(_) => ConversationPhase::Group,
             Self::Synchronization(_) => ConversationPhase::Synchronization,
+        }
+    }
+
+    /// Inviter-side DM.
+    #[must_use]
+    pub const fn as_inviter(&self) -> Option<&Inviter> {
+        match self {
+            Self::DirectMessage(DirectMessage::Inviter(inviter)) => Some(inviter),
+            _ => None,
+        }
+    }
+
+    /// Invitee-side DM.
+    #[must_use]
+    pub const fn as_invitee(&self) -> Option<&Invitee> {
+        match self {
+            Self::DirectMessage(DirectMessage::Invitee(invitee)) => Some(invitee),
+            _ => None,
         }
     }
 }
@@ -352,6 +391,8 @@ mod tests {
                 .expect("invite"),
         }));
         assert_eq!(dm.phase(), ConversationPhase::InviterInviteCreated);
+        let _ = dm.as_inviter().expect("inviter").invite();
+        assert!(dm.as_invitee().is_none());
         let pinned = Conversation::DirectMessage(DirectMessage::Inviter(Inviter::NoticePinned {
             invite: fixtures::test_engine()
                 .try_new_invite(
@@ -363,10 +404,13 @@ mod tests {
                 .expect("invite"),
         }));
         assert_eq!(pinned.phase(), ConversationPhase::InviterNoticePinned);
+        let _ = pinned.as_inviter().expect("pinned").invite();
         let tr = Conversation::DirectMessage(DirectMessage::Invitee(Invitee::TicketReceived {
             ticket: fixtures::sample_ticket(2),
         }));
         assert_eq!(tr.phase(), ConversationPhase::InviteeTicketReceived);
+        assert!(tr.as_inviter().is_none());
+        assert!(tr.as_invitee().expect("tr").card().is_none());
         let notice = crate::protocol::v1::Notice::from_intake(crate::protocol::Policy::Hybrid, &{
             let engine = fixtures::test_engine();
             engine
@@ -385,6 +429,7 @@ mod tests {
             notice: notice.clone(),
         }));
         assert_eq!(ir.phase(), ConversationPhase::InviteeInviteReceived);
+        assert!(ir.as_invitee().expect("ir").card().is_none());
         let card = crate::protocol::v1::CallingCard::from_parts(
             crate::protocol::v1::DisplayName::try_from("Ada").expect("name"),
             vec![1],
@@ -400,6 +445,7 @@ mod tests {
             card,
         }));
         assert_eq!(cc.phase(), ConversationPhase::InviteeCallingCardCreated);
+        assert!(cc.as_invitee().expect("cc").card().is_some());
         let failed =
             Conversation::DirectMessage(DirectMessage::Failed(Failed::PolicyNotAccepted {
                 ticket: fixtures::sample_ticket(1),
@@ -421,5 +467,10 @@ mod tests {
                 ),
             }));
         assert_eq!(failed.phase(), ConversationPhase::Failed);
+        assert!(failed.as_inviter().is_none());
+        assert!(failed.as_invitee().is_none());
+        assert!(g.as_inviter().is_none());
+        assert!(s.as_invitee().is_none());
+        assert!(e.as_inviter().is_none());
     }
 }

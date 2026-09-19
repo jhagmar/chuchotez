@@ -23,8 +23,9 @@ chuchotez = { git = "https://github.com/jhagmar/chuchotez" }
 
 Construct a `v1::Engine` with `v1::std_engine(Policy)`. Pass `&dyn Rng`
 whenever the protocol needs entropy. The crate doctest is the sketch:
-originate methods return the drawn id; write `PersistOk`, then Engine getters.
-Fill `Random32` from a CSPRNG in a real host.
+originate methods return the drawn id; write `PersistOk`, then
+`get_conversation` and match the conversation ADT. Fill `Random32` from a
+CSPRNG in a real host.
 
 ## Workspace
 
