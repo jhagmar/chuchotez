@@ -269,7 +269,7 @@ pub enum CreateCallingCardError {
     Persist(PersistError),
 }
 
-/// Why an Engine query getter failed.
+/// Why [`crate::protocol::v1::Engine::get_conversation`] failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryError {
     /// No such user.
@@ -289,17 +289,6 @@ pub enum QueryError {
         identity_id: IdentityId,
         /// Missing conversation.
         conversation_id: ConversationId,
-    },
-    /// Conversation phase does not expose this artifact.
-    UnexpectedPhase {
-        /// Parent user.
-        user_id: UserId,
-        /// Parent identity.
-        identity_id: IdentityId,
-        /// Conversation.
-        conversation_id: ConversationId,
-        /// Phase that was found.
-        found: ConversationPhase,
     },
 }
 
@@ -646,12 +635,6 @@ impl core::fmt::Display for QueryError {
                 identity_id,
                 conversation_id,
             } => write_unknown_conversation(f, user_id, identity_id, conversation_id),
-            Self::UnexpectedPhase {
-                user_id,
-                identity_id,
-                conversation_id,
-                found,
-            } => write_phase(f, user_id, identity_id, conversation_id, found),
         }
     }
 }

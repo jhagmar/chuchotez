@@ -1,6 +1,6 @@
 //! Invite: Ticket and Intake.
 
-use super::{Intake, IntakeError, KemError, Ticket, TicketError};
+use super::{BillboardTag, Engine, Intake, IntakeError, KemError, Ticket, TicketError};
 
 /// Why minting an Invite failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +73,29 @@ impl Invite {
     #[must_use]
     pub const fn intake(&self) -> &Intake {
         &self.intake
+    }
+
+    /// Compact Ticket string.
+    #[must_use]
+    pub fn ticket_blob(&self, engine: &Engine) -> String {
+        self.ticket.serialize(engine)
+    }
+
+    /// Sealed Notice string.
+    #[must_use]
+    pub fn notice_blob(&self, engine: &Engine) -> String {
+        engine.serialize_notice(self.ticket(), self.intake())
+    }
+
+    /// Billboard tags, one per Billboard on the Ticket.
+    #[must_use]
+    pub fn billboard_tags(&self, engine: &Engine) -> Vec<BillboardTag> {
+        let tag = self.ticket.billboard_tag(engine);
+        self.ticket
+            .billboards()
+            .iter()
+            .map(|_| tag.clone())
+            .collect()
     }
 }
 
@@ -178,22 +201,17 @@ mod tests {
 
     #[test]
     fn every_policy_mints_invite() {
-        use crate::protocol::v1::fixtures;
-        use crate::protocol::v1::intake_pk_len;
+        use crate::protocol::v1::{Engine, fixtures, intake_pk_len};
         for policy in [Policy::Classic, Policy::PostQuantum, Policy::Hybrid] {
             let engine = fixtures::engine_with_policy(policy);
             assert_eq!(engine.policy(), policy);
-            let board = engine.new_billboard(
-                engine.try_new_billboard_kind("nostr").expect("kind"),
-                engine
-                    .try_new_billboard_address("wss://relay.example")
-                    .expect("addr"),
+            let board = Engine::new_billboard(
+                Engine::try_new_billboard_kind("nostr").expect("kind"),
+                Engine::try_new_billboard_address("wss://relay.example").expect("addr"),
             );
-            let mailbox = engine.new_mailbox(
-                engine.try_new_mailbox_kind("nostr").expect("kind"),
-                engine
-                    .try_new_mailbox_address("wss://mailbox.example")
-                    .expect("addr"),
+            let mailbox = Engine::new_mailbox(
+                Engine::try_new_mailbox_kind("nostr").expect("kind"),
+                Engine::try_new_mailbox_address("wss://mailbox.example").expect("addr"),
             );
             let invite = engine
                 .try_new_invite(
@@ -203,10 +221,16 @@ mod tests {
                     &[],
                 )
                 .expect("invite");
-            let ticket_blob = invite.ticket().serialize(&engine);
+            let ticket_blob = invite.ticket_blob(&engine);
             let parsed = engine.try_parse_ticket(&ticket_blob).expect("parse");
             assert_eq!(&parsed, invite.ticket());
-            let notice_blob = engine.serialize_notice(invite.ticket(), invite.intake());
+            assert_eq!(ticket_blob, invite.ticket().serialize(&engine));
+            let notice_blob = invite.notice_blob(&engine);
+            assert_eq!(
+                notice_blob,
+                engine.serialize_notice(invite.ticket(), invite.intake())
+            );
+            assert_eq!(invite.billboard_tags(&engine).len(), 1);
             let notice = engine
                 .try_parse_notice(invite.ticket(), &notice_blob)
                 .expect("notice");

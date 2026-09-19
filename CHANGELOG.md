@@ -10,8 +10,9 @@ ML-DSA-65, Hybrid both concatenated). After `InviteReceived`,
 `create_calling_card` mints a local `CallingCard` and logs
 `CallingCardCreated`. Named mutators return `PersistOk`. `create_user`,
 `create_identity`, `create_invite`, and `receive_ticket` also return the drawn
-id. Ticket and Notice blobs, Billboard tags, and the CallingCard are Engine
-getters. `std_suite` Sign is `LibcruxSign`. Wrap, sign, and send of a
+id. `get_conversation` returns the conversation ADT. Match `InviteCreated`
+for Ticket and Notice blobs and Billboard tags; match `CallingCardCreated`
+for the card. `std_suite` Sign is `LibcruxSign`. Wrap, sign, and send of a
 CallingCard are a later slice.
 
 `EngineState` is the host-owned ADT: `User` / `Identity` / `Conversation`
