@@ -5,7 +5,8 @@ depends on this crate, keeps a `v1::Engine` and `v1::EngineState`, and supplies
 cryptographic randomness and a DEK. The library compiles for
 `wasm32-unknown-unknown` with the Rust standard library.
 
-The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
+The complete guide is [docs/book.md](docs/book.md). The handshake in ordinary
+words is [docs/protocol.md](docs/protocol.md). API reference is rustdoc.
 
 [![CI](https://github.com/jhagmar/chuchotez/actions/workflows/ci.yml/badge.svg)](https://github.com/jhagmar/chuchotez/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jhagmar/chuchotez/actions/workflows/codeql.yml/badge.svg)](https://github.com/jhagmar/chuchotez/actions/workflows/codeql.yml)

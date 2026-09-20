@@ -2,7 +2,8 @@
 
 This book is the guide to the locked library. Types and methods named here exist
 in the crates unless a section says the work is a later slice. rustdoc is the
-API reference. The [README](../README.md) is depend and bootstrap.
+API reference. The [README](../README.md) is depend and bootstrap. The
+handshake in ordinary words is [protocol.md](protocol.md).
 
 Chuchotez is a communications backend the person shipping the app does not
 operate. A **host** is the application that depends on the `chuchotez` crate:
