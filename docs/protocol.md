@@ -316,6 +316,14 @@ Tag = bstr .size 32
 TagKey = bstr .size 32
 ```
 
+#### UnixSeconds
+
+Unix time in seconds, the same unit `time_bin` takes.
+
+```
+UnixSeconds = uint
+```
+
 #### TimeBin
 
 Hour index of Unix time.
@@ -328,7 +336,7 @@ TimeBin = uint
 TimeBin = time_bin(unix_seconds)
 ```
 
-`unix_seconds` is a Unix time in seconds. The host watches `TimeBin-1`,
+`unix_seconds` is a `UnixSeconds` value. The host watches `TimeBin-1`,
 `TimeBin`, and `TimeBin+1`.
 
 #### MailboxTag
@@ -425,15 +433,28 @@ Command into EngineState with no extra randomness.
 CommandOp = "create_user" / "create_identity" / "delete_user"
           / "delete_identity" / "delete_conversation"
           / "set_display_name" / "unset_display_name"
-          / "create_invite" / "mark_notices_pinned"
+          / "create_invite" / "mark_notice_pinned"
           / "receive_ticket" / "receive_notice"
-          / "fail_conversation" / "create_calling_card"
+          / "create_introduction" / "receive_invitee_introduction"
+          / "receive_inviter_introduction" / "introduction_sent"
+          / "confirm_established" / "reject_established"
+          / "fail_conversation"
+
+FailReason = "policy_not_accepted" / "invite_expired"
+           / "notice_unlock_failed" / "notice_conflict"
+           / "invitee_introduction_unlock_failed"
+           / "invitee_introduction_verify_failed"
+           / "inviter_introduction_unlock_failed"
+           / "inviter_introduction_verify_failed"
+           / "duplicate_invitee_introduction"
+           / "duplicate_inviter_introduction"
+           / "digest_rejected"
 
 Command = { op: CommandOp }
 ```
 
 The remaining fields are exactly those for `op`. `ticket` is a DMTicket.
-`notice` is a DMNotice.
+`notice` is a DMNotice. `now` is `UnixSeconds`.
 
 | `op` | Other fields |
 | --- | --- |
@@ -444,19 +465,24 @@ The remaining fields are exactly those for `op`. `ticket` is a DMTicket.
 | `delete_conversation` | `user_id`, `identity_id`, `conversation_id` |
 | `set_display_name` | `user_id`, `identity_id`, `name` |
 | `unset_display_name` | `user_id`, `identity_id` |
-| `create_invite` | `user_id`, `identity_id`, `conversation_id`, `ticket`, `intake_pk`, `intake_sk`, `mailboxes`, `wires` |
-| `mark_notices_pinned` | `user_id`, `identity_id`, `conversation_id` |
+| `create_invite` | `user_id`, `identity_id`, `conversation_id`, `ticket`, `intake_pk`, `intake_sk`, `mailboxes`, `wires`, `expires` |
+| `mark_notice_pinned` | `user_id`, `identity_id`, `conversation_id`, `now` |
 | `receive_ticket` | `user_id`, `identity_id`, `conversation_id`, `ticket` |
-| `receive_notice` | `user_id`, `identity_id`, `conversation_id`, `notice` |
-| `fail_conversation` | `user_id`, `identity_id`, `conversation_id`, `reason` = `policy_not_accepted`, `ticket`, `notice` |
-| `create_calling_card` | `user_id`, `identity_id`, `conversation_id`, `name`, `encryption_pk`, `signing_pk`, `mailbox_tag_key`, `mailboxes`, `wires` |
+| `receive_notice` | `user_id`, `identity_id`, `conversation_id`, `notice`, `now` |
+| `create_introduction` | `user_id`, `identity_id`, `conversation_id`, `name`, `encryption_pk`, `signing_pk`, `mailbox_tag_key`, `mailboxes`, `wires`, `intake_pk`, `intake_sk`, `intake_tag_key`, `sig`, `kem_ct`, `mailbox_blob`, `now` |
+| `receive_invitee_introduction` | `user_id`, `identity_id`, `conversation_id`, `invitee_introduction`, `name`, `encryption_pk`, `signing_pk`, `mailbox_tag_key`, `mailboxes`, `wires`, `sig`, `kem_ct`, `mailbox_blob`, `now` |
+| `receive_inviter_introduction` | `user_id`, `identity_id`, `conversation_id`, `inviter_introduction`, `now` |
+| `introduction_sent` | `user_id`, `identity_id`, `conversation_id`, `now` |
+| `confirm_established` | `user_id`, `identity_id`, `conversation_id`, `now` |
+| `reject_established` | `user_id`, `identity_id`, `conversation_id`, `now` |
+| `fail_conversation` | `user_id`, `identity_id`, `conversation_id`, `reason`, `now` |
 
-Planned `create_calling_card` fields: `intake_pk`, `intake_sk`, `intake_tag_key`,
-`sig`, `mailbox_blob`.
-
-```
-policy_not_accepted = "policy_not_accepted"
-```
+`invitee_introduction` is a `DMSignedInviteeIntroduction`.
+`inviter_introduction` is a `DMSignedInviterIntroduction`. `reason` is a
+`FailReason`. `fail_conversation` with `policy_not_accepted` also holds
+`policy`. `fail_conversation` with `invite_expired` also holds `expires`.
+`Failed.reason` is the PascalCase of that `FailReason`
+(`"policy_not_accepted"` → `"PolicyNotAccepted"`).
 
 ### Direct-message types
 
@@ -514,6 +540,8 @@ to the inviter, then `DMInviteeIntakeTagKey` for posts to the invitee.
 
 Billboard body. `intake_pk` is the wrap target for the invitee’s
 DMSignedInviteeIntroduction. `mailboxes` are where that blob is posted.
+`expires` is the last `UnixSeconds` at which a handshake operation on this
+invite MAY succeed.
 
 ```
 DMNotice = {
@@ -521,6 +549,7 @@ DMNotice = {
   intake_pk: PublicKey,
   mailboxes: [1*4 Mailbox],
   wires: [*4 Wire],
+  expires: UnixSeconds,
 }
 ```
 
@@ -688,15 +717,14 @@ tag                = UTF-8 "chuchotez/1/dm-established"
 EstablishedDigest  = mac(tag, canonical(DMSignedInviterIntroduction) || canonical(DMSignedInviteeIntroduction))
 ```
 
-The concatenation order is inviter then invitee. When a party confirms the
-peer’s digest equals its own, that party’s conversation becomes `Established`.
+The concatenation order is inviter then invitee. `confirmEstablished` moves
+that party from `Confirming` to `Established`. `rejectEstablished` moves
+`Confirming` to `Failed` with `DigestRejected`.
 
 ### Other conversations
 
-`Group` and `Synchronization` conversations. Pairwise streams after
-`Established`. Those tickets are domain records of a different sort.
-
-Types and encodings for those conversations are later work.
+Pairwise streams after `Established`. Those tickets are domain records of a
+different sort. Types and encodings for those streams are later work.
 
 ---
 
@@ -726,7 +754,8 @@ members, and members whose JSON sort does not match this table.
 | --- | --- |
 | `Policy` | JSON string `"Classic"`, `"PostQuantum"`, or `"Hybrid"` |
 | `CommandOp` | JSON string of the enumerant name (`"create_user"`, …) |
-| `policy_not_accepted` | JSON string `"policy_not_accepted"` |
+| `FailReason` | JSON string of the enumerant name (`"policy_not_accepted"`, …) |
+| CDDL `uint` | JSON number of that integer |
 | CDDL `tstr` | JSON string of that Unicode value |
 | CDDL `bstr` | JSON string `text(bytes)` |
 | CDDL array | JSON array of `J(T)` in list order |
@@ -801,83 +830,422 @@ length ≤ 16668.
 
 ## Library
 
-The library is bound to one `Policy`. It holds no suite of its own in the
-process. Named operations drive `EngineState`. `apply` folds a `Command` with
-no extra randomness. Operations that need entropy take `random32` from the
-host.
+The library is bound to one `Policy`. Named operations drive `EngineState`.
+`apply` folds a `Command` with no extra randomness. Operations that need
+entropy take `random32` from a host `Rng`. Mutators return sealed persist
+bytes (`nonce || lock` with the host DEK). `EngineState` is an opaque handle
+the host holds in memory. Reload is `apply` of each persist record in order.
+The query `Conversation` omits ticket secret, DEK, intake `sk`, identity `sk`,
+and `mailbox_tag_key`. TypeScript field names are camelCase of the CDDL names.
 
-Operations named on this page:
+```ts
+declare const brand: unique symbol
+type Brand<T, B extends string> = T & { readonly [brand]: B }
 
+type Random32 = Brand<Uint8Array, "Random32">
+type AeadKey = Brand<Uint8Array, "AeadKey">
+type UserId = Brand<Uint8Array, "UserId">
+type IdentityId = Brand<Uint8Array, "IdentityId">
+type ConversationId = Brand<Uint8Array, "ConversationId">
+type Tag = Brand<Uint8Array, "Tag">
+type TagKey = Brand<Uint8Array, "TagKey">
+type PublicKey = Brand<Uint8Array, "PublicKey">
+type SigningPublicKey = Brand<Uint8Array, "SigningPublicKey">
+type UnixSeconds = number
+type PersistBytes = Uint8Array
+type Policy = "Classic" | "PostQuantum" | "Hybrid"
+type Kind = string
+type Address = string
+type DisplayName = string
+type Billboard = { kind: Kind; address: Address }
+type Mailbox = { kind: Kind; address: Address }
+type Wire = { kind: Kind; address: Address }
+type EngineState = Brand<object, "EngineState">
+
+type Rng = { random32(): Random32 }
+
+type Result<T, E = EngineError> =
+  | { ok: true; value: T }
+  | { ok: false; error: E }
+
+type EngineError =
+  | { code: "WrongPhase" }
+  | { code: "MalformedTicket" }
+  | { code: "ExpiresNotAfterNow" }
+  | { code: "UnknownIds" }
+  | { code: "MissingDisplayName" }
+  | { code: "MalformedDisplayName" }
+  | { code: "ChannelBounds" }
+  | { code: "MalformedPersist" }
+
+type ConversationRef = {
+  userId: UserId
+  identityId: IdentityId
+  conversationId: ConversationId
+}
+
+type MutateOk = { state: EngineState; persist: PersistBytes }
+type CreateUserOk = MutateOk & { userId: UserId }
+type CreateIdentityOk = MutateOk & { identityId: IdentityId }
+type CreateInviteOk = MutateOk & { conversationId: ConversationId }
+type ReceiveTicketOk = MutateOk & { conversationId: ConversationId }
+
+type BillboardPin = {
+  billboard: Billboard
+  tag: Tag
+  body: Uint8Array
+}
+
+type MailboxPost = {
+  mailbox: Mailbox
+  tag: Tag
+  body: Uint8Array
+}
+
+type Inviter =
+  | { phase: "InviteCreated"; expires: UnixSeconds }
+  | { phase: "NoticePinned"; expires: UnixSeconds }
+  | { phase: "IntroductionMinted"; expires: UnixSeconds }
+  | { phase: "Confirming"; expires: UnixSeconds; digest: string }
+
+type Invitee =
+  | { phase: "TicketReceived" }
+  | { phase: "InviteReceived"; policy: Policy; expires: UnixSeconds }
+  | { phase: "IntroductionMinted"; policy: Policy; expires: UnixSeconds }
+  | { phase: "IntroductionSent"; policy: Policy; expires: UnixSeconds }
+  | { phase: "Confirming"; policy: Policy; expires: UnixSeconds; digest: string }
+
+type Established = {
+  name: DisplayName
+  encryptionPk: PublicKey
+  signingPk: SigningPublicKey
+  mailboxes: Mailbox[]
+  wires: Wire[]
+  digest: string
+}
+
+type Failed =
+  | { reason: "PolicyNotAccepted"; policy: Policy }
+  | { reason: "InviteExpired"; expires: UnixSeconds }
+  | { reason: "NoticeUnlockFailed" }
+  | { reason: "NoticeConflict" }
+  | { reason: "InviteeIntroductionUnlockFailed" }
+  | { reason: "InviteeIntroductionVerifyFailed" }
+  | { reason: "InviterIntroductionUnlockFailed" }
+  | { reason: "InviterIntroductionVerifyFailed" }
+  | { reason: "DuplicateInviteeIntroduction" }
+  | { reason: "DuplicateInviterIntroduction" }
+  | { reason: "DigestRejected" }
+
+type DirectMessage =
+  | { sort: "Inviter"; value: Inviter }
+  | { sort: "Invitee"; value: Invitee }
+  | { sort: "Established"; value: Established }
+  | { sort: "Failed"; value: Failed }
+
+type Conversation =
+  | { sort: "DirectMessage"; value: DirectMessage }
+  | { sort: "Group" }
+  | { sort: "Synchronization" }
+
+declare class Engine {
+  constructor(policy: Policy)
+  createUser(state: EngineState, rng: Rng, dek: AeadKey): Result<CreateUserOk>
+  createIdentity(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    userId: UserId,
+  ): Result<CreateIdentityOk>
+  deleteUser(state: EngineState, dek: AeadKey, userId: UserId): Result<MutateOk>
+  deleteIdentity(
+    state: EngineState,
+    dek: AeadKey,
+    userId: UserId,
+    identityId: IdentityId,
+  ): Result<MutateOk>
+  deleteConversation(
+    state: EngineState,
+    dek: AeadKey,
+    ids: ConversationRef,
+  ): Result<MutateOk>
+  createInvite(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    userId: UserId,
+    identityId: IdentityId,
+    billboards: Billboard[],
+    mailboxes: Mailbox[],
+    wires: Wire[],
+    expires: UnixSeconds,
+    now: UnixSeconds,
+  ): Result<CreateInviteOk>
+  markNoticePinned(
+    state: EngineState,
+    dek: AeadKey,
+    ids: ConversationRef,
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  receiveTicket(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    userId: UserId,
+    identityId: IdentityId,
+    ticketHostString: string,
+  ): Result<ReceiveTicketOk>
+  receiveNotice(
+    state: EngineState,
+    dek: AeadKey,
+    ids: ConversationRef,
+    noticeHostString: string,
+    accepted: Policy[],
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  setDisplayName(
+    state: EngineState,
+    dek: AeadKey,
+    userId: UserId,
+    identityId: IdentityId,
+    name: string,
+  ): Result<MutateOk>
+  unsetDisplayName(
+    state: EngineState,
+    dek: AeadKey,
+    userId: UserId,
+    identityId: IdentityId,
+  ): Result<MutateOk>
+  createIntroduction(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    ids: ConversationRef,
+    mailboxes: Mailbox[],
+    wires: Wire[],
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  receiveInviteeIntroduction(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    ids: ConversationRef,
+    mailboxHostString: string,
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  receiveInviterIntroduction(
+    state: EngineState,
+    dek: AeadKey,
+    ids: ConversationRef,
+    mailboxHostString: string,
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  introductionSent(
+    state: EngineState,
+    dek: AeadKey,
+    ids: ConversationRef,
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  confirmEstablished(
+    state: EngineState,
+    dek: AeadKey,
+    ids: ConversationRef,
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  rejectEstablished(
+    state: EngineState,
+    dek: AeadKey,
+    ids: ConversationRef,
+    now: UnixSeconds,
+  ): Result<MutateOk>
+  getConversation(
+    state: EngineState,
+    userId: UserId,
+    identityId: IdentityId,
+    conversationId: ConversationId,
+  ): Result<Conversation>
+  ticketHostString(state: EngineState, ids: ConversationRef): Result<string>
+  noticeBody(state: EngineState, ids: ConversationRef): Result<Uint8Array>
+  billboardPins(state: EngineState, ids: ConversationRef): Result<BillboardPin[]>
+  mailboxPosts(state: EngineState, ids: ConversationRef): Result<MailboxPost[]>
+  establishedDigest(state: EngineState, ids: ConversationRef): Result<string>
+  apply(
+    state: EngineState,
+    persist: PersistBytes,
+    dek: AeadKey,
+  ): Result<EngineState>
+}
 ```
-create_user
-create_identity
-create_invite       → DMInvite
-receive_ticket
-receive_notice
-set_display_name
-create_calling_card
-apply(EngineState, Command) → EngineState
-```
 
-Argument lists, errors, and query operations are later work.
+`digest` and `establishedDigest` are `text(EstablishedDigest)`.
+`billboardPins` `body` is UTF-8 of the `DMNotice` host string. `mailboxPosts`
+`body` is UTF-8 of the signed-introduction host string. `createInvite` MUST
+refuse when `expires <= now`. `createIntroduction` MUST refuse when the
+identity has no `DisplayName`.
 
 ---
 
 ## Mappers
 
 A mapper implements one `Kind` of Channel. The host selects mappers by
-`BillboardKind`, `MailboxKind`, and `WireKind`. Coordinates are `Address`
-values.
+`BillboardKind`, `MailboxKind`, and `WireKind`. The host calls mappers with
+plans from `billboardPins` and `mailboxPosts`. The ADT moves when the host
+calls the matching Engine method.
 
-Operations already required by the direct-message flow:
+```ts
+type MailboxWatchEvent = {
+  tag: Tag
+  body: Uint8Array
+}
 
+interface BillboardMapper {
+  pin(billboard: Billboard, tag: Tag, body: Uint8Array): Promise<void>
+  fetch(billboard: Billboard, tag: Tag): Promise<Uint8Array | null>
+}
+
+interface MailboxMapper {
+  post(mailbox: Mailbox, tag: Tag, body: Uint8Array): Promise<void>
+  fetch(mailbox: Mailbox, tag: Tag): Promise<Uint8Array | null>
+  watch(
+    mailbox: Mailbox,
+    tagKey: TagKey,
+    unixSeconds: UnixSeconds,
+  ): AsyncIterable<MailboxWatchEvent>
+}
+
+interface WireMapper {
+  send(wire: Wire, body: Uint8Array): Promise<void>
+  receive(wire: Wire): AsyncIterable<Uint8Array>
+}
 ```
-pin(billboard, tag, body)      inviter writes a Notice
-fetch(billboard, tag) → body   invitee reads a Notice
-post(mailbox, tag, body)       writer drops a mailbox blob
-```
 
-The host watches `MailboxTag` for `TimeBin-1`, `TimeBin`, and `TimeBin+1`.
-
-Wire send and receive, mapper errors, and size limits at the mapper edge are
-later work.
+`BillboardMapper.fetch` returns `null` when no body is stored.
+`MailboxMapper.watch` MUST yield bodies for `MailboxTag` at `TimeBin-1`,
+`TimeBin`, and `TimeBin+1` for `time_bin(unixSeconds)` and that `tagKey`.
 
 ---
 
 ## State machine
 
-`EngineState` is an ADT of users, identities, and conversations. Illegal
-transitions are unrepresentable. The full transition table is later work.
+Query `Conversation` is library state. It has no on-wire `"type"`
+discriminator.
 
-Outcomes named on this page:
+```
+Conversation = DirectMessage / Group / Synchronization
 
-- A well-formed `DMNotice` whose Policy is outside the host `accepted` list
-  becomes `Failed::PolicyNotAccepted`.
-- Anyone who has the `DMTicket` can pin a `DMNotice` at the `DMInviteTag`.
-- One valid `DMSignedInviteeIntroduction` per conversation.
-- One valid `DMSignedInviterIntroduction` per conversation.
-- When a party confirms `EstablishedDigest` matches the peer, that party’s
-  conversation becomes `Established`.
+Group = {}
+Synchronization = {}
 
-### Direct-message flow
+DirectMessage = Inviter / Invitee / Established / Failed
 
-1. The inviter calls `create_user`, `create_identity`, and `create_invite`, and
-   receives a `DMInvite`.
-2. The inviter pins the `DMNotice` at each Billboard under the `DMInviteTag`,
-   and shares the `DMTicket` with the invitee.
-3. The invitee calls `receive_ticket`. The host fetches the `DMNotice`. The
-   invitee calls `receive_notice`.
-4. The invitee calls `set_display_name` and `create_calling_card`, and stores a
-   local `CallingCard` (shipped).
-5. Planned: the invitee builds a `DMInviteeIntroduction`, signs it, and `wrap`s
-   the `DMSignedInviteeIntroduction` to the inviter’s Intake `pk`. The host
-   posts it on the inviter Mailboxes at the `DMInviterIntakeTagKey`.
-6. Planned: the inviter opens that blob (one valid signed introduction per
-   conversation), builds a `DMInviterIntroduction`, signs it, and `wrap`s the
-   `DMSignedInviterIntroduction` to `DMInviteeIntroduction.intake_pk`. The host
-   posts it on the invitee Mailboxes at the `DMInviteeIntakeTagKey`.
-7. Planned: each side computes `EstablishedDigest`. When a party confirms the
-   two digests match, that party’s conversation becomes `Established`.
+Inviter = InviterInviteCreated
+        / InviterNoticePinned
+        / InviterIntroductionMinted
+        / InviterConfirming
+
+InviterInviteCreated = { expires: UnixSeconds }
+InviterNoticePinned = { expires: UnixSeconds }
+InviterIntroductionMinted = { expires: UnixSeconds }
+InviterConfirming = { expires: UnixSeconds, digest: tstr }
+
+Invitee = InviteeTicketReceived
+        / InviteeInviteReceived
+        / InviteeIntroductionMinted
+        / InviteeIntroductionSent
+        / InviteeConfirming
+
+InviteeTicketReceived = {}
+InviteeInviteReceived = { policy: Policy, expires: UnixSeconds }
+InviteeIntroductionMinted = { policy: Policy, expires: UnixSeconds }
+InviteeIntroductionSent = { policy: Policy, expires: UnixSeconds }
+InviteeConfirming = { policy: Policy, expires: UnixSeconds, digest: tstr }
+
+Established = {
+  name: DisplayName,
+  encryption_pk: PublicKey,
+  signing_pk: SigningPublicKey,
+  mailboxes: [1*4 Mailbox],
+  wires: [*4 Wire],
+  digest: tstr,
+}
+
+Failed = FailedPolicyNotAccepted
+       / FailedInviteExpired
+       / FailedNoticeUnlockFailed
+       / FailedNoticeConflict
+       / FailedInviteeIntroductionUnlockFailed
+       / FailedInviteeIntroductionVerifyFailed
+       / FailedInviterIntroductionUnlockFailed
+       / FailedInviterIntroductionVerifyFailed
+       / FailedDuplicateInviteeIntroduction
+       / FailedDuplicateInviterIntroduction
+       / FailedDigestRejected
+
+FailedPolicyNotAccepted = { reason: "PolicyNotAccepted", policy: Policy }
+FailedInviteExpired = { reason: "InviteExpired", expires: UnixSeconds }
+FailedNoticeUnlockFailed = { reason: "NoticeUnlockFailed" }
+FailedNoticeConflict = { reason: "NoticeConflict" }
+FailedInviteeIntroductionUnlockFailed = {
+  reason: "InviteeIntroductionUnlockFailed",
+}
+FailedInviteeIntroductionVerifyFailed = {
+  reason: "InviteeIntroductionVerifyFailed",
+}
+FailedInviterIntroductionUnlockFailed = {
+  reason: "InviterIntroductionUnlockFailed",
+}
+FailedInviterIntroductionVerifyFailed = {
+  reason: "InviterIntroductionVerifyFailed",
+}
+FailedDuplicateInviteeIntroduction = {
+  reason: "DuplicateInviteeIntroduction",
+}
+FailedDuplicateInviterIntroduction = {
+  reason: "DuplicateInviterIntroduction",
+}
+FailedDigestRejected = { reason: "DigestRejected" }
+```
+
+`Established` is the peer `CallingCard` with `mailbox_tag_key` omitted.
+Anyone who has the `DMTicket` can pin a `DMNotice` at the `DMInviteTag`.
+
+Handshake operations that take `now` MUST store `Failed` `InviteExpired` when
+`now > expires` and the conversation is still pre-`Established`:
+`markNoticePinned`, `receiveNotice`, `createIntroduction`,
+`receiveInviteeIntroduction`, `receiveInviterIntroduction`, `introductionSent`,
+`confirmEstablished`, `rejectEstablished`.
+
+| From | Method | To |
+| --- | --- | --- |
+| (none) | `createInvite` | `Inviter` `InviteCreated` |
+| `InviteCreated` | `markNoticePinned` | `NoticePinned` |
+| `NoticePinned` | `receiveInviteeIntroduction` | `Inviter` `IntroductionMinted` |
+| `Inviter` `IntroductionMinted` | `introductionSent` | `Inviter` `Confirming` |
+| (none) | `receiveTicket` | `Invitee` `TicketReceived` |
+| `TicketReceived` | `receiveNotice` | `InviteReceived` |
+| `InviteReceived` | `createIntroduction` | `Invitee` `IntroductionMinted` |
+| `Invitee` `IntroductionMinted` | `introductionSent` | `IntroductionSent` |
+| `IntroductionSent` | `receiveInviterIntroduction` | `Invitee` `Confirming` |
+| `Inviter` `Confirming` or `Invitee` `Confirming` | `confirmEstablished` | `Established` |
+| `Inviter` `Confirming` or `Invitee` `Confirming` | `rejectEstablished` | `Failed` `DigestRejected` |
+
+`receiveInviteeIntroduction` also mints the inviter’s signed introduction.
+`receiveInviterIntroduction` also computes `EstablishedDigest`. An empty
+Billboard fetch leaves `TicketReceived`.
+
+| Method | Failure stored |
+| --- | --- |
+| `receiveNotice` | `PolicyNotAccepted` when Policy is outside `accepted` |
+| `receiveNotice` | `NoticeUnlockFailed` when the blob fails `unlock` |
+| `receiveNotice` | `NoticeConflict` when a second well-formed Notice disagrees with the stored one |
+| `receiveInviteeIntroduction` | `InviteeIntroductionUnlockFailed` or `InviteeIntroductionVerifyFailed` |
+| `receiveInviteeIntroduction` | `DuplicateInviteeIntroduction` when a second valid invitee intro arrives |
+| `receiveInviterIntroduction` | `InviterIntroductionUnlockFailed` or `InviterIntroductionVerifyFailed` |
+| `receiveInviterIntroduction` | `DuplicateInviterIntroduction` when a second valid inviter intro arrives |
+
+A wrong-phase call is `EngineError` `WrongPhase`; the conversation is
+unchanged. A malformed ticket at `receiveTicket` is `MalformedTicket`; no
+conversation row is created.
 
 ---
 
@@ -890,6 +1258,7 @@ for that key is later work.
 
 ## Host
 
-The host supplies `random32`, appends and reads persist bytes, and talks to
-mappers. It chooses the medium for the `DMTicket` host string. It supplies the
-`accepted` Policy list for `receive_notice`.
+The host supplies `Rng.random32`, appends and reads persist bytes, and talks
+to mappers. It chooses the medium for the `DMTicket` host string. It supplies
+`now` as `UnixSeconds`, `expires` at `createInvite`, and the `accepted` Policy
+list for `receiveNotice`.
