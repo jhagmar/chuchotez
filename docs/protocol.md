@@ -1,8 +1,9 @@
-# Direct-message handshake
+# Chuchotez
 
-This page is the v1 handshake contract: the information domain, and the
-mappings from those values onto serialized bytes. Names here are protocol
-names. The [book](book.md) is the locked library API. rustdoc is the reference.
+This page is the Chuchotez protocol: the information model, encodings, and
+interfaces. A library, host, or mapper in any language implements this page.
+The [book](book.md) documents the locked Rust crate. rustdoc is that crate’s
+API reference.
 
 **Shipped** work is in the crates. **Planned** work is decided and waiting on a
 slice. This page is ahead of the crates: a later slice will propagate it.
@@ -10,70 +11,26 @@ slice. This page is ahead of the crates: a later slice will propagate it.
 The **host** is the app. It supplies `random32`, stores the local log, and talks
 to the network. Chuchotez builds the envelopes.
 
-The **inviter** starts a conversation. The **invitee** joins it.
+## Roles
 
-A **`Policy`** is `Classic`, `PostQuantum`, or `Hybrid`. It chooses the public-key
-algorithms in v1 algorithms.
+The **inviter** starts a direct-message conversation. The **invitee** joins it.
 
-The **`Engine`** is the library handle bound to one Policy and the functions
-below.
+A **`Policy`** is `Classic`, `PostQuantum`, or `Hybrid`. It chooses the
+public-key algorithms in [Algorithms](#algorithms).
 
-**`EngineState`** is the host’s saved users, identities, and conversations.
+The **library** is the handle bound to one Policy (`Engine` in the reference
+crate) and the functions below. **`EngineState`** is the host’s saved users,
+identities, and conversations.
 
-A **`DMInvite`** is a `DMTicket` and a `DMNotice`.
-
-A **`DMTicket`** is the information the inviter shares with the invitee to start
-the handshake. The host carries the ticket’s host string over a medium it
-chooses.
-
-A **`Billboard`** is a Channel the inviter writes and the invitee reads. A
-**`Tag`** is a locator. A **`DMInviteTag`** is the Tag for the Notice on those
-Billboards.
-
-The `DMTicket` contains a secret and a list of `Billboard`s. The `DMNotice` is
-pinned using a `DMInviteTag` derived from the secret.
-
-A **`Mailbox`** is a Channel the invitee writes and the inviter reads.
-
-A **`Wire`** is a Channel both sides use, with no store.
-
-A **`CallingCard`** is one party’s name, keys, Mailboxes, and Wires.
-
-## Handshake
-
-1. The inviter calls `create_user`, `create_identity`, and `create_invite`, and
-   receives a `DMInvite`.
-2. The inviter pins the `DMNotice` at each Billboard under the `DMInviteTag`, and
-   shares the `DMTicket` with the invitee.
-3. The invitee calls `receive_ticket`. The host fetches the `DMNotice`. The
-   invitee calls `receive_notice`.
-4. The invitee calls `set_display_name` and `create_calling_card`, and stores a
-   local `CallingCard` (shipped).
-5. Planned: the invitee builds a `DMInviteeIntroduction`, signs it, and `wrap`s
-   the `DMSignedInviteeIntroduction` to the inviter’s Intake `pk`. The host
-   posts it on the inviter Mailboxes at the `DMInviterIntakeTagKey`.
-6. Planned: the inviter opens that blob (one valid signed introduction per
-   conversation), builds a `DMInviterIntroduction`, signs it, and `wrap`s the
-   `DMSignedInviterIntroduction` to `DMInviteeIntroduction.intake_pk`. The host
-   posts it on the invitee Mailboxes at the `DMInviteeIntakeTagKey`.
-7. Planned: each side computes `EstablishedDigest`. When a party confirms the
-   two digests match, that party’s conversation becomes `Established`.
-
-A well-formed DMNotice whose Policy is outside the host `accepted` list becomes
-`Failed::PolicyNotAccepted`. Anyone who has the DMTicket can pin a DMNotice at
-the DMInviteTag.
+A **mapper** talks to one kind of Channel (Billboard, Mailbox, or Wire). The
+host chooses mappers. Examples of kind strings: `nostr`, `webrtc`.
 
 ## Notation
 
+Byte strings, concatenation, and algorithms:
+
 ```
 ||              concatenation
-byte            8-bit value
-byte[n]         exactly n bytes
-byte[]          bytes of length given beside the field
-string          Unicode string
-List<T>         ordered sequence of T
-T | U           alternative
-record          value with named fields
 refuse          input rejected
 x[0..k]         first k bytes of x
 be<n>u(x)       n-bit big-endian unsigned encoding of x
@@ -90,8 +47,24 @@ with one party.
 `seal` uses a shared secret. `wrap` uses someone’s `pk`. `sign` uses a signing
 `sk`.
 
-Types below are values in the information domain. [Serialization](#serialization)
-maps those values to bytes.
+Information-model types use **CDDL** (RFC 8610). On this page:
+
+```
+Name = Type              named sort
+{ field: Type }          record (map with those keys)
+[n*m Type]               list of Type, length n..=m
+[Type]                   list of Type, length unconstrained here
+A / B                    alternative
+bstr .size n             exactly n bytes
+tstr .size (a..b)        Unicode string, UTF-8 byte length a..=b
+```
+
+Two names with the same CDDL shape are distinct sorts (`UserId` and `Secret`
+are both 32-byte strings). Constraints CDDL does not express (Unicode
+Normalization Form C, Policy-dependent key lengths) sit in the prose under the
+type.
+
+[Serialization](#serialization) maps those values to bytes.
 
 ### Functions
 
@@ -159,7 +132,7 @@ open(key, nonce, ciphertext) → bytes | refuse
 
 `seal` hides `plaintext`. `open` returns it when `key` and `nonce` match. A
 change to the ciphertext makes `open` refuse. `nonce` MUST be unique for that
-`key`. Associated data is empty.
+`key`.
 
 ```
 keygen(policy, seed) → (pk, sk) | refuse
@@ -181,7 +154,9 @@ verify(policy, pk, message, sig) → ok | refuse
 the signature `sig` for `message` using the secret key `sk`. `verify` accepts
 when `sig` matches the public key `pk` and `message`.
 
-## v1 algorithms
+## Algorithms
+
+v1 bindings for the functions above.
 
 | Function | v1 |
 | --- | --- |
@@ -213,332 +188,384 @@ PostQuantum concatenation.
 
 ---
 
-## Domain
+## Information model
 
-### Policy
+### General types
+
+#### Policy
 
 Chooses the KEM and signature algorithms.
 
 ```
-type Policy   Classic | PostQuantum | Hybrid
+Policy = "Classic" / "PostQuantum" / "Hybrid"
 ```
 
-### Kind
+#### Kind
 
 A mapper registry key. Hosts pick the strings their mappers understand
 (examples: `nostr`, `webrtc`).
 
 ```
-type Kind   string   [a-z][a-z0-9-]*    UTF-8 byte length 1..=32
+Kind = tstr .size (1..32) .regexp "[a-z][a-z0-9-]*"
+
+BillboardKind = Kind
+MailboxKind   = Kind
+WireKind      = Kind
 ```
 
-```
-type BillboardKind  Kind
-type MailboxKind    Kind
-type WireKind       Kind
-```
+#### Address
 
-### Address
-
-A mapper coordinate.
+A mapper coordinate. Unicode Normalization Form C, no NUL, no combining mark.
 
 ```
-type Address   string   nonempty     UTF-8 byte length 1..=256
-                            Unicode Normalization Form C
-                            no NUL, no combining mark
+Address = tstr .size (1..256)
+
+BillboardAddress = Address
+MailboxAddress   = Address
+WireAddress      = Address
 ```
 
-```
-type BillboardAddress  Address
-type MailboxAddress    Address
-type WireAddress       Address
-```
-
-### Billboard
+#### Billboard
 
 Place an actor A can publish information so that a given actor B can read it.
 
 ```
-record Billboard {
-    kind     BillboardKind
-    address  BillboardAddress
+Billboard = {
+  kind: BillboardKind,
+  address: BillboardAddress,
 }
 ```
 
-### Mailbox
+#### Mailbox
 
 Place an actor A can read information that a given actor B can write.
 
 ```
-record Mailbox {
-    kind     MailboxKind
-    address  MailboxAddress
+Mailbox = {
+  kind: MailboxKind,
+  address: MailboxAddress,
 }
 ```
 
-### Wire
+#### Wire
 
 Live path where A can transmit information to B and vice versa, with no store.
 
 ```
-record Wire {
-    kind     WireKind
-    address  WireAddress
+Wire = {
+  kind: WireKind,
+  address: WireAddress,
 }
 ```
 
-### DisplayName
+#### DisplayName
 
-A name shown for a user.
+A name shown for a user. Unicode Normalization Form C, no NUL, no combining
+mark.
 
 ```
-type DisplayName   string   nonempty     UTF-8 byte length 1..=64
-                            Unicode Normalization Form C
-                            no NUL, no combining mark
+DisplayName = tstr .size (1..64)
 ```
 
-### UserId
+#### UserId
 
 Identifies a user.
 
 ```
-type UserId   byte[32]
+UserId = bstr .size 32
 ```
 
-### IdentityId
+#### IdentityId
 
 Identifies an identity under a user.
 
 ```
-type IdentityId   byte[32]
+IdentityId = bstr .size 32
 ```
 
-### ConversationId
+#### ConversationId
 
 Identifies a conversation under an identity.
 
 ```
-type ConversationId   byte[32]
+ConversationId = bstr .size 32
 ```
 
-### Secret
+#### Secret
 
 32-byte secret. Ticket capabilities, expand keys, and other 32-byte secrets use
 this sort.
 
 ```
-type Secret   byte[32]
+Secret = bstr .size 32
 ```
 
-### Tag
+#### Tag
 
 32-byte locator. Billboard pins and Mailbox bins use tags.
 
 ```
-type Tag   byte[32]
+Tag = bstr .size 32
 ```
 
-### TagKey
+#### TagKey
 
 32-byte key from which tags are derived with `expand`.
 
 ```
-type TagKey   byte[32]
+TagKey = bstr .size 32
 ```
 
-### PublicKey
+#### TimeBin
+
+Hour index of Unix time.
+
+```
+TimeBin = uint
+```
+
+```
+TimeBin = time_bin(unix_seconds)
+```
+
+`unix_seconds` is a Unix time in seconds. The host watches `TimeBin-1`,
+`TimeBin`, and `TimeBin+1`.
+
+#### MailboxTag
+
+A Mailbox locator for a time bin of Messages. Planned: label encoding.
+
+```
+MailboxTag = Tag
+```
+
+```
+MailboxTag = expand(tag_key, label || be<64>u(TimeBin))
+             label encoding later
+```
+
+#### PublicKey
 
 Public key for `wrap`. Length is the `keygen` `pk` length for the Policy that
 applies.
 
 ```
-type PublicKey   byte[]
+PublicKey = bstr
 ```
 
-### SecretKey
+#### SecretKey
 
 Secret key for `unwrap`. Length is the `keygen` `sk` length for that Policy.
 
 ```
-type SecretKey   byte[]
+SecretKey = bstr
 ```
 
-### KeyPair
+#### KeyPair
 
 A `wrap` key pair.
 
 ```
-record KeyPair {
-    pk  PublicKey
-    sk  SecretKey
+KeyPair = {
+  pk: PublicKey,
+  sk: SecretKey,
 }
 ```
 
-### SigningPublicKey
+#### SigningPublicKey
 
 Public key for `verify`. Length is the `sign_keygen` `pk` length for the Policy
 that applies.
 
 ```
-type SigningPublicKey   byte[]
+SigningPublicKey = bstr
 ```
 
-### SigningSecretKey
+#### SigningSecretKey
 
 Secret key for `sign`. Length is the `sign_keygen` `sk` length for that Policy.
 
 ```
-type SigningSecretKey   byte[]
+SigningSecretKey = bstr
 ```
 
-### SigningKeyPair
+#### SigningKeyPair
 
 A `sign` key pair.
 
 ```
-record SigningKeyPair {
-    pk  SigningPublicKey
-    sk  SigningSecretKey
+SigningKeyPair = {
+  pk: SigningPublicKey,
+  sk: SigningSecretKey,
 }
 ```
 
-### Signature
+#### Signature
 
 Output of `sign`. Length is the `sig` length for the Policy that applies.
 
 ```
-type Signature   byte[]
+Signature = bstr
 ```
 
-### KemCiphertext
+#### KemCiphertext
 
 `kem_ct` from `wrap`. Length is the `kem_ct` length for the Policy that applies.
 
 ```
-type KemCiphertext   byte[]
+KemCiphertext = bstr
 ```
 
-### DMInvite
+#### Command
+
+A mutation of EngineState. `CommandOp` is which mutation. `apply` folds a
+Command into EngineState with no extra randomness.
+
+```
+CommandOp = "create_user" / "create_identity" / "delete_user"
+          / "delete_identity" / "delete_conversation"
+          / "set_display_name" / "unset_display_name"
+          / "create_invite" / "mark_notices_pinned"
+          / "receive_ticket" / "receive_notice"
+          / "fail_conversation" / "create_calling_card"
+
+Command = { op: CommandOp }
+```
+
+The remaining fields are exactly those for `op`. `ticket` is a DMTicket.
+`notice` is a DMNotice.
+
+| `op` | Other fields |
+| --- | --- |
+| `create_user` | `user_id` |
+| `create_identity` | `user_id`, `identity_id`, `encryption_pk`, `encryption_sk`, `signing_pk`, `signing_sk` |
+| `delete_user` | `user_id` |
+| `delete_identity` | `user_id`, `identity_id` |
+| `delete_conversation` | `user_id`, `identity_id`, `conversation_id` |
+| `set_display_name` | `user_id`, `identity_id`, `name` |
+| `unset_display_name` | `user_id`, `identity_id` |
+| `create_invite` | `user_id`, `identity_id`, `conversation_id`, `ticket`, `intake_pk`, `intake_sk`, `mailboxes`, `wires` |
+| `mark_notices_pinned` | `user_id`, `identity_id`, `conversation_id` |
+| `receive_ticket` | `user_id`, `identity_id`, `conversation_id`, `ticket` |
+| `receive_notice` | `user_id`, `identity_id`, `conversation_id`, `notice` |
+| `fail_conversation` | `user_id`, `identity_id`, `conversation_id`, `reason` = `policy_not_accepted`, `ticket`, `notice` |
+| `create_calling_card` | `user_id`, `identity_id`, `conversation_id`, `name`, `encryption_pk`, `signing_pk`, `mailbox_tag_key`, `mailboxes`, `wires` |
+
+Planned `create_calling_card` fields: `intake_pk`, `intake_sk`, `intake_tag_key`,
+`sig`, `mailbox_blob`.
+
+```
+policy_not_accepted = "policy_not_accepted"
+```
+
+### Direct-message types
+
+#### DMInvite
 
 A ticket plus the Notice the inviter pins.
 
 ```
-record DMInvite {
-    ticket  DMTicket
-    notice  DMNotice
+DMInvite = {
+  ticket: DMTicket,
+  notice: DMNotice,
 }
 ```
 
-### DMTicket
+#### DMTicket
 
-Information the inviter shares with the invitee to start the handshake.
+Information the inviter shares with the invitee to start the handshake. The
+host carries the ticket’s host string over a medium it chooses.
 
 ```
-record DMTicket {
-    secret      Secret
-    billboards  List<Billboard>    length 1..=4
+DMTicket = {
+  secret: Secret,
+  billboards: [1*4 Billboard],
 }
 ```
 
-### DMInviteTag
+#### DMInviteTag
 
 Locator for a DMNotice on a Billboard.
 
 ```
-type DMInviteTag   Tag
+DMInviteTag = Tag
 ```
 
 ```
 DMInviteTag = expand(DMTicket.secret, "chuchotez/1/dm-invite-billboard-tag")
 ```
 
-### DMInviterIntakeTagKey
+#### DMInviterIntakeTagKey
 
 Locator key for the first DMSignedInviteeIntroduction on the inviter Mailboxes.
 
 ```
-type DMInviterIntakeTagKey   TagKey
+DMInviterIntakeTagKey = TagKey
 ```
 
 ```
 DMInviterIntakeTagKey = expand(DMTicket.secret, "chuchotez/1/dm-inviter-intake-tag-key")
 ```
 
-### MailboxTag  (planned)
+In this handshake, `MailboxTag` uses `DMInviterIntakeTagKey` for the first post
+to the inviter, then `DMInviteeIntakeTagKey` for posts to the invitee.
 
-A Mailbox locator for a time bin of Messages.
-
-```
-type TimeBin       integer
-type MailboxTag    Tag
-```
-
-```
-TimeBin = time_bin(unix_seconds)
-MailboxTag = expand(tag_key, label || be<64>u(TimeBin))
-             label encoding later
-```
-
-`unix_seconds` is a Unix time in seconds. The host watches `TimeBin-1`,
-`TimeBin`, and `TimeBin+1`. `tag_key` is the DMInviterIntakeTagKey for the first
-post to the inviter, then the DMInviteeIntakeTagKey for posts to the invitee.
-
-### DMNotice
+#### DMNotice
 
 Billboard body. `intake_pk` is the wrap target for the invitee’s
 DMSignedInviteeIntroduction. `mailboxes` are where that blob is posted.
 
 ```
-record DMNotice {
-    policy      Policy
-    intake_pk   PublicKey
-    mailboxes   List<Mailbox>    length 1..=4
-    wires       List<Wire>       length 0..=4
+DMNotice = {
+  policy: Policy,
+  intake_pk: PublicKey,
+  mailboxes: [1*4 Mailbox],
+  wires: [*4 Wire],
 }
 ```
 
-`intake_pk` length MUST match `policy`.
+`intake_pk` length MUST match `policy`. `wires` length is 0..=4.
 
-### CallingCard
+#### CallingCard
 
-The conversation Policy is `DMNotice.policy`. Key and signature lengths MUST
-match that Policy.
+One party’s name, keys, Mailboxes, and Wires. The conversation Policy is
+`DMNotice.policy`. Key and signature lengths MUST match that Policy.
 
 ```
-record CallingCard {
-    name              DisplayName
-    encryption_pk     PublicKey
-    signing_pk        SigningPublicKey
-    mailbox_tag_key   TagKey
-    mailboxes         List<Mailbox>    length 1..=4
-    wires             List<Wire>       length 0..=4
+CallingCard = {
+  name: DisplayName,
+  encryption_pk: PublicKey,
+  signing_pk: SigningPublicKey,
+  mailbox_tag_key: TagKey,
+  mailboxes: [1*4 Mailbox],
+  wires: [*4 Wire],
 }
 ```
 
-`mailbox_tag_key` is `random32()`.
+`mailbox_tag_key` is `random32()`. `wires` length is 0..=4.
 
-### DMInviteeIntakeTagKey
+#### DMInviteeIntakeTagKey
 
 Locator key for later Messages on the invitee’s Mailboxes.
 
 ```
-type DMInviteeIntakeTagKey   TagKey
+DMInviteeIntakeTagKey = TagKey
 ```
 
 ```
 DMInviteeIntakeTagKey = random32()
 ```
 
-### DMInviteeIntroduction  (planned)
+#### DMInviteeIntroduction  (planned)
 
 Inner value the invitee posts. `intake_pk` is the wrap target for the inviter’s
 later card. `intake_tag_key` locates that card on the invitee’s Mailboxes.
 
 ```
-record DMInviteeIntroduction {
-    calling_card     CallingCard
-    intake_pk        PublicKey
-    intake_tag_key   DMInviteeIntakeTagKey
+DMInviteeIntroduction = {
+  calling_card: CallingCard,
+  intake_pk: PublicKey,
+  intake_tag_key: DMInviteeIntakeTagKey,
 }
 ```
 
@@ -546,15 +573,15 @@ record DMInviteeIntroduction {
 `keygen(DMNotice.policy, random32() || random32())`. The Intake secret stays on
 the invitee tree.
 
-### DMSignedInviteeIntroduction (planned)
+#### DMSignedInviteeIntroduction  (planned)
 
 Signed introduction. The host posts `mailbox_blob` to every DMNotice Mailbox at
 the DMInviterIntakeTagKey. The Engine stores `mailbox_blob` at mint.
 
 ```
-record DMSignedInviteeIntroduction {
-    introduction  DMInviteeIntroduction
-    sig           Signature
+DMSignedInviteeIntroduction = {
+  introduction: DMInviteeIntroduction,
+  sig: Signature,
 }
 ```
 
@@ -590,26 +617,26 @@ ok                           = verify(DMNotice.policy, introduction.calling_card
 `Intake sk` is the inviter’s Intake secret (matching `DMNotice.intake_pk`). One
 valid DMSignedInviteeIntroduction per conversation.
 
-### DMInviterIntroduction  (planned)
+#### DMInviterIntroduction  (planned)
 
 Inner value the inviter posts.
 
 ```
-record DMInviterIntroduction {
-    calling_card     CallingCard
+DMInviterIntroduction = {
+  calling_card: CallingCard,
 }
 ```
 
-### DMSignedInviterIntroduction  (planned)
+#### DMSignedInviterIntroduction  (planned)
 
 Signed introduction. The host posts `mailbox_blob` to every
 `DMInviteeIntroduction.calling_card` Mailbox at the `DMInviteeIntakeTagKey`.
 The Engine stores `mailbox_blob` at mint.
 
 ```
-record DMSignedInviterIntroduction {
-    introduction  DMInviterIntroduction
-    sig           Signature
+DMSignedInviterIntroduction = {
+  introduction: DMInviterIntroduction,
+  sig: Signature,
 }
 ```
 
@@ -646,14 +673,14 @@ ok                           = verify(DMNotice.policy, introduction.calling_card
 `DMInviteeIntroduction.intake_pk`). One valid DMSignedInviterIntroduction per
 conversation.
 
-### EstablishedDigest  (planned)
+#### EstablishedDigest  (planned)
 
 32-byte tagged hash of both signed introductions. Both sides compute it after
 they hold `DMSignedInviterIntroduction` and `DMSignedInviteeIntroduction`. The
 `tag` is a public domain-separation string.
 
 ```
-type EstablishedDigest   byte[32]
+EstablishedDigest = bstr .size 32
 ```
 
 ```
@@ -664,50 +691,12 @@ EstablishedDigest  = mac(tag, canonical(DMSignedInviterIntroduction) || canonica
 The concatenation order is inviter then invitee. When a party confirms the
 peer’s digest equals its own, that party’s conversation becomes `Established`.
 
-### Command
-
-A mutation of EngineState. `CommandOp` is which mutation.
-
-```
-type CommandOp   create_user | create_identity | delete_user | delete_identity
-               | delete_conversation | set_display_name | unset_display_name
-               | create_invite | mark_notices_pinned | receive_ticket
-               | receive_notice | fail_conversation | create_calling_card
-```
-
-```
-record Command {
-    op  CommandOp
-}
-```
-
-The remaining fields are exactly those for `op`. `ticket` is a DMTicket.
-`notice` is a DMNotice. `apply` folds a Command into EngineState with no extra
-randomness.
-
-| `op` | Other fields |
-| --- | --- |
-| `create_user` | `user_id` |
-| `create_identity` | `user_id`, `identity_id`, `encryption_pk`, `encryption_sk`, `signing_pk`, `signing_sk` |
-| `delete_user` | `user_id` |
-| `delete_identity` | `user_id`, `identity_id` |
-| `delete_conversation` | `user_id`, `identity_id`, `conversation_id` |
-| `set_display_name` | `user_id`, `identity_id`, `name` |
-| `unset_display_name` | `user_id`, `identity_id` |
-| `create_invite` | `user_id`, `identity_id`, `conversation_id`, `ticket`, `intake_pk`, `intake_sk`, `mailboxes`, `wires` |
-| `mark_notices_pinned` | `user_id`, `identity_id`, `conversation_id` |
-| `receive_ticket` | `user_id`, `identity_id`, `conversation_id`, `ticket` |
-| `receive_notice` | `user_id`, `identity_id`, `conversation_id`, `notice` |
-| `fail_conversation` | `user_id`, `identity_id`, `conversation_id`, `reason` = `policy_not_accepted`, `ticket`, `notice` |
-| `create_calling_card` | `user_id`, `identity_id`, `conversation_id`, `name`, `encryption_pk`, `signing_pk`, `mailbox_tag_key`, `mailboxes`, `wires` |
-
-Planned `create_calling_card` fields: `intake_pk`, `intake_sk`, `intake_tag_key`,
-`sig`, `mailbox_blob`.
-
-### Later conversations
+### Other conversations
 
 `Group` and `Synchronization` conversations. Pairwise streams after
 `Established`. Those tickets are domain records of a different sort.
+
+Types and encodings for those conversations are later work.
 
 ---
 
@@ -738,15 +727,14 @@ members, and members whose JSON sort does not match this table.
 | `Policy` | JSON string `"Classic"`, `"PostQuantum"`, or `"Hybrid"` |
 | `CommandOp` | JSON string of the enumerant name (`"create_user"`, …) |
 | `policy_not_accepted` | JSON string `"policy_not_accepted"` |
-| `string` (`Kind`, `Address`, `DisplayName`, …) | JSON string of that Unicode value |
-| `byte[n]` / `byte[]` | JSON string `text(bytes)` |
-| `List<T>` | JSON array of `J(T)` in list order |
-| record | JSON object: one member per field, name = field name, value = `J(field)` |
+| CDDL `tstr` | JSON string of that Unicode value |
+| CDDL `bstr` | JSON string `text(bytes)` |
+| CDDL array | JSON array of `J(T)` in list order |
+| CDDL map `{ … }` | JSON object: one member per field, name = field name, value = `J(field)` |
 
 Top-level artifacts that travel as a JSON document also carry a discriminator
-member `"type"` with a constant string. Nested records (Billboard, Mailbox,
-Wire, and fields inside Command) omit `"type"`. `J⁻¹` refuses an unknown
-`"type"`.
+member `"type"` with a constant string. Nested maps (Billboard, Mailbox, Wire,
+and fields inside Command) omit `"type"`. `J⁻¹` refuses an unknown `"type"`.
 
 | Domain sort | `"type"` |
 | --- | --- |
@@ -809,4 +797,99 @@ record  = nonce || lock(key, nonce, Command)
 host `key`. Uncompressed `canonical` ≤ 16384. `packed` body ≤ 16400. Record
 length ≤ 16668.
 
-A passphrase vault for the host `key` is later work.
+---
+
+## Library
+
+The library is bound to one `Policy`. It holds no suite of its own in the
+process. Named operations drive `EngineState`. `apply` folds a `Command` with
+no extra randomness. Operations that need entropy take `random32` from the
+host.
+
+Operations named on this page:
+
+```
+create_user
+create_identity
+create_invite       → DMInvite
+receive_ticket
+receive_notice
+set_display_name
+create_calling_card
+apply(EngineState, Command) → EngineState
+```
+
+Argument lists, errors, and query operations are later work.
+
+---
+
+## Mappers
+
+A mapper implements one `Kind` of Channel. The host selects mappers by
+`BillboardKind`, `MailboxKind`, and `WireKind`. Coordinates are `Address`
+values.
+
+Operations already required by the direct-message flow:
+
+```
+pin(billboard, tag, body)      inviter writes a Notice
+fetch(billboard, tag) → body   invitee reads a Notice
+post(mailbox, tag, body)       writer drops a mailbox blob
+```
+
+The host watches `MailboxTag` for `TimeBin-1`, `TimeBin`, and `TimeBin+1`.
+
+Wire send and receive, mapper errors, and size limits at the mapper edge are
+later work.
+
+---
+
+## State machine
+
+`EngineState` is an ADT of users, identities, and conversations. Illegal
+transitions are unrepresentable. The full transition table is later work.
+
+Outcomes named on this page:
+
+- A well-formed `DMNotice` whose Policy is outside the host `accepted` list
+  becomes `Failed::PolicyNotAccepted`.
+- Anyone who has the `DMTicket` can pin a `DMNotice` at the `DMInviteTag`.
+- One valid `DMSignedInviteeIntroduction` per conversation.
+- One valid `DMSignedInviterIntroduction` per conversation.
+- When a party confirms `EstablishedDigest` matches the peer, that party’s
+  conversation becomes `Established`.
+
+### Direct-message flow
+
+1. The inviter calls `create_user`, `create_identity`, and `create_invite`, and
+   receives a `DMInvite`.
+2. The inviter pins the `DMNotice` at each Billboard under the `DMInviteTag`,
+   and shares the `DMTicket` with the invitee.
+3. The invitee calls `receive_ticket`. The host fetches the `DMNotice`. The
+   invitee calls `receive_notice`.
+4. The invitee calls `set_display_name` and `create_calling_card`, and stores a
+   local `CallingCard` (shipped).
+5. Planned: the invitee builds a `DMInviteeIntroduction`, signs it, and `wrap`s
+   the `DMSignedInviteeIntroduction` to the inviter’s Intake `pk`. The host
+   posts it on the inviter Mailboxes at the `DMInviterIntakeTagKey`.
+6. Planned: the inviter opens that blob (one valid signed introduction per
+   conversation), builds a `DMInviterIntroduction`, signs it, and `wrap`s the
+   `DMSignedInviterIntroduction` to `DMInviteeIntroduction.intake_pk`. The host
+   posts it on the invitee Mailboxes at the `DMInviteeIntakeTagKey`.
+7. Planned: each side computes `EstablishedDigest`. When a party confirms the
+   two digests match, that party’s conversation becomes `Established`.
+
+---
+
+## Vault
+
+The host keeps a 32-byte key used to lock Command records. A passphrase vault
+for that key is later work.
+
+---
+
+## Host
+
+The host supplies `random32`, appends and reads persist bytes, and talks to
+mappers. It chooses the medium for the `DMTicket` host string. It supplies the
+`accepted` Policy list for `receive_notice`.
