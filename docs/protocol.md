@@ -20,7 +20,8 @@ public-key algorithms in [Algorithms](#algorithms).
 
 The **library** is the handle bound to one Policy (`Engine` in the reference
 crate) and the functions below. **`EngineState`** is the host’s saved users,
-identities, and conversations.
+identities, and conversations. The library derives tags and time bins. The
+host and each mapper see Channel, Tag, and bodies.
 
 A **mapper** talks to one kind of Channel (Billboard, Mailbox, or Wire). The
 host chooses mappers. Examples of kind strings: `nostr`, `webrtc`.
@@ -98,8 +99,8 @@ A 32-byte fingerprint of `data` that only a holder of `key` can produce. Same
 expand(key, label) = mac(key, label || 0x01) → 32 bytes
 ```
 
-Turns one secret and a short name into a new 32-byte secret. Different labels
-give independent values. `label` is the UTF-8 bytes of the quoted ASCII string.
+Turns one secret and a byte string into a new 32-byte secret. Different labels
+give independent values. Quoted ASCII in a formula is that string as UTF-8.
 
 ```
 compress(bytes) → bytes
@@ -250,6 +251,8 @@ Mailbox = {
 #### Wire
 
 Live path where A can transmit information to B and vice versa, with no store.
+`address` is mapper config (relays, transport, protocol id). The rendezvous
+locator is a WireTag.
 
 ```
 Wire = {
@@ -302,7 +305,7 @@ Secret = bstr .size 32
 
 #### Tag
 
-32-byte locator. Billboard pins and Mailbox bins use tags.
+32-byte locator. Billboard pins, Mailbox bins, and Wire rendezvous use tags.
 
 ```
 Tag = bstr .size 32
@@ -336,20 +339,83 @@ TimeBin = uint
 TimeBin = time_bin(unix_seconds)
 ```
 
-`unix_seconds` is a `UnixSeconds` value. The host watches `TimeBin-1`,
-`TimeBin`, and `TimeBin+1`.
+`unix_seconds` is a `UnixSeconds` value. At `W = TimeBin`, the library listen
+window is `W-1`, `W`, and `W+1`.
 
 #### MailboxTag
 
-A Mailbox locator for a time bin of Messages. Planned: label encoding.
+A Mailbox locator for a time bin.
 
 ```
 MailboxTag = Tag
 ```
 
 ```
-MailboxTag = expand(tag_key, label || be<64>u(TimeBin))
-             label encoding later
+MailboxTag = expand(tag_key, "chuchotez/1/dm-mailbox-bin" || be<64>u(TimeBin))
+```
+
+#### WireTag
+
+Rendezvous locator on a Wire for a time bin. `tag_key` is the TagKey of the
+mailbox interest this listen or send pairs with.
+
+```
+WireTag = Tag
+```
+
+```
+WireTag = expand(tag_key, "chuchotez/1/dm-wire-bin" || be<64>u(TimeBin))
+```
+
+#### Channel
+
+A Billboard, Mailbox, or Wire together with which role it plays. Two Channels
+are equal when `sort`, `kind`, and `address` match.
+
+```
+Channel = BillboardChannel / MailboxChannel / WireChannel
+
+BillboardChannel = { sort: "Billboard", billboard: Billboard }
+MailboxChannel   = { sort: "Mailbox", mailbox: Mailbox }
+WireChannel      = { sort: "Wire", wire: Wire }
+```
+
+#### MailboxBinProgress
+
+EngineState listing progress for one Mailbox and TagKey. `watermark` is the
+greatest bin such that every bin ≤ that value has been listed in full.
+`completed` is fully listed bins greater than `watermark`.
+
+```
+MailboxBinProgress = {
+  mailbox: Mailbox,
+  tag_key: TagKey,
+  watermark: TimeBin,
+  completed: [TimeBin],
+}
+```
+
+#### Poll
+
+Query of Channel work for the ticked now. Arrays are ordered by Channel
+`sort` (`Billboard`, `Mailbox`, `Wire`), then `kind`, then `address`, then
+tag bytes.
+
+```
+ChannelTag = { channel: Channel, tag: Tag }
+ChannelWrite = { channel: Channel, tag: Tag, body: bstr }
+BlockedIdentity = {
+  user_id: UserId,
+  identity_id: IdentityId,
+  missing: "DisplayName",
+}
+
+Poll = {
+  list: [ChannelTag],
+  listen: [ChannelTag],
+  write: [ChannelWrite],
+  blocked: [BlockedIdentity],
+}
 ```
 
 #### PublicKey
@@ -433,12 +499,13 @@ Command into EngineState with no extra randomness.
 CommandOp = "create_user" / "create_identity" / "delete_user"
           / "delete_identity" / "delete_conversation"
           / "set_display_name" / "unset_display_name"
+          / "set_local_channels" / "tick"
           / "create_invite" / "mark_notice_pinned"
           / "receive_ticket" / "receive_notice"
           / "create_introduction" / "receive_invitee_introduction"
           / "receive_inviter_introduction" / "introduction_sent"
           / "confirm_established" / "reject_established"
-          / "fail_conversation"
+          / "fail_conversation" / "write_ack" / "complete_mailbox_bin"
 
 FailReason = "policy_not_accepted" / "invite_expired"
            / "notice_unlock_failed" / "notice_conflict"
@@ -454,17 +521,21 @@ Command = { op: CommandOp }
 ```
 
 The remaining fields are exactly those for `op`. `ticket` is a DMTicket.
-`notice` is a DMNotice. `now` is `UnixSeconds`.
+`notice` is a DMNotice. `now` is `UnixSeconds`. `channel` is a Channel.
+`tag` is a Tag. `body` is bytes. Handshake commands that carry `now` copy
+the ticked now at construction.
 
 | `op` | Other fields |
 | --- | --- |
 | `create_user` | `user_id` |
-| `create_identity` | `user_id`, `identity_id`, `encryption_pk`, `encryption_sk`, `signing_pk`, `signing_sk` |
+| `create_identity` | `user_id`, `identity_id`, `encryption_pk`, `encryption_sk`, `signing_pk`, `signing_sk`, `mailboxes`, `wires` |
 | `delete_user` | `user_id` |
 | `delete_identity` | `user_id`, `identity_id` |
 | `delete_conversation` | `user_id`, `identity_id`, `conversation_id` |
 | `set_display_name` | `user_id`, `identity_id`, `name` |
 | `unset_display_name` | `user_id`, `identity_id` |
+| `set_local_channels` | `user_id`, `identity_id`, `mailboxes`, `wires` |
+| `tick` | `now` |
 | `create_invite` | `user_id`, `identity_id`, `conversation_id`, `ticket`, `intake_pk`, `intake_sk`, `mailboxes`, `wires`, `expires` |
 | `mark_notice_pinned` | `user_id`, `identity_id`, `conversation_id`, `now` |
 | `receive_ticket` | `user_id`, `identity_id`, `conversation_id`, `ticket` |
@@ -476,6 +547,8 @@ The remaining fields are exactly those for `op`. `ticket` is a DMTicket.
 | `confirm_established` | `user_id`, `identity_id`, `conversation_id`, `now` |
 | `reject_established` | `user_id`, `identity_id`, `conversation_id`, `now` |
 | `fail_conversation` | `user_id`, `identity_id`, `conversation_id`, `reason`, `now` |
+| `write_ack` | `channel`, `tag`, `body` |
+| `complete_mailbox_bin` | `user_id`, `identity_id`, `conversation_id`, `mailbox`, `tag` |
 
 `invitee_introduction` is a `DMSignedInviteeIntroduction`.
 `inviter_introduction` is a `DMSignedInviterIntroduction`. `reason` is a
@@ -604,8 +677,9 @@ the invitee tree.
 
 #### DMSignedInviteeIntroduction  (planned)
 
-Signed introduction. The host posts `mailbox_blob` to every DMNotice Mailbox at
-the DMInviterIntakeTagKey. The Engine stores `mailbox_blob` at mint.
+Signed introduction. The Engine stores `mailbox_blob` at mint. `poll` write
+work posts it to every DMNotice Mailbox at `MailboxTag` and every DMNotice
+Wire at `WireTag` for `time_bin(ticked now)` and `DMInviterIntakeTagKey`.
 
 ```
 DMSignedInviteeIntroduction = {
@@ -658,9 +732,10 @@ DMInviterIntroduction = {
 
 #### DMSignedInviterIntroduction  (planned)
 
-Signed introduction. The host posts `mailbox_blob` to every
-`DMInviteeIntroduction.calling_card` Mailbox at the `DMInviteeIntakeTagKey`.
-The Engine stores `mailbox_blob` at mint.
+Signed introduction. The Engine stores `mailbox_blob` at mint. `poll` write
+work posts it to every `DMInviteeIntroduction.calling_card` Mailbox at
+`MailboxTag` and every such Wire at `WireTag` for `time_bin(ticked now)` and
+`DMInviteeIntakeTagKey`.
 
 ```
 DMSignedInviterIntroduction = {
@@ -763,7 +838,9 @@ members, and members whose JSON sort does not match this table.
 
 Top-level artifacts that travel as a JSON document also carry a discriminator
 member `"type"` with a constant string. Nested maps (Billboard, Mailbox, Wire,
-and fields inside Command) omit `"type"`. `J⁻¹` refuses an unknown `"type"`.
+Channel, and fields inside Command) omit `"type"`. `J⁻¹` refuses an unknown
+`"type"`. Channel `sort` is the JSON string `"Billboard"`, `"Mailbox"`, or
+`"Wire"`.
 
 | Domain sort | `"type"` |
 | --- | --- |
@@ -832,11 +909,14 @@ length ≤ 16668.
 
 The library is bound to one `Policy`. Named operations drive `EngineState`.
 `apply` folds a `Command` with no extra randomness. Operations that need
-entropy take `random32` from a host `Rng`. Mutators return sealed persist
-bytes (`nonce || lock` with the host DEK). `EngineState` is an opaque handle
-the host holds in memory. Reload is `apply` of each persist record in order.
-The query `Conversation` omits ticket secret, DEK, intake `sk`, identity `sk`,
-and `mailbox_tag_key`. TypeScript field names are camelCase of the CDDL names.
+entropy take `random32` from a host `Rng`. Mutators return zero or more sealed
+persist records (`nonce || lock` with the host DEK), in `apply` order.
+`EngineState` is an opaque handle the host holds in memory. Reload is `apply`
+of each persist record in order. `tick` is the clock. `poll` is the Channel
+and Tag query for that ticked now. `ingestList`, `ingestItem`, and `writeAck`
+fold mapper results. The query `Conversation` omits ticket secret, DEK, intake
+`sk`, identity `sk`, `mailbox_tag_key`, and `MailboxBinProgress`. TypeScript
+field names are camelCase of the CDDL names.
 
 ```ts
 declare const brand: unique symbol
@@ -848,7 +928,6 @@ type UserId = Brand<Uint8Array, "UserId">
 type IdentityId = Brand<Uint8Array, "IdentityId">
 type ConversationId = Brand<Uint8Array, "ConversationId">
 type Tag = Brand<Uint8Array, "Tag">
-type TagKey = Brand<Uint8Array, "TagKey">
 type PublicKey = Brand<Uint8Array, "PublicKey">
 type SigningPublicKey = Brand<Uint8Array, "SigningPublicKey">
 type UnixSeconds = number
@@ -860,6 +939,10 @@ type DisplayName = string
 type Billboard = { kind: Kind; address: Address }
 type Mailbox = { kind: Kind; address: Address }
 type Wire = { kind: Kind; address: Address }
+type Channel =
+  | { sort: "Billboard"; billboard: Billboard }
+  | { sort: "Mailbox"; mailbox: Mailbox }
+  | { sort: "Wire"; wire: Wire }
 type EngineState = Brand<object, "EngineState">
 
 type Rng = { random32(): Random32 }
@@ -873,10 +956,14 @@ type EngineError =
   | { code: "MalformedTicket" }
   | { code: "ExpiresNotAfterNow" }
   | { code: "UnknownIds" }
-  | { code: "MissingDisplayName" }
   | { code: "MalformedDisplayName" }
   | { code: "ChannelBounds" }
   | { code: "MalformedPersist" }
+  | { code: "NotTicked" }
+  | { code: "ClockWentBackwards" }
+  | { code: "UnknownTag" }
+  | { code: "UnknownWrite" }
+  | { code: "SnapshotTooLarge" }
 
 type ConversationRef = {
   userId: UserId
@@ -884,22 +971,24 @@ type ConversationRef = {
   conversationId: ConversationId
 }
 
-type MutateOk = { state: EngineState; persist: PersistBytes }
+type MutateOk = { state: EngineState; persist: PersistBytes[] }
 type CreateUserOk = MutateOk & { userId: UserId }
 type CreateIdentityOk = MutateOk & { identityId: IdentityId }
 type CreateInviteOk = MutateOk & { conversationId: ConversationId }
 type ReceiveTicketOk = MutateOk & { conversationId: ConversationId }
 
-type BillboardPin = {
-  billboard: Billboard
-  tag: Tag
-  body: Uint8Array
+type ChannelTag = { channel: Channel; tag: Tag }
+type ChannelWrite = { channel: Channel; tag: Tag; body: Uint8Array }
+type BlockedIdentity = {
+  userId: UserId
+  identityId: IdentityId
+  missing: "DisplayName"
 }
-
-type MailboxPost = {
-  mailbox: Mailbox
-  tag: Tag
-  body: Uint8Array
+type Poll = {
+  list: ChannelTag[]
+  listen: ChannelTag[]
+  write: ChannelWrite[]
+  blocked: BlockedIdentity[]
 }
 
 type Inviter =
@@ -921,6 +1010,8 @@ type Established = {
   signingPk: SigningPublicKey
   mailboxes: Mailbox[]
   wires: Wire[]
+  localMailboxes: Mailbox[]
+  localWires: Wire[]
   digest: string
 }
 
@@ -956,6 +1047,8 @@ declare class Engine {
     rng: Rng,
     dek: AeadKey,
     userId: UserId,
+    mailboxes: Mailbox[],
+    wires: Wire[],
   ): Result<CreateIdentityOk>
   deleteUser(state: EngineState, dek: AeadKey, userId: UserId): Result<MutateOk>
   deleteIdentity(
@@ -969,6 +1062,40 @@ declare class Engine {
     dek: AeadKey,
     ids: ConversationRef,
   ): Result<MutateOk>
+  setLocalChannels(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    userId: UserId,
+    identityId: IdentityId,
+    mailboxes: Mailbox[],
+    wires: Wire[],
+  ): Result<MutateOk>
+  tick(state: EngineState, dek: AeadKey, now: UnixSeconds): Result<MutateOk>
+  poll(state: EngineState): Result<Poll>
+  ingestList(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    channel: Channel,
+    tag: Tag,
+    bodies: Uint8Array[],
+  ): Result<MutateOk>
+  ingestItem(
+    state: EngineState,
+    rng: Rng,
+    dek: AeadKey,
+    channel: Channel,
+    tag: Tag,
+    body: Uint8Array,
+  ): Result<MutateOk>
+  writeAck(
+    state: EngineState,
+    dek: AeadKey,
+    channel: Channel,
+    tag: Tag,
+    body: Uint8Array,
+  ): Result<MutateOk>
   createInvite(
     state: EngineState,
     rng: Rng,
@@ -976,17 +1103,8 @@ declare class Engine {
     userId: UserId,
     identityId: IdentityId,
     billboards: Billboard[],
-    mailboxes: Mailbox[],
-    wires: Wire[],
     expires: UnixSeconds,
-    now: UnixSeconds,
   ): Result<CreateInviteOk>
-  markNoticePinned(
-    state: EngineState,
-    dek: AeadKey,
-    ids: ConversationRef,
-    now: UnixSeconds,
-  ): Result<MutateOk>
   receiveTicket(
     state: EngineState,
     rng: Rng,
@@ -995,16 +1113,9 @@ declare class Engine {
     identityId: IdentityId,
     ticketHostString: string,
   ): Result<ReceiveTicketOk>
-  receiveNotice(
-    state: EngineState,
-    dek: AeadKey,
-    ids: ConversationRef,
-    noticeHostString: string,
-    accepted: Policy[],
-    now: UnixSeconds,
-  ): Result<MutateOk>
   setDisplayName(
     state: EngineState,
+    rng: Rng,
     dek: AeadKey,
     userId: UserId,
     identityId: IdentityId,
@@ -1016,47 +1127,15 @@ declare class Engine {
     userId: UserId,
     identityId: IdentityId,
   ): Result<MutateOk>
-  createIntroduction(
-    state: EngineState,
-    rng: Rng,
-    dek: AeadKey,
-    ids: ConversationRef,
-    mailboxes: Mailbox[],
-    wires: Wire[],
-    now: UnixSeconds,
-  ): Result<MutateOk>
-  receiveInviteeIntroduction(
-    state: EngineState,
-    rng: Rng,
-    dek: AeadKey,
-    ids: ConversationRef,
-    mailboxHostString: string,
-    now: UnixSeconds,
-  ): Result<MutateOk>
-  receiveInviterIntroduction(
-    state: EngineState,
-    dek: AeadKey,
-    ids: ConversationRef,
-    mailboxHostString: string,
-    now: UnixSeconds,
-  ): Result<MutateOk>
-  introductionSent(
-    state: EngineState,
-    dek: AeadKey,
-    ids: ConversationRef,
-    now: UnixSeconds,
-  ): Result<MutateOk>
   confirmEstablished(
     state: EngineState,
     dek: AeadKey,
     ids: ConversationRef,
-    now: UnixSeconds,
   ): Result<MutateOk>
   rejectEstablished(
     state: EngineState,
     dek: AeadKey,
     ids: ConversationRef,
-    now: UnixSeconds,
   ): Result<MutateOk>
   getConversation(
     state: EngineState,
@@ -1065,9 +1144,6 @@ declare class Engine {
     conversationId: ConversationId,
   ): Result<Conversation>
   ticketHostString(state: EngineState, ids: ConversationRef): Result<string>
-  noticeBody(state: EngineState, ids: ConversationRef): Result<Uint8Array>
-  billboardPins(state: EngineState, ids: ConversationRef): Result<BillboardPin[]>
-  mailboxPosts(state: EngineState, ids: ConversationRef): Result<MailboxPost[]>
   establishedDigest(state: EngineState, ids: ConversationRef): Result<string>
   apply(
     state: EngineState,
@@ -1077,51 +1153,100 @@ declare class Engine {
 }
 ```
 
-`digest` and `establishedDigest` are `text(EstablishedDigest)`.
-`billboardPins` `body` is UTF-8 of the `DMNotice` host string. `mailboxPosts`
-`body` is UTF-8 of the signed-introduction host string. `createInvite` MUST
-refuse when `expires <= now`. `createIntroduction` MUST refuse when the
-identity has no `DisplayName`.
+`digest` and `establishedDigest` are `text(EstablishedDigest)`. `poll` write
+`body` is UTF-8 of the Notice or signed-introduction host string. `createInvite`
+MUST refuse when `expires` is less than or equal to the ticked now. Identity
+mailboxes length is 1..=4 and wires length is 0..=4; `kind`+`address` is unique
+within each list (`ChannelBounds`). `createInvite` copies those identity
+channels into `DMNotice`. `setLocalChannels` stores identity defaults. A mint
+copies the current identity channels into the card.
+
+`tick` is the only operation that takes `now`. `now` less than the last ticked
+value is `ClockWentBackwards`. Equal `now` is success. Last ticked `now` lives
+in memory. `tick` appends persist when it stores `InviteExpired` or
+initializes a `watermark`. Reload is `NotTicked` until the host `tick`s
+again. A first successful `tick` is required before `poll`, `createInvite`,
+`ingestList`, `ingestItem`, `writeAck`, `confirmEstablished`, and
+`rejectEstablished` (`NotTicked`). `createUser`, `createIdentity`,
+`receiveTicket`, `setDisplayName`, `unsetDisplayName`, `setLocalChannels`,
+and deletes MAY run before that tick. When `now` is greater than a still
+pre-`Established` invite `expires`, `tick` stores `Failed` `InviteExpired`.
+
+`ingestList` with `bodies.length > 512` is `SnapshotTooLarge`. `ingestList` is
+valid for a `(channel, tag)` in the current `poll` list set; `ingestItem` for
+the listen set; `writeAck` for a current pending write (`UnknownTag` /
+`UnknownWrite`). Per body, the library parses, unlocks, and verifies; a
+malformed body is skipped. A Notice whose `policy` differs from the Engine
+`Policy` stores `Failed` `PolicyNotAccepted`. Empty or all-junk mailbox
+`ingestList` still completes that bin (`complete_mailbox_bin`). A Billboard
+`ingestList` that matches stored state, or an `ingestItem` of a body already
+folded, appends no persist.
+
+Mint of a signed introduction runs inside ingest when the identity has a
+`DisplayName` and local channels. Otherwise `poll.blocked` lists that identity
+(`missing: "DisplayName"`). `setDisplayName` and `setLocalChannels` mint every
+waiting introduction on that identity. `unsetDisplayName` before mint returns
+the identity to `blocked`; a minted card keeps its name.
+
+At `W = time_bin(ticked now)`, each live `(Mailbox, TagKey)` has a
+`MailboxBinProgress`. `createInvite` and each mint set `watermark` to `W-3`
+for new pairs. `tick` does the same for a live pair still unset. Mailbox
+**list** tags are `MailboxTag` for bins in `(watermark, W-2] ∪ [W-1, W, W+1]`
+that are not yet fully listed. Mailbox **listen** tags are `MailboxTag` for
+`[W-1, W, W+1]`. After `ingestList`, that tag leaves `list` and stays on
+`listen` while its bin is in the window. Completing bin `B` records it in
+`completed` (or raises `watermark`); `watermark` is the greatest `k` with
+every bin `≤ k` fully listed, and at most `W-2`. Completing `W-1` leaves
+`watermark` at `W-2` until every bin `≤ W-2` is done. A body stored after
+`ingestList` completed that bin is missed.
+
+Wire **listen** tags are `WireTag` on local Wires for the same TagKey and
+window. Handshake **write** tags on Mailbox and Wire use bin `W` only, one
+destination Channel each. Billboard pins use `DMInviteTag`. `writeAck` of
+every member of a mint’s write set moves `InviteCreated` to `NoticePinned` and
+`IntroductionMinted` to Sent or Confirming. `poll` re-emits unacked writes.
+
+Handshake locators stay in `poll` until `Established` or `Failed`: invitee
+list and listen of `DMInviteTag` on ticket Billboards; inviter list and listen
+of local Mailboxes at `DMInviterIntakeTagKey`; invitee list and listen of
+local Mailboxes at `DMInviteeIntakeTagKey` once that key exists. Session list
+and listen of local Mailboxes at each `CallingCard.mailbox_tag_key` starts
+when that key exists and continues in `Established`. Failed and deleted
+conversations contribute no `poll` rows; their pending writes drop. Ingest of
+bodies on Established session tags is success with no conversation change
+until pairwise message types ship.
 
 ---
 
 ## Mappers
 
 A mapper implements one `Kind` of Channel. The host selects mappers by
-`BillboardKind`, `MailboxKind`, and `WireKind`. The host calls mappers with
-plans from `billboardPins` and `mailboxPosts`. The ADT moves when the host
-calls the matching Engine method.
+`BillboardKind`, `MailboxKind`, and `WireKind`, and calls them with Channel
+and Tag from `poll`.
 
 ```ts
-type MailboxWatchEvent = {
-  tag: Tag
-  body: Uint8Array
-}
-
 interface BillboardMapper {
   pin(billboard: Billboard, tag: Tag, body: Uint8Array): Promise<void>
-  fetch(billboard: Billboard, tag: Tag): Promise<Uint8Array | null>
+  list(billboard: Billboard, tag: Tag): Promise<Uint8Array[]>
+  listen(billboard: Billboard, tag: Tag): AsyncIterable<Uint8Array>
 }
 
 interface MailboxMapper {
   post(mailbox: Mailbox, tag: Tag, body: Uint8Array): Promise<void>
-  fetch(mailbox: Mailbox, tag: Tag): Promise<Uint8Array | null>
-  watch(
-    mailbox: Mailbox,
-    tagKey: TagKey,
-    unixSeconds: UnixSeconds,
-  ): AsyncIterable<MailboxWatchEvent>
+  list(mailbox: Mailbox, tag: Tag): Promise<Uint8Array[]>
+  listen(mailbox: Mailbox, tag: Tag): AsyncIterable<Uint8Array>
 }
 
 interface WireMapper {
-  send(wire: Wire, body: Uint8Array): Promise<void>
-  receive(wire: Wire): AsyncIterable<Uint8Array>
+  send(wire: Wire, tag: Tag, body: Uint8Array): Promise<void>
+  listen(wire: Wire, tag: Tag): AsyncIterable<Uint8Array>
 }
 ```
 
-`BillboardMapper.fetch` returns `null` when no body is stored.
-`MailboxMapper.watch` MUST yield bodies for `MailboxTag` at `TimeBin-1`,
-`TimeBin`, and `TimeBin+1` for `time_bin(unixSeconds)` and that `tagKey`.
+`list` returns the complete stored snapshot for that Channel and Tag
+(pagination stays inside the mapper). The host calls `ingestList` only after
+that snapshot is in hand. `listen` yields bodies as they arrive. The host
+starts and stops `listen` by set-diff of `poll().listen`.
 
 ---
 
@@ -1166,6 +1291,8 @@ Established = {
   signing_pk: SigningPublicKey,
   mailboxes: [1*4 Mailbox],
   wires: [*4 Wire],
+  local_mailboxes: [1*4 Mailbox],
+  local_wires: [*4 Wire],
   digest: tstr,
 }
 
@@ -1206,42 +1333,44 @@ FailedDuplicateInviterIntroduction = {
 FailedDigestRejected = { reason: "DigestRejected" }
 ```
 
-`Established` is the peer `CallingCard` with `mailbox_tag_key` omitted.
-Anyone who has the `DMTicket` can pin a `DMNotice` at the `DMInviteTag`.
+Query `Established` is the peer `CallingCard` (`mailbox_tag_key` omitted) plus
+`local_mailboxes` and `local_wires`. EngineState also keeps both
+`mailbox_tag_key` values and `MailboxBinProgress` rows. Anyone who has the
+`DMTicket` can pin a `DMNotice` at the `DMInviteTag`.
 
-Handshake operations that take `now` MUST store `Failed` `InviteExpired` when
-`now > expires` and the conversation is still pre-`Established`:
-`markNoticePinned`, `receiveNotice`, `createIntroduction`,
-`receiveInviteeIntroduction`, `receiveInviterIntroduction`, `introductionSent`,
-`confirmEstablished`, `rejectEstablished`.
+`tick` stores `Failed` `InviteExpired` when the ticked `now` is greater than
+`expires` and the conversation is still pre-`Established`. Later
+`ingestList` / `ingestItem` / `writeAck` / `confirmEstablished` /
+`rejectEstablished` on that conversation is `WrongPhase`.
 
 | From | Method | To |
 | --- | --- | --- |
 | (none) | `createInvite` | `Inviter` `InviteCreated` |
-| `InviteCreated` | `markNoticePinned` | `NoticePinned` |
-| `NoticePinned` | `receiveInviteeIntroduction` | `Inviter` `IntroductionMinted` |
-| `Inviter` `IntroductionMinted` | `introductionSent` | `Inviter` `Confirming` |
+| `InviteCreated` | `writeAck` of the full pin set | `NoticePinned` |
+| `NoticePinned` | `ingestList` / `ingestItem` of a valid invitee introduction | `Inviter` `IntroductionMinted` |
+| `Inviter` `IntroductionMinted` | `writeAck` of the full post set | `Inviter` `Confirming` |
 | (none) | `receiveTicket` | `Invitee` `TicketReceived` |
-| `TicketReceived` | `receiveNotice` | `InviteReceived` |
-| `InviteReceived` | `createIntroduction` | `Invitee` `IntroductionMinted` |
-| `Invitee` `IntroductionMinted` | `introductionSent` | `IntroductionSent` |
-| `IntroductionSent` | `receiveInviterIntroduction` | `Invitee` `Confirming` |
+| `TicketReceived` | `ingestList` / `ingestItem` of a valid Notice | `InviteReceived` |
+| `InviteReceived` | ingest or `setDisplayName` / `setLocalChannels` mint | `Invitee` `IntroductionMinted` |
+| `Invitee` `IntroductionMinted` | `writeAck` of the full post set | `IntroductionSent` |
+| `IntroductionSent` | `ingestList` / `ingestItem` of a valid inviter introduction | `Invitee` `Confirming` |
 | `Inviter` `Confirming` or `Invitee` `Confirming` | `confirmEstablished` | `Established` |
 | `Inviter` `Confirming` or `Invitee` `Confirming` | `rejectEstablished` | `Failed` `DigestRejected` |
 
-`receiveInviteeIntroduction` also mints the inviter’s signed introduction.
-`receiveInviterIntroduction` also computes `EstablishedDigest`. An empty
-Billboard fetch leaves `TicketReceived`.
+A valid invitee introduction also mints the inviter’s signed introduction. A
+valid inviter introduction also computes `EstablishedDigest`. An empty
+Billboard snapshot leaves `TicketReceived`. `confirmEstablished` and
+`rejectEstablished` use the ticked now.
 
-| Method | Failure stored |
+| Ingest | Failure stored |
 | --- | --- |
-| `receiveNotice` | `PolicyNotAccepted` when Policy is outside `accepted` |
-| `receiveNotice` | `NoticeUnlockFailed` when the blob fails `unlock` |
-| `receiveNotice` | `NoticeConflict` when a second well-formed Notice disagrees with the stored one |
-| `receiveInviteeIntroduction` | `InviteeIntroductionUnlockFailed` or `InviteeIntroductionVerifyFailed` |
-| `receiveInviteeIntroduction` | `DuplicateInviteeIntroduction` when a second valid invitee intro arrives |
-| `receiveInviterIntroduction` | `InviterIntroductionUnlockFailed` or `InviterIntroductionVerifyFailed` |
-| `receiveInviterIntroduction` | `DuplicateInviterIntroduction` when a second valid inviter intro arrives |
+| Notice | `PolicyNotAccepted` when `DMNotice.policy` differs from Engine `Policy` |
+| Notice | `NoticeUnlockFailed` when the blob fails `unlock` |
+| Notice | `NoticeConflict` when a second well-formed Notice disagrees with the stored one |
+| Invitee introduction | `InviteeIntroductionUnlockFailed` or `InviteeIntroductionVerifyFailed` |
+| Invitee introduction | `DuplicateInviteeIntroduction` when a second valid invitee intro arrives |
+| Inviter introduction | `InviterIntroductionUnlockFailed` or `InviterIntroductionVerifyFailed` |
+| Inviter introduction | `DuplicateInviterIntroduction` when a second valid inviter intro arrives |
 
 A wrong-phase call is `EngineError` `WrongPhase`; the conversation is
 unchanged. A malformed ticket at `receiveTicket` is `MalformedTicket`; no
@@ -1259,6 +1388,11 @@ for that key is later work.
 ## Host
 
 The host supplies `Rng.random32`, appends and reads persist bytes, and talks
-to mappers. It chooses the medium for the `DMTicket` host string. It supplies
-`now` as `UnixSeconds`, `expires` at `createInvite`, and the `accepted` Policy
-list for `receiveNotice`.
+to mappers with Channel and Tag. It chooses the medium for the `DMTicket`
+host string. It supplies `expires` at `createInvite`. Each cycle is `tick`
+with the current `UnixSeconds`, then `poll`, then mapper `list` / `listen` /
+`pin` / `post` / `send`, then `ingestList` / `ingestItem` / `writeAck`. Named
+local and out-of-band calls (`createUser`, `createIdentity`, `receiveTicket`,
+`setDisplayName`, `unsetDisplayName`, `setLocalChannels`,
+`confirmEstablished`, `rejectEstablished`, deletes) MAY run at any time the
+Engine accepts them.
