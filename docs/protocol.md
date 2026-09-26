@@ -515,7 +515,7 @@ FailReason = "policy_not_accepted" / "invite_expired"
            / "inviter_introduction_verify_failed"
            / "duplicate_invitee_introduction"
            / "duplicate_inviter_introduction"
-           / "digest_rejected"
+           / "confirmation_rejected"
 
 Command = { op: CommandOp }
 ```
@@ -777,24 +777,24 @@ ok                           = verify(DMNotice.policy, introduction.calling_card
 `DMInviteeIntroduction.intake_pk`). One valid DMSignedInviterIntroduction per
 conversation.
 
-#### EstablishedDigest  (planned)
+#### ConfirmationDigest  (planned)
 
 32-byte tagged hash of both signed introductions. Both sides compute it after
 they hold `DMSignedInviterIntroduction` and `DMSignedInviteeIntroduction`. The
 `tag` is a public domain-separation string.
 
 ```
-EstablishedDigest = bstr .size 32
+ConfirmationDigest = bstr .size 32
 ```
 
 ```
-tag                = UTF-8 "chuchotez/1/dm-established"
-EstablishedDigest  = mac(tag, canonical(DMSignedInviterIntroduction) || canonical(DMSignedInviteeIntroduction))
+tag                 = UTF-8 "chuchotez/1/dm-confirmation"
+ConfirmationDigest  = mac(tag, canonical(DMSignedInviterIntroduction) || canonical(DMSignedInviteeIntroduction))
 ```
 
 The concatenation order is inviter then invitee. `confirmEstablished` moves
 that party from `Confirming` to `Established`. `rejectEstablished` moves
-`Confirming` to `Failed` with `DigestRejected`.
+`Confirming` to `Failed` with `ConfirmationRejected`.
 
 ### Other conversations
 
@@ -995,14 +995,14 @@ type Inviter =
   | { phase: "InviteCreated"; expires: UnixSeconds }
   | { phase: "NoticePinned"; expires: UnixSeconds }
   | { phase: "IntroductionMinted"; expires: UnixSeconds }
-  | { phase: "Confirming"; expires: UnixSeconds; digest: string }
+  | { phase: "Confirming"; expires: UnixSeconds; confirmationDigest: string }
 
 type Invitee =
   | { phase: "TicketReceived" }
   | { phase: "InviteReceived"; policy: Policy; expires: UnixSeconds }
   | { phase: "IntroductionMinted"; policy: Policy; expires: UnixSeconds }
   | { phase: "IntroductionSent"; policy: Policy; expires: UnixSeconds }
-  | { phase: "Confirming"; policy: Policy; expires: UnixSeconds; digest: string }
+  | { phase: "Confirming"; policy: Policy; expires: UnixSeconds; confirmationDigest: string }
 
 type Established = {
   name: DisplayName
@@ -1012,7 +1012,7 @@ type Established = {
   wires: Wire[]
   localMailboxes: Mailbox[]
   localWires: Wire[]
-  digest: string
+  confirmationDigest: string
 }
 
 type Failed =
@@ -1026,7 +1026,7 @@ type Failed =
   | { reason: "InviterIntroductionVerifyFailed" }
   | { reason: "DuplicateInviteeIntroduction" }
   | { reason: "DuplicateInviterIntroduction" }
-  | { reason: "DigestRejected" }
+  | { reason: "ConfirmationRejected" }
 
 type DirectMessage =
   | { sort: "Inviter"; value: Inviter }
@@ -1144,7 +1144,7 @@ declare class Engine {
     conversationId: ConversationId,
   ): Result<Conversation>
   ticketHostString(state: EngineState, ids: ConversationRef): Result<string>
-  establishedDigest(state: EngineState, ids: ConversationRef): Result<string>
+  confirmationDigest(state: EngineState, ids: ConversationRef): Result<string>
   apply(
     state: EngineState,
     persist: PersistBytes,
@@ -1153,7 +1153,7 @@ declare class Engine {
 }
 ```
 
-`digest` and `establishedDigest` are `text(EstablishedDigest)`. `poll` write
+`confirmationDigest` is `text(ConfirmationDigest)`. `poll` write
 `body` is UTF-8 of the Notice or signed-introduction host string. `createInvite`
 MUST refuse when `expires` is less than or equal to the ticked now. Identity
 mailboxes length is 1..=4 and wires length is 0..=4; `kind`+`address` is unique
@@ -1271,7 +1271,7 @@ Inviter = InviterInviteCreated
 InviterInviteCreated = { expires: UnixSeconds }
 InviterNoticePinned = { expires: UnixSeconds }
 InviterIntroductionMinted = { expires: UnixSeconds }
-InviterConfirming = { expires: UnixSeconds, digest: tstr }
+InviterConfirming = { expires: UnixSeconds, confirmation_digest: tstr }
 
 Invitee = InviteeTicketReceived
         / InviteeInviteReceived
@@ -1283,7 +1283,7 @@ InviteeTicketReceived = {}
 InviteeInviteReceived = { policy: Policy, expires: UnixSeconds }
 InviteeIntroductionMinted = { policy: Policy, expires: UnixSeconds }
 InviteeIntroductionSent = { policy: Policy, expires: UnixSeconds }
-InviteeConfirming = { policy: Policy, expires: UnixSeconds, digest: tstr }
+InviteeConfirming = { policy: Policy, expires: UnixSeconds, confirmation_digest: tstr }
 
 Established = {
   name: DisplayName,
@@ -1293,7 +1293,7 @@ Established = {
   wires: [*4 Wire],
   local_mailboxes: [1*4 Mailbox],
   local_wires: [*4 Wire],
-  digest: tstr,
+  confirmation_digest: tstr,
 }
 
 Failed = FailedPolicyNotAccepted
@@ -1306,7 +1306,7 @@ Failed = FailedPolicyNotAccepted
        / FailedInviterIntroductionVerifyFailed
        / FailedDuplicateInviteeIntroduction
        / FailedDuplicateInviterIntroduction
-       / FailedDigestRejected
+       / FailedConfirmationRejected
 
 FailedPolicyNotAccepted = { reason: "PolicyNotAccepted", policy: Policy }
 FailedInviteExpired = { reason: "InviteExpired", expires: UnixSeconds }
@@ -1330,7 +1330,7 @@ FailedDuplicateInviteeIntroduction = {
 FailedDuplicateInviterIntroduction = {
   reason: "DuplicateInviterIntroduction",
 }
-FailedDigestRejected = { reason: "DigestRejected" }
+FailedConfirmationRejected = { reason: "ConfirmationRejected" }
 ```
 
 Query `Established` is the peer `CallingCard` (`mailbox_tag_key` omitted) plus
@@ -1355,10 +1355,10 @@ Query `Established` is the peer `CallingCard` (`mailbox_tag_key` omitted) plus
 | `Invitee` `IntroductionMinted` | `writeAck` of the full post set | `IntroductionSent` |
 | `IntroductionSent` | `ingestList` / `ingestItem` of a valid inviter introduction | `Invitee` `Confirming` |
 | `Inviter` `Confirming` or `Invitee` `Confirming` | `confirmEstablished` | `Established` |
-| `Inviter` `Confirming` or `Invitee` `Confirming` | `rejectEstablished` | `Failed` `DigestRejected` |
+| `Inviter` `Confirming` or `Invitee` `Confirming` | `rejectEstablished` | `Failed` `ConfirmationRejected` |
 
 A valid invitee introduction also mints the inviter’s signed introduction. A
-valid inviter introduction also computes `EstablishedDigest`. An empty
+valid inviter introduction also computes `ConfirmationDigest`. An empty
 Billboard snapshot leaves `TicketReceived`. `confirmEstablished` and
 `rejectEstablished` use the ticked now.
 
