@@ -91,6 +91,171 @@ pub struct Hlc {
     pub counter: u64,
 }
 
+/// Sealed packet contents, padded to [`PACKET_PAD_LEN`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PacketPlain {
+    /// Non-final durable-body fragment.
+    TxFragMore(PacketTxFragMore),
+    /// Final durable-body fragment.
+    TxFragLast(PacketTxFragLast),
+    /// Set XOR with no fragment.
+    XorAck(PacketXorAck),
+    /// XOR of `tx_id`s in `[lo, hi)`.
+    HealHalfXor(PacketHealHalfXor),
+    /// `tx_id`s the sender wants in `[lo, hi)`.
+    HealWant(PacketHealWant),
+    /// `tx_id`s the sender has in `[lo, hi)`.
+    HealHave(PacketHealHave),
+    /// Composing signal.
+    Typing(PacketTyping),
+    /// Composing signal with last-active time.
+    TypingActive(PacketTypingActive),
+    /// Liveness signal.
+    Presence(PacketPresence),
+    /// Liveness signal with last-active time.
+    PresenceActive(PacketPresenceActive),
+}
+
+/// A non-final slice of `packed(DurableBody)`. `frag_i` is 0-based, 0..=62.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketTxFragMore {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Transaction id covering `payload`.
+    pub tx_id: Tag,
+    /// 0-based fragment index.
+    pub frag_i: u64,
+    /// Fragment bytes.
+    pub frag: Vec<u8>,
+}
+
+/// The final slice of `packed(DurableBody)`. Fragment count is `frag_i + 1`, 1..=64.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketTxFragLast {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Transaction id covering `payload`.
+    pub tx_id: Tag,
+    /// 0-based fragment index.
+    pub frag_i: u64,
+    /// Fragment bytes.
+    pub frag: Vec<u8>,
+    /// Sender set XOR after including this `tx_id`.
+    pub set_xor: Tag,
+}
+
+/// The sender’s set XOR and no transaction fragment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketXorAck {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Sender set XOR.
+    pub set_xor: Tag,
+}
+
+/// XOR of `tx_id`s in `[lo, hi)` for mismatch recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketHealHalfXor {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Inclusive range start.
+    pub lo: Tag,
+    /// Exclusive range end. All-`0xff` bytes is +∞.
+    pub hi: Tag,
+    /// XOR of ids in the range.
+    pub xor: Tag,
+}
+
+/// `tx_id` values the sender wants in `[lo, hi)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketHealWant {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Inclusive range start.
+    pub lo: Tag,
+    /// Exclusive range end. All-`0xff` bytes is +∞.
+    pub hi: Tag,
+    /// Wanted ids, length 0..=32.
+    pub ids: Vec<Tag>,
+}
+
+/// `tx_id` values the sender has in `[lo, hi)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketHealHave {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Inclusive range start.
+    pub lo: Tag,
+    /// Exclusive range end. All-`0xff` bytes is +∞.
+    pub hi: Tag,
+    /// Held ids, length 0..=32.
+    pub ids: Vec<Tag>,
+}
+
+/// Ephemeral composing signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketTyping {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Conversation this signal belongs to.
+    pub conversation_id: ConversationId,
+    /// Whether the sender is composing.
+    pub composing: bool,
+}
+
+/// Ephemeral composing signal with a visible last-active time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketTypingActive {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Conversation this signal belongs to.
+    pub conversation_id: ConversationId,
+    /// Last-active Unix seconds.
+    pub last_active: u64,
+    /// Whether the sender is composing.
+    pub composing: bool,
+}
+
+/// Ephemeral liveness signal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketPresence {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Conversation this signal belongs to.
+    pub conversation_id: ConversationId,
+}
+
+/// Ephemeral liveness signal with a visible last-active time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PacketPresenceActive {
+    /// Sender signing public key, or `DeviceId` on Synchronization.
+    pub actor_id: Vec<u8>,
+    /// Sender packet sequence.
+    pub packet_seq: u64,
+    /// Conversation this signal belongs to.
+    pub conversation_id: ConversationId,
+    /// Last-active Unix seconds.
+    pub last_active: u64,
+}
+
 /// Reassembled durable transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableBody {
@@ -492,30 +657,28 @@ pub(crate) fn time_bin(unix_seconds: u64) -> u64 {
     unix_seconds / TIME_BIN_SECONDS
 }
 
-#[allow(dead_code)]
-pub(crate) fn pad484(bytes: &[u8]) -> Result<Vec<u8>, ()> {
-    if bytes.len() > PACKET_PAD_LEN {
-        return Err(());
-    }
-    let mut out = bytes.to_vec();
-    out.resize(PACKET_PAD_LEN, 0);
-    Ok(out)
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn pad(bytes: &[u8], n: usize) -> Result<Vec<u8>, ()> {
+    (bytes.len() <= n)
+        .then(|| {
+            let mut out = bytes.to_vec();
+            out.resize(n, 0);
+            out
+        })
+        .ok_or(())
 }
 
-#[allow(dead_code)]
-pub(crate) fn unpad484(bytes: &[u8]) -> &[u8] {
-    let mut n = bytes.len();
-    while n > 0 && bytes[n - 1] == 0 {
-        n -= 1;
-    }
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn unpad(bytes: &[u8]) -> &[u8] {
+    let n = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     &bytes[..n]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BIN_WINDOW, ConversationSort, PACKET_LEN, PACKET_PAD_LEN, pad484, parse_policy, policy_str,
-        time_bin, unpad484,
+        BIN_WINDOW, ConversationSort, PACKET_LEN, PACKET_PAD_LEN, pad, parse_policy, policy_str,
+        time_bin, unpad,
     };
     use crate::protocol::Policy;
 
@@ -539,9 +702,11 @@ mod tests {
             "Synchronization"
         );
         assert_eq!(ConversationSort::Engine.to_string(), "Engine");
-        let p = pad484(b"hi").expect("pad");
+        let p = pad(b"hi", PACKET_PAD_LEN).expect("pad");
         assert_eq!(p.len(), PACKET_PAD_LEN);
-        assert_eq!(unpad484(&p), b"hi");
-        assert!(pad484(&[0u8; PACKET_PAD_LEN + 1]).is_err());
+        assert_eq!(unpad(&p), b"hi");
+        assert!(pad(&[0u8; PACKET_PAD_LEN + 1], PACKET_PAD_LEN).is_err());
+        assert!(unpad(&[0u8; 4]).is_empty());
+        assert_eq!(pad(b"", 2).expect("z"), vec![0, 0]);
     }
 }

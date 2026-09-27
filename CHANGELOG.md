@@ -15,4 +15,6 @@ required before `poll` and mints. Ticket host strings are
 `Conversation`. `std_suite` adds SHA-256 (`LibcruxSha256`) and
 Argon2id (`RustcryptoArgon2id`). Kem wrap/unwrap and Sign sign/verify ship
 for Classic, PostQuantum, and Hybrid. `ADDRESS_MAX_LEN` is 256. Persistent
-channel lists are length 1..=4; ephemeral lists are 0..=4.
+channel lists are length 1..=4; ephemeral lists are 0..=4. `PacketPlain`
+alternatives map through `J` / `J⁻¹`. `packed(PacketPlain)` that exceeds
+`PACKET_PAD_LEN` (484) is `BodyTooLarge`.

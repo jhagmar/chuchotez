@@ -53,7 +53,9 @@ pub use kem::{
 };
 pub use payload::{
     BIN_WINDOW, ConversationSort, DurableBody, GroupMember, Hlc, PACKET_LEN,
-    PACKET_MAX_UNCOMPRESSED, PACKET_PAD_LEN, Ticket, TxEdit, TxGroupInvite, TxGroupRoster,
+    PACKET_MAX_UNCOMPRESSED, PACKET_PAD_LEN, PacketHealHalfXor, PacketHealHave, PacketHealWant,
+    PacketPlain, PacketPresence, PacketPresenceActive, PacketTxFragLast, PacketTxFragMore,
+    PacketTyping, PacketTypingActive, PacketXorAck, Ticket, TxEdit, TxGroupInvite, TxGroupRoster,
     TxGroupWrap, TxInviteeIntro, TxInviterIntro, TxMedia, TxNotice, TxPayload, TxReaction, TxText,
     UnlockSecret, VAULT_M, VAULT_P, VAULT_T, VaultHeader,
 };

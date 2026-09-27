@@ -1,11 +1,16 @@
 //! JSON mapping `J` for Ticket, DurableBody, PacketPlain, and VaultHeader.
 
 use super::channel::{Address, DurableChannel, EphemeralChannel, Kind};
+use super::compress::Compress;
 use super::defaults::{Defaults, DisplayName, NotificationPrivacy, OnWirePrefs, ProfilePic, Wake};
+use super::error::EngineError;
+use super::json::CanonicalJson;
 use super::payload::{
-    DurableBody, GroupMember, Hlc, Ticket, TxEdit, TxGroupInvite, TxGroupRoster, TxGroupWrap,
-    TxInviteeIntro, TxInviterIntro, TxMedia, TxNotice, TxPayload, TxReaction, TxText, VaultHeader,
-    parse_policy, policy_str,
+    DurableBody, GroupMember, Hlc, PACKET_PAD_LEN, PacketHealHalfXor, PacketHealHave,
+    PacketHealWant, PacketPlain, PacketPresence, PacketPresenceActive, PacketTxFragLast,
+    PacketTxFragMore, PacketTyping, PacketTypingActive, PacketXorAck, Ticket, TxEdit,
+    TxGroupInvite, TxGroupRoster, TxGroupWrap, TxInviteeIntro, TxInviterIntro, TxMedia, TxNotice,
+    TxPayload, TxReaction, TxText, VaultHeader, parse_policy, policy_str,
 };
 use super::{
     Base64Url, ConversationId, DeviceId, IdentityId, Json, KeyPair, Secret, SigningKeyPair, Tag,
@@ -1123,6 +1128,362 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn packet_type(packet: &PacketPlain) -> &'static str {
+    match packet {
+        PacketPlain::TxFragMore(_) => "v1-packet-tx-frag-more",
+        PacketPlain::TxFragLast(_) => "v1-packet-tx-frag-last",
+        PacketPlain::XorAck(_) => "v1-packet-xor-ack",
+        PacketPlain::HealHalfXor(_) => "v1-packet-heal-half-xor",
+        PacketPlain::HealWant(_) => "v1-packet-heal-want",
+        PacketPlain::HealHave(_) => "v1-packet-heal-have",
+        PacketPlain::Typing(_) => "v1-packet-typing",
+        PacketPlain::TypingActive(_) => "v1-packet-typing-active",
+        PacketPlain::Presence(_) => "v1-packet-presence",
+        PacketPlain::PresenceActive(_) => "v1-packet-presence-active",
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn tags_json(b64u: &dyn Base64Url, ids: &[Tag]) -> Json {
+    Json::Array(ids.iter().map(|t| bstr(b64u, t.as_bytes())).collect())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn packet_to_json(b64u: &dyn Base64Url, packet: &PacketPlain) -> Json {
+    let mut members = vec![
+        ("type".into(), Json::String(packet_type(packet).into())),
+        ("version".into(), Json::Number(1)),
+    ];
+    match packet {
+        PacketPlain::TxFragMore(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push(("tx_id".into(), bstr(b64u, p.tx_id.as_bytes())));
+            members.push(("frag_i".into(), Json::Number(p.frag_i)));
+            members.push(("frag".into(), bstr(b64u, &p.frag)));
+        }
+        PacketPlain::TxFragLast(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push(("tx_id".into(), bstr(b64u, p.tx_id.as_bytes())));
+            members.push(("frag_i".into(), Json::Number(p.frag_i)));
+            members.push(("frag".into(), bstr(b64u, &p.frag)));
+            members.push(("set_xor".into(), bstr(b64u, p.set_xor.as_bytes())));
+        }
+        PacketPlain::XorAck(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push(("set_xor".into(), bstr(b64u, p.set_xor.as_bytes())));
+        }
+        PacketPlain::HealHalfXor(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push(("lo".into(), bstr(b64u, p.lo.as_bytes())));
+            members.push(("hi".into(), bstr(b64u, p.hi.as_bytes())));
+            members.push(("xor".into(), bstr(b64u, p.xor.as_bytes())));
+        }
+        PacketPlain::HealWant(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push(("lo".into(), bstr(b64u, p.lo.as_bytes())));
+            members.push(("hi".into(), bstr(b64u, p.hi.as_bytes())));
+            members.push(("ids".into(), tags_json(b64u, &p.ids)));
+        }
+        PacketPlain::HealHave(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push(("lo".into(), bstr(b64u, p.lo.as_bytes())));
+            members.push(("hi".into(), bstr(b64u, p.hi.as_bytes())));
+            members.push(("ids".into(), tags_json(b64u, &p.ids)));
+        }
+        PacketPlain::Typing(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push((
+                "conversation_id".into(),
+                bstr(b64u, p.conversation_id.as_bytes()),
+            ));
+            members.push(("composing".into(), Json::Bool(p.composing)));
+        }
+        PacketPlain::TypingActive(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push((
+                "conversation_id".into(),
+                bstr(b64u, p.conversation_id.as_bytes()),
+            ));
+            members.push(("last_active".into(), Json::Number(p.last_active)));
+            members.push(("composing".into(), Json::Bool(p.composing)));
+        }
+        PacketPlain::Presence(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push((
+                "conversation_id".into(),
+                bstr(b64u, p.conversation_id.as_bytes()),
+            ));
+        }
+        PacketPlain::PresenceActive(p) => {
+            members.push(("actor_id".into(), bstr(b64u, &p.actor_id)));
+            members.push(("packet_seq".into(), Json::Number(p.packet_seq)));
+            members.push((
+                "conversation_id".into(),
+                bstr(b64u, p.conversation_id.as_bytes()),
+            ));
+            members.push(("last_active".into(), Json::Number(p.last_active)));
+        }
+    }
+    Json::Object(members)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn get_cid(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<ConversationId, ()> {
+    id32(
+        get_bstr(b64u, m, "conversation_id")?,
+        ConversationId::from_bytes,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn require_v1(m: &[(String, Json)]) -> Result<(), ()> {
+    (get_u64(m, "version")? == 1).then_some(()).ok_or(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn get_frag_i(m: &[(String, Json)], max: u64) -> Result<u64, ()> {
+    let n = get_u64(m, "frag_i")?;
+    (n <= max).then_some(n).ok_or(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn get_ids(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<Vec<Tag>, ()> {
+    let Json::Array(items) = get(m, "ids")? else {
+        return Err(());
+    };
+    (items.len() <= 32).then_some(()).ok_or(())?;
+    items
+        .iter()
+        .map(|item| match item {
+            Json::String(s) => id32(b64u.decode(s).map_err(|_| ())?, Tag::from_bytes),
+            _ => Err(()),
+        })
+        .collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn packet_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<PacketPlain, ()> {
+    let m = parse_obj(value)?;
+    require_v1(m)?;
+    match get_str(m, "type")? {
+        "v1-packet-tx-frag-more" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "tx_id",
+                    "frag_i",
+                    "frag",
+                ],
+            )?;
+            Ok(PacketPlain::TxFragMore(PacketTxFragMore {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                tx_id: get_tag(b64u, m, "tx_id")?,
+                frag_i: get_frag_i(m, 62)?,
+                frag: get_bstr(b64u, m, "frag")?,
+            }))
+        }
+        "v1-packet-tx-frag-last" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "tx_id",
+                    "frag_i",
+                    "frag",
+                    "set_xor",
+                ],
+            )?;
+            Ok(PacketPlain::TxFragLast(PacketTxFragLast {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                tx_id: get_tag(b64u, m, "tx_id")?,
+                frag_i: get_frag_i(m, 63)?,
+                frag: get_bstr(b64u, m, "frag")?,
+                set_xor: get_tag(b64u, m, "set_xor")?,
+            }))
+        }
+        "v1-packet-xor-ack" => {
+            extra_ok(m, &["type", "version", "actor_id", "packet_seq", "set_xor"])?;
+            Ok(PacketPlain::XorAck(PacketXorAck {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                set_xor: get_tag(b64u, m, "set_xor")?,
+            }))
+        }
+        "v1-packet-heal-half-xor" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "lo",
+                    "hi",
+                    "xor",
+                ],
+            )?;
+            Ok(PacketPlain::HealHalfXor(PacketHealHalfXor {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                lo: get_tag(b64u, m, "lo")?,
+                hi: get_tag(b64u, m, "hi")?,
+                xor: get_tag(b64u, m, "xor")?,
+            }))
+        }
+        "v1-packet-heal-want" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "lo",
+                    "hi",
+                    "ids",
+                ],
+            )?;
+            Ok(PacketPlain::HealWant(PacketHealWant {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                lo: get_tag(b64u, m, "lo")?,
+                hi: get_tag(b64u, m, "hi")?,
+                ids: get_ids(b64u, m)?,
+            }))
+        }
+        "v1-packet-heal-have" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "lo",
+                    "hi",
+                    "ids",
+                ],
+            )?;
+            Ok(PacketPlain::HealHave(PacketHealHave {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                lo: get_tag(b64u, m, "lo")?,
+                hi: get_tag(b64u, m, "hi")?,
+                ids: get_ids(b64u, m)?,
+            }))
+        }
+        "v1-packet-typing" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "conversation_id",
+                    "composing",
+                ],
+            )?;
+            Ok(PacketPlain::Typing(PacketTyping {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                conversation_id: get_cid(b64u, m)?,
+                composing: get_bool(m, "composing")?,
+            }))
+        }
+        "v1-packet-typing-active" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "conversation_id",
+                    "last_active",
+                    "composing",
+                ],
+            )?;
+            Ok(PacketPlain::TypingActive(PacketTypingActive {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                conversation_id: get_cid(b64u, m)?,
+                last_active: get_u64(m, "last_active")?,
+                composing: get_bool(m, "composing")?,
+            }))
+        }
+        "v1-packet-presence" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "conversation_id",
+                ],
+            )?;
+            Ok(PacketPlain::Presence(PacketPresence {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                conversation_id: get_cid(b64u, m)?,
+            }))
+        }
+        "v1-packet-presence-active" => {
+            extra_ok(
+                m,
+                &[
+                    "type",
+                    "version",
+                    "actor_id",
+                    "packet_seq",
+                    "conversation_id",
+                    "last_active",
+                ],
+            )?;
+            Ok(PacketPlain::PresenceActive(PacketPresenceActive {
+                actor_id: get_bstr(b64u, m, "actor_id")?,
+                packet_seq: get_u64(m, "packet_seq")?,
+                conversation_id: get_cid(b64u, m)?,
+                last_active: get_u64(m, "last_active")?,
+            }))
+        }
+        _ => Err(()),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn packed_packet(
+    json: &dyn CanonicalJson,
+    b64u: &dyn Base64Url,
+    compress: &dyn Compress,
+    packet: &PacketPlain,
+) -> Result<Vec<u8>, EngineError> {
+    let packed = compress.compress(&json.encode(&packet_to_json(b64u, packet)));
+    (packed.len() <= PACKET_PAD_LEN)
+        .then_some(packed)
+        .ok_or(EngineError::BodyTooLarge)
+}
+
 pub(crate) fn durable_body_from_json(
     b64u: &dyn Base64Url,
     value: &Json,
@@ -1148,22 +1509,26 @@ mod tests {
         Defaults, DisplayName, NotificationPrivacy, OnWirePrefs, ProfilePic,
     };
     use super::super::payload::{
-        DurableBody, GroupMember, Hlc, Ticket, TxEdit, TxGroupInvite, TxGroupRoster, TxGroupWrap,
-        TxInviteeIntro, TxInviterIntro, TxMedia, TxNotice, TxPayload, TxReaction, TxText,
-        VaultHeader,
+        DurableBody, GroupMember, Hlc, PACKET_PAD_LEN, PacketHealHalfXor, PacketHealHave,
+        PacketHealWant, PacketPlain, PacketPresence, PacketPresenceActive, PacketTxFragLast,
+        PacketTxFragMore, PacketTyping, PacketTypingActive, PacketXorAck, Ticket, TxEdit,
+        TxGroupInvite, TxGroupRoster, TxGroupWrap, TxInviteeIntro, TxInviterIntro, TxMedia,
+        TxNotice, TxPayload, TxReaction, TxText, VaultHeader, pad, unpad,
     };
     use super::super::{
-        Address, Base64Url, Base64UrlError, ConversationId, DeviceId, DurableChannel,
+        Address, Base64Url, Base64UrlError, ConversationId, DeviceId, DurableChannel, EngineError,
         EphemeralChannel, IdentityId, Json, KeyPair, Kind, Secret, SigningKeyPair, Tag, TagKey,
         UserId, Wake,
     };
     use super::{
-        durable_body_from_json, durable_body_to_json, durable_json, extra_ok, get, get_bool,
-        get_str, get_tag, get_u64, id32, parse_durable_list, parse_ephemeral_list, parse_hlc,
-        parse_obj, parse_opt_str, parse_opt_tag, parse_opt_u64, parse_pic, payload_from_json,
-        payload_to_json, payload_type, ticket_from_json, ticket_to_json, vault_header_to_json,
+        bstr, durable_body_from_json, durable_body_to_json, durable_json, extra_ok, get, get_bool,
+        get_str, get_tag, get_u64, id32, packed_packet, packet_from_json, packet_to_json,
+        packet_type, parse_durable_list, parse_ephemeral_list, parse_hlc, parse_obj, parse_opt_str,
+        parse_opt_tag, parse_opt_u64, parse_pic, payload_from_json, payload_to_json, payload_type,
+        ticket_from_json, ticket_to_json, vault_header_to_json,
     };
     use crate::protocol::Policy;
+    use crate::protocol::v1::fixtures::{DetJson, IdentityCompress};
     struct Hex;
     impl Base64Url for Hex {
         fn encode(&self, src: &[u8]) -> String {
@@ -1854,5 +2219,238 @@ mod tests {
             }
         });
         assert!(durable_body_from_json(&Hex, &body_j).is_err());
+    }
+
+    #[test]
+    fn packet_roundtrips() {
+        let actor = vec![7u8; 32];
+        let tag = Tag::from_bytes([3; 32]);
+        let inf = Tag::from_bytes([0xff; 32]);
+        let cid = ConversationId::from_bytes([4; 32]);
+        let packets = [
+            PacketPlain::TxFragMore(PacketTxFragMore {
+                actor_id: actor.clone(),
+                packet_seq: 1,
+                tx_id: tag,
+                frag_i: 0,
+                frag: vec![9, 8, 7],
+            }),
+            PacketPlain::TxFragMore(PacketTxFragMore {
+                actor_id: actor.clone(),
+                packet_seq: 2,
+                tx_id: tag,
+                frag_i: 62,
+                frag: Vec::new(),
+            }),
+            PacketPlain::TxFragLast(PacketTxFragLast {
+                actor_id: actor.clone(),
+                packet_seq: 3,
+                tx_id: tag,
+                frag_i: 0,
+                frag: vec![1],
+                set_xor: tag,
+            }),
+            PacketPlain::TxFragLast(PacketTxFragLast {
+                actor_id: actor.clone(),
+                packet_seq: 4,
+                tx_id: tag,
+                frag_i: 63,
+                frag: vec![2],
+                set_xor: inf,
+            }),
+            PacketPlain::XorAck(PacketXorAck {
+                actor_id: actor.clone(),
+                packet_seq: 5,
+                set_xor: tag,
+            }),
+            PacketPlain::HealHalfXor(PacketHealHalfXor {
+                actor_id: actor.clone(),
+                packet_seq: 6,
+                lo: tag,
+                hi: inf,
+                xor: tag,
+            }),
+            PacketPlain::HealWant(PacketHealWant {
+                actor_id: actor.clone(),
+                packet_seq: 7,
+                lo: tag,
+                hi: inf,
+                ids: Vec::new(),
+            }),
+            PacketPlain::HealWant(PacketHealWant {
+                actor_id: actor.clone(),
+                packet_seq: 8,
+                lo: tag,
+                hi: inf,
+                ids: vec![tag; 32],
+            }),
+            PacketPlain::HealHave(PacketHealHave {
+                actor_id: actor.clone(),
+                packet_seq: 9,
+                lo: tag,
+                hi: inf,
+                ids: vec![tag],
+            }),
+            PacketPlain::Typing(PacketTyping {
+                actor_id: actor.clone(),
+                packet_seq: 10,
+                conversation_id: cid,
+                composing: true,
+            }),
+            PacketPlain::TypingActive(PacketTypingActive {
+                actor_id: actor.clone(),
+                packet_seq: 11,
+                conversation_id: cid,
+                last_active: 99,
+                composing: false,
+            }),
+            PacketPlain::Presence(PacketPresence {
+                actor_id: actor.clone(),
+                packet_seq: 12,
+                conversation_id: cid,
+            }),
+            PacketPlain::PresenceActive(PacketPresenceActive {
+                actor_id: actor.clone(),
+                packet_seq: 13,
+                conversation_id: cid,
+                last_active: 100,
+            }),
+        ];
+        fn extra(j: Json) -> Json {
+            match j {
+                Json::Object(mut m) => {
+                    m.push(("nope".into(), Json::Bool(true)));
+                    Json::Object(m)
+                }
+                other => other,
+            }
+        }
+        for p in &packets {
+            let j = packet_to_json(&Hex, p);
+            assert_eq!(packet_from_json(&Hex, &j).expect("round"), *p);
+            assert!(packet_from_json(&Hex, &extra(j)).is_err());
+        }
+        let _ = extra(Json::Null);
+        assert_eq!(packet_type(&packets[0]), "v1-packet-tx-frag-more");
+        assert!(format!("{:?}", packets[5]).contains("HealHalfXor"));
+        fn on_obj(j: &mut Json, f: fn(&mut Vec<(String, Json)>)) {
+            let Json::Object(m) = j else {
+                return;
+            };
+            f(m);
+        }
+        #[allow(clippy::ptr_arg)]
+        fn drop_cid(m: &mut Vec<(String, Json)>) {
+            m.retain(|(k, _)| k != "conversation_id");
+        }
+        #[allow(clippy::ptr_arg)]
+        fn set_type_nope(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "type" {
+                    *v = Json::String("v1-nope".into());
+                }
+            }
+        }
+        #[allow(clippy::ptr_arg)]
+        fn set_version_2(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "version" {
+                    *v = Json::Number(2);
+                }
+            }
+        }
+        #[allow(clippy::ptr_arg)]
+        fn set_frag_63(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "frag_i" {
+                    *v = Json::Number(63);
+                }
+            }
+        }
+        #[allow(clippy::ptr_arg)]
+        fn set_frag_64(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "frag_i" {
+                    *v = Json::Number(64);
+                }
+            }
+        }
+        #[allow(clippy::ptr_arg)]
+        fn push_id(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "ids"
+                    && let Json::Array(a) = v
+                {
+                    a.push(bstr(&Hex, Tag::from_bytes([3; 32]).as_bytes()));
+                }
+            }
+        }
+        #[allow(clippy::ptr_arg)]
+        fn ids_number(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "ids" {
+                    *v = Json::Array(vec![Json::Number(1)]);
+                }
+            }
+        }
+        #[allow(clippy::ptr_arg)]
+        fn ids_bool(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "ids" {
+                    *v = Json::Bool(true);
+                }
+            }
+        }
+        #[allow(clippy::ptr_arg)]
+        fn short_cid(m: &mut Vec<(String, Json)>) {
+            for (k, v) in m.iter_mut() {
+                if k == "conversation_id" {
+                    *v = Json::String("aa".into());
+                }
+            }
+        }
+        on_obj(&mut Json::Null, drop_cid);
+        let mut missing = packet_to_json(&Hex, &packets[11]);
+        on_obj(&mut missing, drop_cid);
+        assert!(packet_from_json(&Hex, &missing).is_err());
+        let mut unknown = packet_to_json(&Hex, &packets[4]);
+        on_obj(&mut unknown, set_type_nope);
+        assert!(packet_from_json(&Hex, &unknown).is_err());
+        let mut ver = packet_to_json(&Hex, &packets[4]);
+        on_obj(&mut ver, set_version_2);
+        assert!(packet_from_json(&Hex, &ver).is_err());
+        let mut more_i = packet_to_json(&Hex, &packets[0]);
+        on_obj(&mut more_i, set_frag_63);
+        assert!(packet_from_json(&Hex, &more_i).is_err());
+        let mut last_i = packet_to_json(&Hex, &packets[2]);
+        on_obj(&mut last_i, set_frag_64);
+        assert!(packet_from_json(&Hex, &last_i).is_err());
+        let mut ids_long = packet_to_json(&Hex, &packets[7]);
+        on_obj(&mut ids_long, push_id);
+        assert!(packet_from_json(&Hex, &ids_long).is_err());
+        let mut ids_num = packet_to_json(&Hex, &packets[8]);
+        on_obj(&mut ids_num, ids_number);
+        assert!(packet_from_json(&Hex, &ids_num).is_err());
+        let mut ids_ty = packet_to_json(&Hex, &packets[8]);
+        on_obj(&mut ids_ty, ids_bool);
+        assert!(packet_from_json(&Hex, &ids_ty).is_err());
+        let mut bad_cid = packet_to_json(&Hex, &packets[11]);
+        on_obj(&mut bad_cid, short_cid);
+        assert!(packet_from_json(&Hex, &bad_cid).is_err());
+        let small = packed_packet(&DetJson, &Hex, &IdentityCompress, &packets[11]).expect("pack");
+        assert!(small.len() <= PACKET_PAD_LEN);
+        let padded = pad(&small, PACKET_PAD_LEN).expect("pad");
+        assert_eq!(unpad(&padded), small.as_slice());
+        let huge = PacketPlain::TxFragMore(PacketTxFragMore {
+            actor_id: actor,
+            packet_seq: 99,
+            tx_id: tag,
+            frag_i: 0,
+            frag: vec![1; 600],
+        });
+        assert_eq!(
+            packed_packet(&DetJson, &Hex, &IdentityCompress, &huge),
+            Err(EngineError::BodyTooLarge)
+        );
     }
 }
