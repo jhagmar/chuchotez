@@ -2,6 +2,9 @@
 set -eu
 cd /src
 
+export CARGO_INCREMENTAL=0
+export CARGO_TERM_COLOR=always
+
 # GitHub's reuse-action lints a checkout. This bind mount is a submodule
 # whose gitdir sits outside /src, so reuse cannot honour .gitignore and
 # would scan target/ and ci/out/.

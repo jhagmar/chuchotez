@@ -18,6 +18,7 @@ ENV RUSTUP_HOME=/opt/rustup
 ENV CARGO_HOME=/opt/cargo
 ENV PATH=/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV CARGO_TERM_COLOR=always
+ENV CARGO_INCREMENTAL=0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

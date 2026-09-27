@@ -23,6 +23,8 @@ wildcards = "deny"
 skip = [
     { crate = "shlex@1", reason = "bindgen 0.72 (crabgrind via libcrux-secrets) requires shlex 1; cc requires shlex 2" },
     { crate = "syn@3", reason = "serde_derive (hax-lib-macros-types) requires syn 3; libcrux macros require syn 2" },
+    { crate = "rand_core@0.6", reason = "argon2 password-hash requires rand_core 0.6; libcrux requires rand_core 0.10" },
+    { crate = "cpufeatures@0.2", reason = "argon2 requires cpufeatures 0.2; libcrux requires cpufeatures 0.3" },
 ]
 
 [sources]

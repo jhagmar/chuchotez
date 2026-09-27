@@ -30,6 +30,7 @@ fn write_json(value: &Json, out: &mut String) {
         Json::Null => out.push_str("null"),
         Json::Bool(true) => out.push_str("true"),
         Json::Bool(false) => out.push_str("false"),
+        Json::Number(n) => out.push_str(&n.to_string()),
         Json::String(s) => write_string(s, out),
         Json::Array(items) => {
             out.push('[');
@@ -114,7 +115,32 @@ impl<'a> Parser<'a> {
         if self.rest.starts_with('{') {
             return self.object();
         }
+        if self
+            .rest
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit())
+        {
+            return self.number();
+        }
         Err(CanonicalJsonError::Invalid)
+    }
+
+    fn number(&mut self) -> Result<Json, CanonicalJsonError> {
+        let bytes = self.rest.as_bytes();
+        if bytes.first() == Some(&b'0') && bytes.get(1).is_some_and(|b| b.is_ascii_digit()) {
+            return Err(CanonicalJsonError::Invalid);
+        }
+        let mut i = 0usize;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let digits = &self.rest[..i];
+        self.rest = &self.rest[i..];
+        let n = digits
+            .parse::<u64>()
+            .map_err(|_| CanonicalJsonError::Invalid)?;
+        Ok(Json::Number(n))
     }
 
     fn string(&mut self) -> Result<String, CanonicalJsonError> {
@@ -241,7 +267,11 @@ mod tests {
             port.decode(&[0xff]).unwrap_err(),
             CanonicalJsonError::Invalid
         );
-        assert_eq!(port.decode(b"1").unwrap_err(), CanonicalJsonError::Invalid);
+        assert_eq!(port.decode(b"-1").unwrap_err(), CanonicalJsonError::Invalid);
+        assert_eq!(port.decode(b"01").unwrap_err(), CanonicalJsonError::Invalid);
+        assert_eq!(port.decode(b"0").expect("zero"), Json::Number(0));
+        assert_eq!(port.decode(b"42").expect("n"), Json::Number(42));
+        assert_eq!(port.encode(&Json::Number(42)), b"42");
         assert_eq!(
             port.decode(b"{,}").unwrap_err(),
             CanonicalJsonError::Invalid

@@ -6,7 +6,8 @@ The [book](book.md) documents the locked Rust crate. rustdoc is that crate’s
 API reference.
 
 **Shipped** work is in the crates. **Planned** work is decided and waiting on a
-slice. This page is ahead of the crates: a later slice will propagate it.
+slice. Packet sending-chain seal/open, ingest reassembly, heal, live path,
+confirmation digest, and child-conversation spawn wait on a later slice.
 
 The **host** is the app. It supplies `random32`, stores the local log, and talks
 to the network. Chuchotez builds the envelopes.
@@ -586,10 +587,11 @@ DurableWrite = { channel: DurableChannel, tag: Tag, body: bstr .size 512 }
 EphemeralWrite = { channel: EphemeralChannel, tag: Tag, body: bstr .size 512 }
 BlobPut = { kind: Kind, address: Address, tag: Tag, body: bstr }
 BlobGet = { kind: Kind, address: Address, tag: Tag }
+BlockedMissing = "DisplayName"
 BlockedIdentity = {
   user_id: UserId,
   identity_id: IdentityId,
-  missing: "DisplayName",
+  missing: BlockedMissing,
 }
 
 Poll = {
@@ -1631,10 +1633,11 @@ type DurableWrite = { channel: DurableChannel; tag: Tag; body: Uint8Array }
 type EphemeralWrite = { channel: EphemeralChannel; tag: Tag; body: Uint8Array }
 type BlobPut = { kind: Kind; address: Address; tag: Tag; body: Uint8Array }
 type BlobGet = { kind: Kind; address: Address; tag: Tag }
+type BlockedMissing = "DisplayName"
 type BlockedIdentity = {
   userId: UserId
   identityId: IdentityId
-  missing: "DisplayName"
+  missing: BlockedMissing
 }
 type Poll = {
   list: DurableLocator[]
@@ -1663,8 +1666,7 @@ type HistoryItem = {
 
 type ConversationListRow = {
   conversationId: ConversationId
-  sort: ConversationSort
-  phase: string
+  conversation: Conversation
 }
 
 type ConversationSort =
@@ -1773,16 +1775,30 @@ type FailedReason =
   | { reason: "Left" }
 
 type Handshake =
-  | { role: "Inviter"; value: HandshakeInviter }
-  | { role: "Invitee"; value: HandshakeInvitee }
-  | { role: "Failed"; value: FailedReason }
+  | ({ role: "Inviter" } & HandshakeInviter)
+  | ({ role: "Invitee" } & HandshakeInvitee)
+  | ({ role: "Failed" } & FailedReason)
+
+type DirectMessageQuery =
+  | { phase: "Established"; value: DmEstablished }
+  | { phase: "Failed"; value: FailedReason }
+
+type GroupQuery =
+  | { phase: "GroupOffer"; value: GroupOffer }
+  | { phase: "GroupEstablished"; value: GroupEstablished }
+  | { phase: "GroupFailed"; value: FailedReason }
+
+type SynchronizationQuery =
+  | { phase: "Handshake"; value: Handshake }
+  | { phase: "SyncEstablished"; value: SyncEstablished }
+  | { phase: "Failed"; value: FailedReason }
 
 type Conversation =
   | { sort: "HandshakeDm"; value: Handshake }
   | { sort: "HandshakeSync"; value: Handshake }
-  | { sort: "DirectMessage"; value: DmEstablished | { phase: "Failed"; value: FailedReason } }
-  | { sort: "Group"; value: { phase: "GroupOffer"; value: GroupOffer } | { phase: "GroupEstablished"; value: GroupEstablished } | { phase: "GroupFailed"; value: FailedReason } }
-  | { sort: "Synchronization"; value: Handshake | { phase: "SyncEstablished"; value: SyncEstablished } | { phase: "Failed"; value: FailedReason } }
+  | { sort: "DirectMessage"; value: DirectMessageQuery }
+  | { sort: "Group"; value: GroupQuery }
+  | { sort: "Synchronization"; value: SynchronizationQuery }
 
 declare class Engine {
   constructor(defaults: Defaults)

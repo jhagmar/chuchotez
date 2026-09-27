@@ -7,6 +7,8 @@ pub enum Json {
     Null,
     /// JSON boolean.
     Bool(bool),
+    /// JSON number of a CDDL `uint`.
+    Number(u64),
     /// JSON string.
     String(String),
     /// JSON array.
@@ -48,6 +50,8 @@ mod tests {
         let a = Json::String("x".into());
         assert_eq!(a, Json::String("x".into()));
         assert_ne!(a, Json::Bool(true));
+        assert_eq!(Json::Number(7), Json::Number(7));
+        assert_ne!(Json::Number(7), Json::Number(8));
         assert_eq!(Json::Null, Json::Null);
         assert_eq!(Json::Array(Vec::new()), Json::Array(Vec::new()));
         assert_eq!(

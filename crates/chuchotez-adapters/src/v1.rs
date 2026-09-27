@@ -1,8 +1,10 @@
 //! Default portable v1 suite and engine.
 
-use crate::{AesGcm, Base64Ct, Deflate, LibcruxHmac, LibcruxKem, LibcruxSign, Rfc8785};
-use chuchotez_domain::Policy;
-use chuchotez_domain::v1::{Engine, Suite};
+use crate::{
+    AesGcm, Base64Ct, Deflate, LibcruxHmac, LibcruxKem, LibcruxSha256, LibcruxSign, Rfc8785,
+    RustcryptoArgon2id,
+};
+use chuchotez_domain::v1::{Defaults, Engine, Suite};
 use std::sync::Arc;
 
 /// Default portable v1 suite.
@@ -16,28 +18,39 @@ pub fn std_suite() -> Suite {
         Arc::new(Rfc8785),
         Arc::new(LibcruxKem),
         Arc::new(LibcruxSign),
+        Arc::new(LibcruxSha256),
+        Arc::new(RustcryptoArgon2id),
     )
 }
 
-/// [`Engine`] bound to [`std_suite`] for `policy`.
+/// [`Engine`] bound to [`std_suite`] and `defaults`.
 #[must_use]
-pub fn std_engine(policy: Policy) -> Engine {
-    Engine::new(std_suite(), policy)
+pub fn std_engine(defaults: Defaults) -> Engine {
+    Engine::new(std_suite(), defaults)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{std_engine, std_suite};
-    use chuchotez_domain::Policy;
+    use chuchotez_domain::v1::{Address, Defaults, DurableChannel, Kind, NotificationPrivacy};
 
     #[test]
-    fn std_engine_binds_policy() {
+    fn std_engine_binds_defaults() {
         let _ = std_suite();
-        assert_eq!(std_engine(Policy::Hybrid).policy(), Policy::Hybrid);
-        assert_eq!(std_engine(Policy::Classic).policy(), Policy::Classic);
-        assert_eq!(
-            std_engine(Policy::PostQuantum).policy(),
-            Policy::PostQuantum
-        );
+        let d = Defaults::try_new(
+            vec![DurableChannel::new(
+                Kind::try_from("nostr").expect("k"),
+                Address::try_from("wss://relay.example").expect("a"),
+            )],
+            Vec::new(),
+            true,
+            false,
+            true,
+            None,
+            false,
+            NotificationPrivacy::Name,
+        )
+        .expect("d");
+        assert_eq!(std_engine(d.clone()).defaults(), &d);
     }
 }
