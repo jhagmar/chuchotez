@@ -29,6 +29,11 @@ pub const PACKET_NONCE_LEN: usize = 12;
 /// Padded PacketPlain length.
 pub const PACKET_PAD_LEN: usize = 484;
 
+/// AES-256-GCM tag length; `PACKET_LEN` is nonce + pad + tag.
+pub const AEAD_TAG_LEN: usize = 16;
+
+const _: () = assert!(PACKET_LEN == PACKET_NONCE_LEN + PACKET_PAD_LEN + AEAD_TAG_LEN);
+
 /// Hour in seconds.
 pub const TIME_BIN_SECONDS: u64 = 3600;
 
@@ -63,6 +68,44 @@ impl ConversationSort {
             Self::Engine => "Engine",
         }
     }
+
+    pub(crate) fn omits_actor_id(self) -> bool {
+        matches!(self, Self::HandshakeDm | Self::HandshakeSync)
+    }
+
+    pub(crate) fn chain_root_label(self) -> Option<&'static [u8]> {
+        Some(match self {
+            Self::HandshakeDm => b"chuchotez/1/handshake-dm-chain-root",
+            Self::HandshakeSync => b"chuchotez/1/handshake-sync-chain-root",
+            Self::DirectMessage => b"chuchotez/1/dm-chain-root",
+            Self::Group => b"chuchotez/1/group-chain-root",
+            Self::Synchronization => b"chuchotez/1/sync-chain-root",
+            Self::Engine => return None,
+        })
+    }
+
+    pub(crate) fn chain_c_label(self) -> Option<&'static [u8]> {
+        Some(match self {
+            Self::HandshakeDm => b"chuchotez/1/handshake-dm-chain-c",
+            Self::HandshakeSync => b"chuchotez/1/handshake-sync-chain-c",
+            Self::DirectMessage => b"chuchotez/1/dm-chain-c",
+            Self::Group => b"chuchotez/1/group-chain-c",
+            Self::Synchronization => b"chuchotez/1/sync-chain-c",
+            Self::Engine => return None,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mix_label(self) -> Option<&'static [u8]> {
+        Some(match self {
+            Self::HandshakeDm => b"chuchotez/1/handshake-dm-kem-mix",
+            Self::HandshakeSync => b"chuchotez/1/handshake-sync-kem-mix",
+            Self::DirectMessage => b"chuchotez/1/dm-kem-mix",
+            Self::Group => b"chuchotez/1/group-kem-mix",
+            Self::Synchronization => b"chuchotez/1/sync-kem-mix",
+            Self::Engine => return None,
+        })
+    }
 }
 
 impl core::fmt::Display for ConversationSort {
@@ -91,7 +134,9 @@ pub struct Hlc {
     pub counter: u64,
 }
 
-/// Sealed packet contents, padded to [`PACKET_PAD_LEN`].
+/// Sealed packet contents, padded to [`PACKET_PAD_LEN`]. HandshakeDm and
+/// HandshakeSync carry empty `actor_id`. DirectMessage and Group carry
+/// `SigningPublicKey`. Synchronization carries `DeviceId`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PacketPlain {
     /// Non-final durable-body fragment.
@@ -677,8 +722,8 @@ pub(crate) fn unpad(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        BIN_WINDOW, ConversationSort, PACKET_LEN, PACKET_PAD_LEN, pad, parse_policy, policy_str,
-        time_bin, unpad,
+        AEAD_TAG_LEN, BIN_WINDOW, ConversationSort, PACKET_LEN, PACKET_PAD_LEN, pad, parse_policy,
+        policy_str, time_bin, unpad,
     };
     use crate::protocol::Policy;
 
@@ -687,6 +732,7 @@ mod tests {
         assert_eq!(time_bin(3600), 1);
         assert_eq!(BIN_WINDOW, 72);
         assert_eq!(PACKET_LEN, 512);
+        assert_eq!(AEAD_TAG_LEN, 16);
         assert_eq!(policy_str(Policy::Classic), "Classic");
         assert_eq!(policy_str(Policy::PostQuantum), "PostQuantum");
         assert_eq!(policy_str(Policy::Hybrid), "Hybrid");
@@ -702,6 +748,75 @@ mod tests {
             "Synchronization"
         );
         assert_eq!(ConversationSort::Engine.to_string(), "Engine");
+        assert!(ConversationSort::HandshakeDm.omits_actor_id());
+        assert!(ConversationSort::HandshakeSync.omits_actor_id());
+        assert!(!ConversationSort::DirectMessage.omits_actor_id());
+        assert!(!ConversationSort::Group.omits_actor_id());
+        assert!(!ConversationSort::Synchronization.omits_actor_id());
+        assert!(!ConversationSort::Engine.omits_actor_id());
+        assert_eq!(
+            ConversationSort::HandshakeDm.chain_root_label(),
+            Some(b"chuchotez/1/handshake-dm-chain-root".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::HandshakeSync.chain_root_label(),
+            Some(b"chuchotez/1/handshake-sync-chain-root".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::DirectMessage.chain_root_label(),
+            Some(b"chuchotez/1/dm-chain-root".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::Group.chain_root_label(),
+            Some(b"chuchotez/1/group-chain-root".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::Synchronization.chain_root_label(),
+            Some(b"chuchotez/1/sync-chain-root".as_slice())
+        );
+        assert!(ConversationSort::Engine.chain_root_label().is_none());
+        assert_eq!(
+            ConversationSort::HandshakeDm.chain_c_label(),
+            Some(b"chuchotez/1/handshake-dm-chain-c".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::HandshakeSync.chain_c_label(),
+            Some(b"chuchotez/1/handshake-sync-chain-c".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::DirectMessage.chain_c_label(),
+            Some(b"chuchotez/1/dm-chain-c".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::Group.chain_c_label(),
+            Some(b"chuchotez/1/group-chain-c".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::Synchronization.chain_c_label(),
+            Some(b"chuchotez/1/sync-chain-c".as_slice())
+        );
+        assert!(ConversationSort::Engine.chain_c_label().is_none());
+        assert_eq!(
+            ConversationSort::HandshakeDm.mix_label(),
+            Some(b"chuchotez/1/handshake-dm-kem-mix".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::HandshakeSync.mix_label(),
+            Some(b"chuchotez/1/handshake-sync-kem-mix".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::DirectMessage.mix_label(),
+            Some(b"chuchotez/1/dm-kem-mix".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::Group.mix_label(),
+            Some(b"chuchotez/1/group-kem-mix".as_slice())
+        );
+        assert_eq!(
+            ConversationSort::Synchronization.mix_label(),
+            Some(b"chuchotez/1/sync-kem-mix".as_slice())
+        );
+        assert!(ConversationSort::Engine.mix_label().is_none());
         let p = pad(b"hi", PACKET_PAD_LEN).expect("pad");
         assert_eq!(p.len(), PACKET_PAD_LEN);
         assert_eq!(unpad(&p), b"hi");

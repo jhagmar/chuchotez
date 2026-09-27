@@ -39,7 +39,9 @@ set-diff of those lists.
 ## PacketPlain
 
 `PacketPlain` is the sealed packet contents, padded to `PACKET_PAD_LEN`
-(484). Alternatives are `PacketTxFragMore`, `PacketTxFragLast`,
+(484). HandshakeDm and HandshakeSync carry empty `actor_id`. DirectMessage
+and Group carry `SigningPublicKey`. Synchronization carries `DeviceId`.
+Alternatives are `PacketTxFragMore`, `PacketTxFragLast`,
 `PacketXorAck`, `PacketHealHalfXor`, `PacketHealWant`, `PacketHealHave`,
 `PacketTyping`, `PacketTypingActive`, `PacketPresence`, and
 `PacketPresenceActive`. JSON `"type"` strings are the `v1-packet-*`
@@ -57,6 +59,9 @@ type `"v1-handshake-ticket"`. `create_invite` omitted persistents copies
 **TxNotice** is the handshake advertisement (policy, intake public key,
 persistents, ephemerals, expires). Invite packets list at
 `expand(secret, "chuchotez/1/handshake-invite" || time_bin)`.
+`create_invite` and `create_sync_invite` post 512-byte sealed fragments of
+that notice. Handshake sending-chain join omits `actor_id`. Group invites
+use an Established DM and have no Ticket, InviteTag, or intake KEM.
 
 ## Engine, Suite, Rng, and EngineState
 
@@ -97,9 +102,10 @@ query.
 The facade crate is `chuchotez`. The crate doctest is the host sketch: wrap a
 DEK, `tick`, `create_user`, `create_identity` with a Policy, `create_invite`,
 `ticket_host_string`. Fill `Random32` from a CSPRNG in a real host. After
-`receive_ticket`, the invitee lists the invite tag. `ingest_list` /
-`ingest_packet` of reassembled handshake bodies, sending-chain packet seal and
-open, heal, live-path XOR-acks, confirmation digest bytes, and spawning a
+`receive_ticket`, the invitee lists the invite tag. `create_invite` posts
+sealed 512-byte `PacketTxFrag` bodies on the handshake sending chain.
+`ingest_list` / `ingest_packet` of reassembled handshake bodies, heal,
+live-path XOR-acks, confirmation digest bytes, and spawning a
 child DM secret from intros are a later slice; those methods exist and fail
 closed (`UnknownTag`, empty digest) until that slice.
 
@@ -133,8 +139,6 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 
 ## Later slices
 
-- Seal and open 512-byte mapper bodies on the sending chain (`mk` /
-  `eph_mk`, skip-ahead).
 - Reassemble `ingest_list` / `ingest_packet` into `DurableBody` merge.
 - Heal half-xor / want / have.
 - Live path (ephemeral first, persistent after 3 ticked seconds).

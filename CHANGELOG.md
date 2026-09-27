@@ -17,4 +17,7 @@ Argon2id (`RustcryptoArgon2id`). Kem wrap/unwrap and Sign sign/verify ship
 for Classic, PostQuantum, and Hybrid. `ADDRESS_MAX_LEN` is 256. Persistent
 channel lists are length 1..=4; ephemeral lists are 0..=4. `PacketPlain`
 alternatives map through `J` / `J⁻¹`. `packed(PacketPlain)` that exceeds
-`PACKET_PAD_LEN` (484) is `BodyTooLarge`.
+`PACKET_PAD_LEN` (484) is `BodyTooLarge`. Handshake sending-chain join omits
+`actor_id`; `create_invite` and `create_sync_invite` post 512-byte sealed
+`PacketTxFrag` bodies of `TxNotice` at InviteTag. Group invites use an
+Established DM and have no Ticket, InviteTag, or intake KEM.

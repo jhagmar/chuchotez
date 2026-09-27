@@ -88,7 +88,8 @@ impl Compress for IdentityCompress {
         if src.len() > max_uncompressed {
             return Err(CompressError::Oversize);
         }
-        Ok(src.to_vec())
+        let n = src.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        Ok(src[..n].to_vec())
     }
 }
 
@@ -128,14 +129,14 @@ pub(crate) struct XorAead;
 
 impl Aead for XorAead {
     fn seal(&self, key: &AeadKey, nonce: &AeadNonce, _aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(plaintext.len() + 32);
+        let mut out = Vec::with_capacity(plaintext.len() + 16);
         for (i, byte) in plaintext.iter().enumerate() {
             out.push(
                 byte ^ key.as_bytes()[i % key.as_bytes().len()]
                     ^ nonce.as_bytes()[i % nonce.as_bytes().len()],
             );
         }
-        out.extend_from_slice(key.as_bytes());
+        out.extend_from_slice(&key.as_bytes()[..16]);
         out
     }
 
@@ -146,11 +147,11 @@ impl Aead for XorAead {
         _aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, AeadError> {
-        if ciphertext.len() < 32 {
+        if ciphertext.len() < 16 {
             return Err(AeadError::Open);
         }
-        let (body, tag) = ciphertext.split_at(ciphertext.len() - 32);
-        if tag != key.as_bytes() {
+        let (body, tag) = ciphertext.split_at(ciphertext.len() - 16);
+        if tag != &key.as_bytes()[..16] {
             return Err(AeadError::Open);
         }
         Ok(body
@@ -477,21 +478,22 @@ impl Argon2id for EchoArgon {
     }
 }
 
-pub(crate) fn test_engine() -> Engine {
-    Engine::new(
-        Suite::new(
-            Arc::new(XorHmac),
-            Arc::new(IdentityCompress),
-            Arc::new(HexB64),
-            Arc::new(XorAead),
-            Arc::new(DetJson),
-            Arc::new(EchoKem),
-            Arc::new(EchoSign),
-            Arc::new(XorHash),
-            Arc::new(EchoArgon),
-        ),
-        sample_defaults(),
+pub(crate) fn test_suite() -> Suite {
+    Suite::new(
+        Arc::new(XorHmac),
+        Arc::new(IdentityCompress),
+        Arc::new(HexB64),
+        Arc::new(XorAead),
+        Arc::new(DetJson),
+        Arc::new(EchoKem),
+        Arc::new(EchoSign),
+        Arc::new(XorHash),
+        Arc::new(EchoArgon),
     )
+}
+
+pub(crate) fn test_engine() -> Engine {
+    Engine::new(test_suite(), sample_defaults())
 }
 
 #[cfg(test)]
@@ -544,6 +546,10 @@ mod tests {
         );
         assert_eq!(IdentityCompress.compress(b"x"), b"x");
         assert!(IdentityCompress.decompress(&[0; 8], 4).is_err());
+        assert_eq!(
+            IdentityCompress.decompress(&[b'a', 0, 0], 8).expect("z"),
+            b"a"
+        );
         assert!(super::HexB64.decode("zz").is_err());
         assert!(super::HexB64.decode("0g").is_err());
         assert!(super::HexB64.decode("0").is_err());
