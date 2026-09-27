@@ -36,6 +36,17 @@ each list (`ChannelBounds`).
 bodies plus blob GET/PUT rows. The host starts and stops mapper work by
 set-diff of those lists.
 
+## PacketPlain
+
+`PacketPlain` is the sealed packet contents, padded to `PACKET_PAD_LEN`
+(484). Alternatives are `PacketTxFragMore`, `PacketTxFragLast`,
+`PacketXorAck`, `PacketHealHalfXor`, `PacketHealWant`, `PacketHealHave`,
+`PacketTyping`, `PacketTypingActive`, `PacketPresence`, and
+`PacketPresenceActive`. JSON `"type"` strings are the `v1-packet-*`
+discriminators. `J⁻¹` refuses extra members, missing members, and an unknown
+`"type"`. `packed(PacketPlain)` that exceeds 484 is `BodyTooLarge`. Heal
+`hi` of all-`0xff` bytes is +∞.
+
 ## Ticket and Notice
 
 **Ticket** is the QR capability: a 32-byte secret, the inviter’s persistent
@@ -122,8 +133,8 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 
 ## Later slices
 
-- Seal and open 512-byte `PacketPlain` bodies on the sending chain (`mk` /
-  `eph_mk`, pad 484, skip-ahead).
+- Seal and open 512-byte mapper bodies on the sending chain (`mk` /
+  `eph_mk`, skip-ahead).
 - Reassemble `ingest_list` / `ingest_packet` into `DurableBody` merge.
 - Heal half-xor / want / have.
 - Live path (ephemeral first, persistent after 3 ticked seconds).
