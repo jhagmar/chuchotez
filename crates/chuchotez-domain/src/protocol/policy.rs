@@ -1,7 +1,7 @@
 //! Layout version is the module (`v1`, later `v2`). Crypto policy is selected
 //! when constructing that module’s engine.
 
-/// Crypto policy the engine honors for Intake KEM.
+/// Crypto policy the identity honors for KEM and signatures.
 ///
 /// Every v1 engine accepts every variant. Tag Expand is HMAC-SHA-256 for all
 /// three. Intake KEM follows this value.

@@ -1,6 +1,6 @@
 [package]
 name = "chuchotez"
-description = "WASM-first communications backend: Invite, Billboard, Mailbox, Wire"
+description = "WASM-first communications backend"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

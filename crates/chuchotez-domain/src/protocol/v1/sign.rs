@@ -15,6 +15,24 @@ pub const MLDSA65_SIGN_PK_LEN: usize = 1952;
 /// Hybrid verification-key length (Ed25519 then ML-DSA-65).
 pub const HYBRID_SIGN_PK_LEN: usize = CLASSIC_SIGN_PK_LEN + MLDSA65_SIGN_PK_LEN;
 
+/// Classic Ed25519 signing-key length.
+pub const CLASSIC_SIGN_SK_LEN: usize = 32;
+
+/// ML-DSA-65 signing-key length.
+pub const MLDSA65_SIGN_SK_LEN: usize = 4032;
+
+/// Hybrid signing-key length.
+pub const HYBRID_SIGN_SK_LEN: usize = CLASSIC_SIGN_SK_LEN + MLDSA65_SIGN_SK_LEN;
+
+/// Classic Ed25519 signature length.
+pub const CLASSIC_SIGN_SIG_LEN: usize = 64;
+
+/// ML-DSA-65 signature length.
+pub const MLDSA65_SIGN_SIG_LEN: usize = 3309;
+
+/// Hybrid signature length.
+pub const HYBRID_SIGN_SIG_LEN: usize = CLASSIC_SIGN_SIG_LEN + MLDSA65_SIGN_SIG_LEN;
+
 /// [`SIGN_SEED_LEN`] bytes as an array.
 pub type SignSeedBytes = [u8; SIGN_SEED_LEN];
 
@@ -25,6 +43,26 @@ pub const fn sign_pk_len(policy: Policy) -> usize {
         Policy::Classic => CLASSIC_SIGN_PK_LEN,
         Policy::PostQuantum => MLDSA65_SIGN_PK_LEN,
         Policy::Hybrid => HYBRID_SIGN_PK_LEN,
+    }
+}
+
+/// Signing-key length for `policy`.
+#[must_use]
+pub const fn sign_sk_len(policy: Policy) -> usize {
+    match policy {
+        Policy::Classic => CLASSIC_SIGN_SK_LEN,
+        Policy::PostQuantum => MLDSA65_SIGN_SK_LEN,
+        Policy::Hybrid => HYBRID_SIGN_SK_LEN,
+    }
+}
+
+/// Signature length for `policy`.
+#[must_use]
+pub const fn sign_sig_len(policy: Policy) -> usize {
+    match policy {
+        Policy::Classic => CLASSIC_SIGN_SIG_LEN,
+        Policy::PostQuantum => MLDSA65_SIGN_SIG_LEN,
+        Policy::Hybrid => HYBRID_SIGN_SIG_LEN,
     }
 }
 
@@ -71,14 +109,14 @@ impl core::fmt::Debug for SignSeed {
     }
 }
 
-/// Public and secret signing bytes for an [`super::Identity`].
+/// A `sign` key pair.
 #[derive(Clone)]
-pub struct IdentitySignKeypair {
+pub struct SigningKeyPair {
     public: Vec<u8>,
     secret: Vec<u8>,
 }
 
-impl IdentitySignKeypair {
+impl SigningKeyPair {
     /// Wrap public and secret key bytes from a Sign adapter.
     #[must_use]
     pub fn from_parts(public: Vec<u8>, secret: Vec<u8>) -> Self {
@@ -98,17 +136,17 @@ impl IdentitySignKeypair {
     }
 }
 
-impl PartialEq for IdentitySignKeypair {
+impl PartialEq for SigningKeyPair {
     fn eq(&self, other: &Self) -> bool {
         self.public == other.public && self.secret == other.secret
     }
 }
 
-impl Eq for IdentitySignKeypair {}
+impl Eq for SigningKeyPair {}
 
-impl core::fmt::Debug for IdentitySignKeypair {
+impl core::fmt::Debug for SigningKeyPair {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("IdentitySignKeypair(..)")
+        f.write_str("SigningKeyPair(..)")
     }
 }
 
@@ -119,6 +157,8 @@ pub enum SignError {
     UnsupportedPolicy(Policy),
     /// The primitive rejected the seed or failed to expand a keypair.
     KeyGen,
+    /// Sign or verify failed.
+    Sign,
 }
 
 impl core::fmt::Display for SignError {
@@ -128,22 +168,42 @@ impl core::fmt::Display for SignError {
                 write!(f, "unsupported sign policy {policy:?}")
             }
             Self::KeyGen => f.write_str("sign key generation failed"),
+            Self::Sign => f.write_str("sign failed"),
         }
     }
 }
 
 impl std::error::Error for SignError {}
 
-/// Generate an [`IdentitySignKeypair`] for a [`Policy`]. Adapters supply the primitive.
+/// Generate, sign, and verify for a [`Policy`]. Adapters supply the primitive.
 pub trait Sign {
     /// Expand a signing keypair for `policy` from `seed`.
-    fn generate(&self, policy: Policy, seed: &SignSeed) -> Result<IdentitySignKeypair, SignError>;
+    fn generate(&self, policy: Policy, seed: &SignSeed) -> Result<SigningKeyPair, SignError>;
+
+    /// Sign `message` with `sk`. Classic ignores `seed`; PostQuantum and Hybrid consume it.
+    fn sign(
+        &self,
+        policy: Policy,
+        sk: &[u8],
+        message: &[u8],
+        seed: &Random32,
+    ) -> Result<Vec<u8>, SignError>;
+
+    /// Accept when `sig` matches `pk` and `message`.
+    fn verify(
+        &self,
+        policy: Policy,
+        pk: &[u8],
+        message: &[u8],
+        sig: &[u8],
+    ) -> Result<(), SignError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        IdentitySignKeypair, SIGN_SEED_LEN, SignError, SignSeed, SignSeedBytes, sign_pk_len,
+        SIGN_SEED_LEN, SignError, SignSeed, SignSeedBytes, SigningKeyPair, sign_pk_len,
+        sign_sig_len, sign_sk_len,
     };
     use crate::protocol::{Policy, RANDOM32_LEN, Random32};
 
@@ -165,16 +225,23 @@ mod tests {
         assert_eq!(sign_pk_len(Policy::Classic), 32);
         assert_eq!(sign_pk_len(Policy::PostQuantum), 1952);
         assert_eq!(sign_pk_len(Policy::Hybrid), 1984);
-        let keys = IdentitySignKeypair::from_parts(vec![1, 2], vec![3, 4]);
+        assert_eq!(sign_sk_len(Policy::Classic), 32);
+        assert_eq!(sign_sk_len(Policy::PostQuantum), 4032);
+        assert_eq!(sign_sk_len(Policy::Hybrid), 4064);
+        assert_eq!(sign_sig_len(Policy::Classic), 64);
+        assert_eq!(sign_sig_len(Policy::PostQuantum), 3309);
+        assert_eq!(sign_sig_len(Policy::Hybrid), 3373);
+        let keys = SigningKeyPair::from_parts(vec![1, 2], vec![3, 4]);
         assert_eq!(keys.public_bytes(), &[1, 2]);
         assert_eq!(keys.secret_bytes(), &[3, 4]);
-        assert_eq!(format!("{keys:?}"), "IdentitySignKeypair(..)");
+        assert_eq!(format!("{keys:?}"), "SigningKeyPair(..)");
         assert!(!format!("{keys:?}").contains('3'));
         assert_eq!(keys, keys.clone());
         assert_eq!(
             format!("{}", SignError::KeyGen),
             "sign key generation failed"
         );
+        assert_eq!(format!("{}", SignError::Sign), "sign failed");
         assert_eq!(
             format!("{}", SignError::UnsupportedPolicy(Policy::Classic)),
             "unsupported sign policy Classic"

@@ -1,4 +1,4 @@
-//! Shared kind and address grammar for Billboard, Mailbox, and Wire.
+//! Mapper kind, address, DurableChannel, and EphemeralChannel.
 
 use super::unicode::is_combining;
 use super::{ADDRESS_MAX_LEN, KIND_MAX_LEN};
@@ -89,9 +89,136 @@ pub(crate) fn parse_address(value: &str) -> Result<String, AddressError> {
     Ok(value.to_owned())
 }
 
+/// Mapper registry key.
+#[derive(Clone, Eq, PartialEq)]
+pub struct Kind(String);
+
+impl Kind {
+    /// Kind string for the host mapper registry.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for Kind {
+    type Error = KindError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Ok(Self(parse_kind(value)?))
+    }
+}
+
+impl core::fmt::Debug for Kind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Kind").field(&self.0).finish()
+    }
+}
+
+/// Mapper coordinate. Unicode Normalization Form C, no NUL, no combining mark.
+#[derive(Clone, Eq, PartialEq)]
+pub struct Address(String);
+
+impl Address {
+    /// Address bytes as UTF-8.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for Address {
+    type Error = AddressError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Ok(Self(parse_address(value)?))
+    }
+}
+
+impl core::fmt::Debug for Address {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Address(..)")
+    }
+}
+
+/// A mapper destination that stores posted packets for `list`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DurableChannel {
+    kind: Kind,
+    address: Address,
+}
+
+impl DurableChannel {
+    /// Bind a validated kind to a validated address.
+    #[must_use]
+    pub const fn new(kind: Kind, address: Address) -> Self {
+        Self { kind, address }
+    }
+
+    /// Mapper registry key.
+    #[must_use]
+    pub const fn kind(&self) -> &Kind {
+        &self.kind
+    }
+
+    /// Mapper coordinate.
+    #[must_use]
+    pub const fn address(&self) -> &Address {
+        &self.address
+    }
+}
+
+impl core::fmt::Debug for DurableChannel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DurableChannel")
+            .field("kind", &self.kind)
+            .field("address", &self.address)
+            .finish()
+    }
+}
+
+/// A mapper destination that delivers live packets on `listen`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct EphemeralChannel {
+    kind: Kind,
+    address: Address,
+}
+
+impl EphemeralChannel {
+    /// Bind a validated kind to a validated address.
+    #[must_use]
+    pub const fn new(kind: Kind, address: Address) -> Self {
+        Self { kind, address }
+    }
+
+    /// Mapper registry key.
+    #[must_use]
+    pub const fn kind(&self) -> &Kind {
+        &self.kind
+    }
+
+    /// Mapper coordinate.
+    #[must_use]
+    pub const fn address(&self) -> &Address {
+        &self.address
+    }
+}
+
+impl core::fmt::Debug for EphemeralChannel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EphemeralChannel")
+            .field("kind", &self.kind)
+            .field("address", &self.address)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AddressError, KindError, parse_address, parse_kind};
+    use super::{
+        Address, AddressError, DurableChannel, EphemeralChannel, Kind, KindError, parse_address,
+        parse_kind,
+    };
     use crate::protocol::v1::{ADDRESS_MAX_LEN, KIND_MAX_LEN};
 
     #[test]
@@ -117,6 +244,10 @@ mod tests {
             "kind must match [a-z][a-z0-9-]*"
         );
         let _ = &KindError::Empty as &dyn std::error::Error;
+        let kind = Kind::try_from("nostr").expect("k");
+        assert_eq!(kind.as_str(), "nostr");
+        assert_eq!(format!("{kind:?}"), "Kind(\"nostr\")");
+        assert_eq!(kind, kind.clone());
     }
 
     #[test]
@@ -155,5 +286,20 @@ mod tests {
         );
         let _ = &AddressError::Empty as &dyn std::error::Error;
         assert_ne!(AddressError::InvalidUtf8, AddressError::Nul);
+        let addr = Address::try_from("wss://relay.example").expect("a");
+        assert_eq!(addr.as_str(), "wss://relay.example");
+        assert_eq!(format!("{addr:?}"), "Address(..)");
+        let d = DurableChannel::new(Kind::try_from("nostr").expect("k"), addr.clone());
+        assert_eq!(d.kind().as_str(), "nostr");
+        assert_eq!(d.address().as_str(), "wss://relay.example");
+        assert_eq!(d, d.clone());
+        assert!(format!("{d:?}").contains("DurableChannel"));
+        let e = EphemeralChannel::new(
+            Kind::try_from("webrtc").expect("k"),
+            Address::try_from("stun:stun.example").expect("a"),
+        );
+        assert_eq!(e.kind().as_str(), "webrtc");
+        assert_eq!(e, e.clone());
+        assert!(format!("{e:?}").contains("EphemeralChannel"));
     }
 }

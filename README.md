@@ -5,7 +5,8 @@ depends on this crate, keeps a `v1::Engine` and `v1::EngineState`, and supplies
 cryptographic randomness and a DEK. The library compiles for
 `wasm32-unknown-unknown` with the Rust standard library.
 
-The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
+The complete guide is [docs/book.md](docs/book.md). The protocol is
+[docs/protocol.md](docs/protocol.md). API reference is rustdoc.
 
 [![CI](https://github.com/jhagmar/chuchotez/actions/workflows/ci.yml/badge.svg)](https://github.com/jhagmar/chuchotez/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jhagmar/chuchotez/actions/workflows/codeql.yml/badge.svg)](https://github.com/jhagmar/chuchotez/actions/workflows/codeql.yml)
@@ -21,11 +22,11 @@ The complete guide is [docs/book.md](docs/book.md). API reference is rustdoc.
 chuchotez = { git = "https://github.com/jhagmar/chuchotez" }
 ```
 
-Construct a `v1::Engine` with `v1::std_engine(Policy)`. Pass `&dyn Rng`
-whenever the protocol needs entropy. The crate doctest is the sketch:
-originate methods return the drawn id; write `PersistOk`, then
-`get_conversation` and match the conversation ADT. Fill `Random32` from a
-CSPRNG in a real host.
+Construct a `v1::Engine` with `v1::std_engine(defaults)`. Pass `&dyn Rng`
+whenever the protocol needs entropy. The crate doctest is the sketch: wrap a
+DEK, `tick`, then `create_user` / `create_identity` / `create_invite`.
+Originate methods return the drawn id. Fill `Random32` from a CSPRNG in a real
+host.
 
 ## Workspace
 

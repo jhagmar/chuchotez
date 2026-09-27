@@ -1,65 +1,91 @@
-//! Intake generator over `libcrux-kem`.
+//! KEM generator and wrap over `libcrux-kem`.
 
 use chuchotez_domain::Policy;
-use chuchotez_domain::v1::{IntakeKeypair, Kem, KemError, KemSeed};
-use libcrux_kem::{Algorithm, key_gen_derand};
+use chuchotez_domain::v1::{Kem, KemError, KemSeed, KeyPair};
+use libcrux_kem::{Algorithm, Ct, PrivateKey, PublicKey, key_gen_derand};
 
-/// libcrux Intake KEM: X25519, ML-KEM-768, and X-Wing.
+/// libcrux KEM: X25519, ML-KEM-768, and X-Wing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LibcruxKem;
 
-/// X25519 and X-Wing `key_gen_derand` seed length.
 const SEED_32: usize = 32;
 
-fn pair_from_seed(alg: Algorithm, seed: &[u8]) -> Result<IntakeKeypair, KemError> {
-    let (sk, pk) = key_gen_derand(alg, seed).map_err(|_| KemError::KeyGen)?;
-    Ok(IntakeKeypair::from_parts(pk.encode(), sk.encode()))
+fn alg(policy: Policy) -> Algorithm {
+    match policy {
+        Policy::Classic => Algorithm::X25519,
+        Policy::PostQuantum => Algorithm::MlKem768,
+        Policy::Hybrid => Algorithm::XWingKemDraft06,
+    }
+}
+
+fn wrap_seed(policy: Policy, seed: &KemSeed) -> &[u8] {
+    let bytes = seed.as_bytes();
+    match policy {
+        Policy::Classic => &bytes[..SEED_32],
+        Policy::PostQuantum => &bytes[..SEED_32],
+        Policy::Hybrid => bytes.as_slice(),
+    }
 }
 
 impl Kem for LibcruxKem {
-    fn generate(&self, policy: Policy, seed: &KemSeed) -> Result<IntakeKeypair, KemError> {
+    fn generate(&self, policy: Policy, seed: &KemSeed) -> Result<KeyPair, KemError> {
         let bytes = seed.as_bytes();
-        match policy {
-            Policy::Classic => pair_from_seed(Algorithm::X25519, &bytes[..SEED_32]),
-            Policy::PostQuantum => pair_from_seed(Algorithm::MlKem768, bytes),
-            Policy::Hybrid => pair_from_seed(Algorithm::XWingKemDraft06, &bytes[..SEED_32]),
-        }
+        let slice = match policy {
+            Policy::Classic | Policy::Hybrid => &bytes[..SEED_32],
+            Policy::PostQuantum => bytes.as_slice(),
+        };
+        let (sk, pk) = key_gen_derand(alg(policy), slice).map_err(|_| KemError::KeyGen)?;
+        Ok(KeyPair::from_parts(pk.encode(), sk.encode()))
+    }
+
+    fn wrap(
+        &self,
+        policy: Policy,
+        pk: &[u8],
+        seed: &KemSeed,
+    ) -> Result<(Vec<u8>, Vec<u8>), KemError> {
+        let public = PublicKey::decode(alg(policy), pk).map_err(|_| KemError::Wrap)?;
+        let (ss, ct) = public
+            .encapsulate_derand(wrap_seed(policy, seed))
+            .map_err(|_| KemError::Wrap)?;
+        Ok((ss.encode(), ct.encode()))
+    }
+
+    fn unwrap(&self, policy: Policy, sk: &[u8], kem_ct: &[u8]) -> Result<Vec<u8>, KemError> {
+        let secret = PrivateKey::decode(alg(policy), sk).map_err(|_| KemError::Wrap)?;
+        let ct = Ct::decode(alg(policy), kem_ct).map_err(|_| KemError::Wrap)?;
+        Ok(ct
+            .decapsulate(&secret)
+            .map_err(|_| KemError::Wrap)?
+            .encode())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LibcruxKem, pair_from_seed};
+    use super::LibcruxKem;
     use chuchotez_domain::Policy;
-    use chuchotez_domain::v1::{KEM_SEED_LEN, Kem, KemError, KemSeed};
-    use libcrux_kem::Algorithm;
+    use chuchotez_domain::v1::{KEM_SEED_LEN, Kem, KemSeed, kem_ct_len, kem_pk_len};
 
     #[test]
-    fn generates_every_policy() {
+    fn wrap_roundtrip_every_policy() {
         let port = LibcruxKem;
         let seed = KemSeed::from_bytes([3; KEM_SEED_LEN]);
-        let classic = port.generate(Policy::Classic, &seed).expect("classic");
-        assert_eq!(classic.public_bytes().len(), 32);
-        assert_eq!(classic.secret_bytes().len(), 32);
-        let pq = port.generate(Policy::PostQuantum, &seed).expect("pq");
-        assert_eq!(pq.public_bytes().len(), 1184);
-        assert_eq!(pq.secret_bytes().len(), 2400);
-        let hybrid = port.generate(Policy::Hybrid, &seed).expect("hybrid");
-        assert_eq!(hybrid.public_bytes().len(), 1216);
-        assert_eq!(hybrid.secret_bytes().len(), 32);
+        let wrap_seed = KemSeed::from_bytes([9; KEM_SEED_LEN]);
+        for policy in [Policy::Classic, Policy::PostQuantum, Policy::Hybrid] {
+            let keys = port.generate(policy, &seed).expect("gen");
+            assert_eq!(keys.public_bytes().len(), kem_pk_len(policy));
+            let (ss, ct) = port
+                .wrap(policy, keys.public_bytes(), &wrap_seed)
+                .expect("wrap");
+            assert_eq!(ct.len(), kem_ct_len(policy));
+            let opened = port
+                .unwrap(policy, keys.secret_bytes(), &ct)
+                .expect("unwrap");
+            assert_eq!(opened, ss);
+        }
         assert_eq!(port, LibcruxKem);
         assert_eq!(format!("{port:?}"), "LibcruxKem");
-        assert_eq!(
-            pair_from_seed(Algorithm::X25519, &[]).unwrap_err(),
-            KemError::KeyGen
-        );
-        assert_eq!(
-            pair_from_seed(Algorithm::MlKem768, &[0; 8]).unwrap_err(),
-            KemError::KeyGen
-        );
-        assert_eq!(
-            pair_from_seed(Algorithm::XWingKemDraft06, &[]).unwrap_err(),
-            KemError::KeyGen
-        );
+        assert!(port.wrap(Policy::Classic, &[], &seed).is_err());
     }
 }

@@ -1,21 +1,20 @@
-//! Shared v1 test doubles. Not compiled into the library.
+//! Shared v1 test doubles.
 
 use super::{
-    Aead, AeadError, AeadKey, AeadNonce, Base64Url, Base64UrlError, Billboard, BillboardAddress,
-    BillboardKind, CanonicalJson, CanonicalJsonError, Compress, CompressError, Engine, HmacSha256,
-    HmacSha256Key, HmacSha256Mac, IdentitySignKeypair, IntakeKeypair, Json, Kem, KemError, KemSeed,
-    Mailbox, MailboxAddress, MailboxKind, Policy, SECRET_LEN, Sign, SignError, SignSeed, Suite,
-    Ticket, Wire, WireAddress, WireKind, sign_pk_len,
+    Address, Aead, AeadError, AeadKey, AeadNonce, Argon2Error, Argon2id, Base64Url, Base64UrlError,
+    CanonicalJson, CanonicalJsonError, Compress, CompressError, Defaults, DurableChannel, Engine,
+    HmacSha256, HmacSha256Key, HmacSha256Mac, Json, Kem, KemError, KemSeed, KeyPair, Kind,
+    NotificationPrivacy, Policy, SECRET_LEN, Sha256, Sign, SignError, SignSeed, SigningKeyPair,
+    Suite, kem_ct_len, kem_pk_len, sign_pk_len, sign_sig_len,
 };
 use crate::protocol::{Random32, Rng};
 use std::cell::Cell;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub(crate) fn fill(byte: u8) -> [u8; SECRET_LEN] {
     [byte; SECRET_LEN]
 }
 
-/// Repeats `bytes` on every [`Rng::random32`] call.
 pub(crate) struct SeedRng(pub [u8; SECRET_LEN]);
 
 impl Rng for SeedRng {
@@ -24,7 +23,6 @@ impl Rng for SeedRng {
     }
 }
 
-/// Distinct [`Random32`] draws: big-endian counter in the last eight bytes.
 pub(crate) struct CounterRng {
     n: Cell<u64>,
 }
@@ -45,32 +43,27 @@ impl Rng for CounterRng {
     }
 }
 
-pub(crate) fn sample_ticket(byte: u8) -> Ticket {
-    Ticket::from_parts(fill(byte), vec![sample_billboard()]).expect("ticket")
-}
-
-pub(crate) fn sample_billboard() -> Billboard {
-    Billboard::new(
-        BillboardKind::try_from("nostr").expect("kind"),
-        BillboardAddress::try_from("wss://relay.example").expect("addr"),
+pub(crate) fn sample_durable() -> DurableChannel {
+    DurableChannel::new(
+        Kind::try_from("nostr").expect("kind"),
+        Address::try_from("wss://relay.example").expect("addr"),
     )
 }
 
-pub(crate) fn sample_mailbox() -> Mailbox {
-    Mailbox::new(
-        MailboxKind::try_from("nostr").expect("kind"),
-        MailboxAddress::try_from("wss://mailbox.example").expect("addr"),
+pub(crate) fn sample_defaults() -> Defaults {
+    Defaults::try_new(
+        vec![sample_durable()],
+        Vec::new(),
+        true,
+        true,
+        true,
+        None,
+        false,
+        NotificationPrivacy::Name,
     )
+    .expect("defaults")
 }
 
-pub(crate) fn sample_wire() -> Wire {
-    Wire::new(
-        WireKind::try_from("webrtc").expect("kind"),
-        WireAddress::try_from("stun:stun.example").expect("addr"),
-    )
-}
-
-/// Mixes `key` and `data` so distinct infos yield distinct outputs.
 pub(crate) struct XorHmac;
 
 impl HmacSha256 for XorHmac {
@@ -99,84 +92,6 @@ impl Compress for IdentityCompress {
     }
 }
 
-pub(crate) struct ExplodingCompress;
-
-impl Compress for ExplodingCompress {
-    fn compress(&self, src: &[u8]) -> Vec<u8> {
-        let mut out = src.to_vec();
-        out.resize(crate::protocol::v1::COMMAND_MAX_COMPRESSED + 1, 0);
-        out
-    }
-
-    fn decompress(&self, src: &[u8], max_uncompressed: usize) -> Result<Vec<u8>, CompressError> {
-        IdentityCompress.decompress(src, max_uncompressed)
-    }
-}
-
-pub(crate) struct MaxPadCompress;
-
-impl Compress for MaxPadCompress {
-    fn compress(&self, src: &[u8]) -> Vec<u8> {
-        let mut out = src.to_vec();
-        out.resize(crate::protocol::v1::COMMAND_MAX_COMPRESSED, 0);
-        out
-    }
-
-    fn decompress(&self, src: &[u8], max_uncompressed: usize) -> Result<Vec<u8>, CompressError> {
-        IdentityCompress.decompress(src, max_uncompressed)
-    }
-}
-
-pub(crate) struct CodecCompress;
-
-impl Compress for CodecCompress {
-    fn compress(&self, src: &[u8]) -> Vec<u8> {
-        src.to_vec()
-    }
-
-    fn decompress(&self, _src: &[u8], _max_uncompressed: usize) -> Result<Vec<u8>, CompressError> {
-        Err(CompressError::Codec)
-    }
-}
-
-pub(crate) struct FatAead;
-
-impl Aead for FatAead {
-    fn seal(&self, key: &AeadKey, nonce: &AeadNonce, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let mut out = XorAead.seal(key, nonce, aad, plaintext);
-        out.extend_from_slice(&[0u8; 300]);
-        out
-    }
-
-    fn open(
-        &self,
-        key: &AeadKey,
-        nonce: &AeadNonce,
-        aad: &[u8],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, AeadError> {
-        if ciphertext.len() < 300 {
-            return Err(AeadError::Open);
-        }
-        XorAead.open(key, nonce, aad, &ciphertext[..ciphertext.len() - 300])
-    }
-}
-
-pub(crate) struct PadJson;
-
-impl CanonicalJson for PadJson {
-    fn encode(&self, value: &Json) -> Vec<u8> {
-        let mut out = DetJson.encode(value);
-        out.resize(crate::protocol::v1::COMMAND_MAX_UNCOMPRESSED + 1, b'x');
-        out
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<Json, CanonicalJsonError> {
-        DetJson.decode(bytes)
-    }
-}
-
-/// Hex stand-in so domain tests cover envelope composition without a b64u crate.
 pub(crate) struct HexB64;
 
 impl Base64Url for HexB64 {
@@ -209,15 +124,11 @@ fn hex_nibble(b: u8) -> Result<u8, Base64UrlError> {
     }
 }
 
-/// Mixes key, nonce, and AAD into the ciphertext so a different Ticket fails open.
 pub(crate) struct XorAead;
 
 impl Aead for XorAead {
-    fn seal(&self, key: &AeadKey, nonce: &AeadNonce, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        let aad_len = u16::try_from(aad.len()).expect("aad fits u16");
-        let mut out = Vec::with_capacity(2 + aad.len() + plaintext.len());
-        out.extend_from_slice(&aad_len.to_be_bytes());
-        out.extend_from_slice(aad);
+    fn seal(&self, key: &AeadKey, nonce: &AeadNonce, _aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(plaintext.len() + 32);
         for (i, byte) in plaintext.iter().enumerate() {
             out.push(
                 byte ^ key.as_bytes()[i % key.as_bytes().len()]
@@ -225,7 +136,6 @@ impl Aead for XorAead {
             );
         }
         out.extend_from_slice(key.as_bytes());
-        out.extend_from_slice(nonce.as_bytes());
         out
     }
 
@@ -233,27 +143,16 @@ impl Aead for XorAead {
         &self,
         key: &AeadKey,
         nonce: &AeadNonce,
-        aad: &[u8],
+        _aad: &[u8],
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, AeadError> {
-        let tag = key.as_bytes().len() + nonce.as_bytes().len();
-        if ciphertext.len() < 2 + tag {
+        if ciphertext.len() < 32 {
             return Err(AeadError::Open);
         }
-        let aad_len = usize::from(u16::from_be_bytes([ciphertext[0], ciphertext[1]]));
-        if ciphertext.len() < 2 + aad_len + tag {
+        let (body, tag) = ciphertext.split_at(ciphertext.len() - 32);
+        if tag != key.as_bytes() {
             return Err(AeadError::Open);
         }
-        let (head, tail) = ciphertext.split_at(ciphertext.len() - tag);
-        if &tail[..key.as_bytes().len()] != key.as_bytes()
-            || &tail[key.as_bytes().len()..] != nonce.as_bytes()
-        {
-            return Err(AeadError::Open);
-        }
-        if &head[2..2 + aad_len] != aad {
-            return Err(AeadError::Open);
-        }
-        let body = &head[2 + aad_len..];
         Ok(body
             .iter()
             .enumerate()
@@ -265,7 +164,6 @@ impl Aead for XorAead {
     }
 }
 
-/// Deterministic JSON for domain tests (sorted object names, no whitespace).
 pub(crate) struct DetJson;
 
 impl CanonicalJson for DetJson {
@@ -276,66 +174,19 @@ impl CanonicalJson for DetJson {
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<Json, CanonicalJsonError> {
-        let text = core::str::from_utf8(bytes).map_err(|_| CanonicalJsonError::Invalid)?;
-        let mut p = Parser { rest: text };
-        let value = p.value()?;
-        p.skip_ws();
-        if !p.rest.is_empty() {
-            return Err(CanonicalJsonError::Invalid);
-        }
-        Ok(value)
+        decode_json(bytes)
     }
 }
 
-fn write_json(value: &Json, out: &mut String) {
-    match value {
-        Json::Null => out.push_str("null"),
-        Json::Bool(true) => out.push_str("true"),
-        Json::Bool(false) => out.push_str("false"),
-        Json::String(s) => write_string(s, out),
-        Json::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json(item, out);
-            }
-            out.push(']');
-        }
-        Json::Object(members) => {
-            let mut sorted = members.clone();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            out.push('{');
-            for (i, (k, v)) in sorted.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_string(k, out);
-                out.push(':');
-                write_json(v, out);
-            }
-            out.push('}');
-        }
+fn decode_json(bytes: &[u8]) -> Result<Json, CanonicalJsonError> {
+    let text = core::str::from_utf8(bytes).map_err(|_| CanonicalJsonError::Invalid)?;
+    let mut p = Parser { rest: text };
+    let value = p.value()?;
+    p.skip_ws();
+    if !p.rest.is_empty() {
+        return Err(CanonicalJsonError::Invalid);
     }
-}
-
-fn write_string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if u32::from(c) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", u32::from(c)));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    Ok(value)
 }
 
 struct Parser<'a> {
@@ -370,6 +221,23 @@ impl<'a> Parser<'a> {
         if self.rest.starts_with('{') {
             return self.object();
         }
+        if self
+            .rest
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit())
+        {
+            let bytes = self.rest.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let n = self.rest[..i]
+                .parse::<u64>()
+                .map_err(|_| CanonicalJsonError::Invalid)?;
+            self.rest = &self.rest[i..];
+            return Ok(Json::Number(n));
+        }
         Err(CanonicalJsonError::Invalid)
     }
 
@@ -388,18 +256,6 @@ impl<'a> Parser<'a> {
                 Some('\\') => match chars.next() {
                     Some('"') => out.push('"'),
                     Some('\\') => out.push('\\'),
-                    Some('n') => out.push('\n'),
-                    Some('r') => out.push('\r'),
-                    Some('t') => out.push('\t'),
-                    Some('u') => {
-                        let mut hex = String::new();
-                        for _ in 0..4 {
-                            hex.push(chars.next().ok_or(CanonicalJsonError::Invalid)?);
-                        }
-                        let code = u32::from_str_radix(&hex, 16)
-                            .map_err(|_| CanonicalJsonError::Invalid)?;
-                        out.push(char::from_u32(code).ok_or(CanonicalJsonError::Invalid)?);
-                    }
                     _ => return Err(CanonicalJsonError::Invalid),
                 },
                 Some(c) => out.push(c),
@@ -440,7 +296,6 @@ impl<'a> Parser<'a> {
             return Ok(Json::Object(members));
         }
         loop {
-            self.skip_ws();
             let key = self.string()?;
             self.skip_ws();
             if !self.rest.starts_with(':') {
@@ -463,100 +318,166 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Echoes seed bytes as a policy-sized keypair.
+fn write_json(value: &Json, out: &mut String) {
+    match value {
+        Json::Null => out.push_str("null"),
+        Json::Bool(true) => out.push_str("true"),
+        Json::Bool(false) => out.push_str("false"),
+        Json::Number(n) => out.push_str(&n.to_string()),
+        Json::String(s) => {
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json(item, out);
+            }
+            out.push(']');
+        }
+        Json::Object(members) => {
+            let mut sorted = members.clone();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push('{');
+            for (i, (k, v)) in sorted.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                out.push_str(k);
+                out.push_str("\":");
+                write_json(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 pub(crate) struct EchoKem;
 
 impl Kem for EchoKem {
-    fn generate(&self, policy: Policy, seed: &KemSeed) -> Result<IntakeKeypair, KemError> {
-        let seed32 = &seed.as_bytes()[..SECRET_LEN];
-        let n = super::intake_pk_len(policy);
+    fn generate(&self, policy: Policy, seed: &KemSeed) -> Result<KeyPair, KemError> {
+        let n = kem_pk_len(policy);
         let mut public = vec![0u8; n];
+        let seed32 = &seed.as_bytes()[..SECRET_LEN];
         for (i, byte) in public.iter_mut().enumerate() {
             *byte = seed32[i % SECRET_LEN];
         }
-        Ok(IntakeKeypair::from_parts(public, seed32.to_vec()))
+        Ok(KeyPair::from_parts(public, seed32.to_vec()))
+    }
+
+    fn wrap(
+        &self,
+        policy: Policy,
+        pk: &[u8],
+        seed: &KemSeed,
+    ) -> Result<(Vec<u8>, Vec<u8>), KemError> {
+        let mut shared = [0u8; 32];
+        shared.copy_from_slice(&seed.as_bytes()[..32]);
+        if let Some(p) = pk.first() {
+            shared[0] ^= p;
+        }
+        let mut ct = vec![0u8; kem_ct_len(policy)];
+        let n = 32.min(ct.len());
+        ct[..n].copy_from_slice(&shared[..n]);
+        Ok((shared.to_vec(), ct))
+    }
+
+    fn unwrap(&self, _policy: Policy, _sk: &[u8], kem_ct: &[u8]) -> Result<Vec<u8>, KemError> {
+        let mut shared = vec![0u8; 32];
+        let n = 32.min(kem_ct.len());
+        shared[..n].copy_from_slice(&kem_ct[..n]);
+        Ok(shared)
     }
 }
 
-/// Echoes seed bytes as a policy-sized signing keypair.
 pub(crate) struct EchoSign;
 
 impl Sign for EchoSign {
-    fn generate(&self, policy: Policy, seed: &SignSeed) -> Result<IdentitySignKeypair, SignError> {
-        let seed32 = &seed.as_bytes()[..SECRET_LEN];
+    fn generate(&self, policy: Policy, seed: &SignSeed) -> Result<SigningKeyPair, SignError> {
         let n = sign_pk_len(policy);
         let mut public = vec![0u8; n];
+        let seed32 = &seed.as_bytes()[..SECRET_LEN];
         for (i, byte) in public.iter_mut().enumerate() {
             *byte = seed32[i % SECRET_LEN];
         }
-        Ok(IdentitySignKeypair::from_parts(public, seed32.to_vec()))
+        Ok(SigningKeyPair::from_parts(public, seed32.to_vec()))
     }
-}
 
-/// Always fails [`Kem::generate`].
-pub(crate) struct FailingKem;
-
-impl Kem for FailingKem {
-    fn generate(&self, policy: Policy, _seed: &KemSeed) -> Result<IntakeKeypair, KemError> {
-        Err(KemError::UnsupportedPolicy(policy))
-    }
-}
-
-/// Always fails [`Sign::generate`].
-pub(crate) struct FailingSign;
-
-impl Sign for FailingSign {
-    fn generate(
+    fn sign(
         &self,
-        _policy: Policy,
-        _seed: &SignSeed,
-    ) -> Result<IdentitySignKeypair, SignError> {
-        Err(SignError::KeyGen)
+        policy: Policy,
+        sk: &[u8],
+        message: &[u8],
+        _seed: &Random32,
+    ) -> Result<Vec<u8>, SignError> {
+        let n = sign_sig_len(policy);
+        let mut sig = vec![0u8; n];
+        for (i, byte) in sig.iter_mut().enumerate() {
+            *byte = sk.get(i % sk.len()).copied().unwrap_or(0)
+                ^ message.get(i % message.len().max(1)).copied().unwrap_or(0);
+        }
+        Ok(sig)
+    }
+
+    fn verify(
+        &self,
+        policy: Policy,
+        pk: &[u8],
+        message: &[u8],
+        sig: &[u8],
+    ) -> Result<(), SignError> {
+        let expect = self.sign(policy, pk, message, &Random32::from_bytes([0; 32]))?;
+        if expect == sig {
+            Ok(())
+        } else {
+            Err(SignError::Sign)
+        }
     }
 }
 
-pub(crate) fn engine_with(
-    compress: Arc<dyn Compress + Send + Sync>,
-    b64u: Arc<dyn Base64Url + Send + Sync>,
-) -> Engine {
-    Engine::new(
-        Suite::new(
-            Arc::new(XorHmac),
-            compress,
-            b64u,
-            Arc::new(XorAead),
-            Arc::new(DetJson),
-            Arc::new(EchoKem),
-            Arc::new(EchoSign),
-        ),
-        Policy::Hybrid,
-    )
+pub(crate) struct XorHash;
+
+impl Sha256 for XorHash {
+    fn hash(&self, data: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, b) in data.iter().enumerate() {
+            out[i % 32] ^= b;
+        }
+        out
+    }
 }
 
-pub(crate) fn engine_custom(
-    compress: Arc<dyn Compress + Send + Sync>,
-    aead: Arc<dyn Aead + Send + Sync>,
-    json: Arc<dyn CanonicalJson + Send + Sync>,
-) -> Engine {
-    Engine::new(
-        Suite::new(
-            Arc::new(XorHmac),
-            compress,
-            Arc::new(HexB64),
-            aead,
-            json,
-            Arc::new(EchoKem),
-            Arc::new(EchoSign),
-        ),
-        Policy::Hybrid,
-    )
+pub(crate) struct EchoArgon;
+
+impl Argon2id for EchoArgon {
+    fn hash(
+        &self,
+        passphrase: &[u8],
+        salt: &[u8; 16],
+        _m: u32,
+        _t: u32,
+        _p: u32,
+    ) -> Result<[u8; 32], Argon2Error> {
+        let mut out = [0u8; 32];
+        for (i, b) in passphrase.iter().chain(salt.iter()).enumerate() {
+            out[i % 32] ^= b;
+        }
+        Ok(out)
+    }
 }
 
 pub(crate) fn test_engine() -> Engine {
-    engine_with(Arc::new(IdentityCompress), Arc::new(HexB64))
-}
-
-pub(crate) fn engine_with_policy(policy: Policy) -> Engine {
     Engine::new(
         Suite::new(
             Arc::new(XorHmac),
@@ -566,243 +487,141 @@ pub(crate) fn engine_with_policy(policy: Policy) -> Engine {
             Arc::new(DetJson),
             Arc::new(EchoKem),
             Arc::new(EchoSign),
+            Arc::new(XorHash),
+            Arc::new(EchoArgon),
         ),
-        policy,
-    )
-}
-
-/// Records the last HMAC `data` so Expand info strings can be asserted.
-pub(crate) struct RecordingHmac {
-    pub data: Mutex<Vec<u8>>,
-}
-
-impl RecordingHmac {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            data: Mutex::new(Vec::new()),
-        })
-    }
-}
-
-impl HmacSha256 for RecordingHmac {
-    fn mac(&self, _key: &HmacSha256Key, data: &[u8]) -> HmacSha256Mac {
-        *self.data.lock().expect("record") = data.to_vec();
-        HmacSha256Mac::from_bytes([0; SECRET_LEN])
-    }
-}
-
-pub(crate) fn engine_with_hmac(hmac: Arc<dyn HmacSha256 + Send + Sync>) -> Engine {
-    Engine::new(
-        Suite::new(
-            hmac,
-            Arc::new(IdentityCompress),
-            Arc::new(HexB64),
-            Arc::new(XorAead),
-            Arc::new(DetJson),
-            Arc::new(EchoKem),
-            Arc::new(EchoSign),
-        ),
-        Policy::Hybrid,
-    )
-}
-
-pub(crate) fn engine_with_kem_sign(
-    kem: Arc<dyn Kem + Send + Sync>,
-    sign: Arc<dyn Sign + Send + Sync>,
-) -> Engine {
-    Engine::new(
-        Suite::new(
-            Arc::new(XorHmac),
-            Arc::new(IdentityCompress),
-            Arc::new(HexB64),
-            Arc::new(XorAead),
-            Arc::new(DetJson),
-            kem,
-            sign,
-        ),
-        Policy::Hybrid,
+        sample_defaults(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalJson, CodecCompress, Compress, DetJson, ExplodingCompress, FatAead, Json,
-        MaxPadCompress, PadJson, XorAead,
+        CounterRng, EchoArgon, EchoKem, EchoSign, IdentityCompress, SeedRng, XorAead, XorHash,
+        XorHmac, fill, sample_defaults, test_engine,
     };
+    use crate::protocol::Rng;
     use crate::protocol::v1::{
-        Aead, AeadError, AeadKey, AeadNonce, COMMAND_MAX_COMPRESSED, COMMAND_MAX_UNCOMPRESSED,
-        CanonicalJsonError, CompressError,
+        Aead, Argon2id, Base64Url, CanonicalJson, Compress, HmacSha256, Kem, Policy, Sha256, Sign,
+        UnlockSecret,
     };
 
     #[test]
-    fn xor_aead_rejects_short_and_wrong_key() {
-        let aead = XorAead;
-        let key = AeadKey::from_bytes([1u8; 32]);
-        let nonce = AeadNonce::from_bytes(core::array::from_fn(|i| 2u8.wrapping_add(i as u8)));
-        let ct = aead.seal(&key, &nonce, b"ad", b"pt");
-        assert_eq!(aead.open(&key, &nonce, b"ad", &ct).expect("ok"), b"pt");
-        let other = AeadKey::from_bytes([3u8; 32]);
+    fn doubles() {
+        let rng = CounterRng::new();
+        assert_ne!(
+            rng.random32().as_bytes(),
+            SeedRng(fill(1)).random32().as_bytes()
+        );
+        assert_eq!(XorHash.hash(b"ab")[0], b'a');
+        assert!(
+            EchoArgon
+                .hash(b"passpass", &super::super::argon::fixture_salt(), 8, 1, 1)
+                .is_ok()
+        );
+        let seed = crate::protocol::v1::KemSeed::from_bytes([2; 64]);
+        let keys = EchoKem.generate(Policy::Classic, &seed).expect("k");
+        let (ss, ct) = EchoKem
+            .wrap(Policy::Classic, keys.public_bytes(), &seed)
+            .expect("w");
         assert_eq!(
-            aead.open(&other, &nonce, b"ad", &ct).unwrap_err(),
-            AeadError::Open
+            EchoKem
+                .unwrap(Policy::Classic, keys.secret_bytes(), &ct)
+                .expect("u")
+                .len(),
+            32
+        );
+        let _ = ss;
+        let sseed = crate::protocol::v1::SignSeed::from_bytes([3; 64]);
+        let sk = EchoSign.generate(Policy::Classic, &sseed).expect("s");
+        let sig = EchoSign
+            .sign(Policy::Classic, sk.secret_bytes(), b"m", &rng.random32())
+            .expect("sig");
+        assert!(
+            EchoSign
+                .verify(Policy::Classic, sk.secret_bytes(), b"m", &sig)
+                .is_ok()
+        );
+        assert_eq!(IdentityCompress.compress(b"x"), b"x");
+        assert!(IdentityCompress.decompress(&[0; 8], 4).is_err());
+        assert!(super::HexB64.decode("zz").is_err());
+        assert!(super::HexB64.decode("0g").is_err());
+        assert!(super::HexB64.decode("0").is_err());
+        let key = crate::protocol::v1::AeadKey::from_bytes([1; 32]);
+        let nonce = crate::protocol::v1::AeadNonce::from_bytes([2; 12]);
+        let ct = XorAead.seal(&key, &nonce, b"", b"pt");
+        assert_eq!(XorAead.open(&key, &nonce, b"", &ct).expect("o"), b"pt");
+        assert!(XorAead.open(&key, &nonce, b"", b"x").is_err());
+        assert!(XorAead.open(&key, &nonce, b"", &[0; 40]).is_err());
+        let json = super::DetJson;
+        assert!(json.decode(b"{").is_err());
+        assert_eq!(
+            json.decode(b"null").expect("n"),
+            crate::protocol::v1::Json::Null
         );
         assert_eq!(
-            aead.open(&key, &nonce, b"xx", &ct).unwrap_err(),
-            AeadError::Open
+            json.decode(b"true").expect("t"),
+            crate::protocol::v1::Json::Bool(true)
         );
         assert_eq!(
-            aead.open(&key, &nonce, b"ad", &[]).unwrap_err(),
-            AeadError::Open
+            json.decode(b"false").expect("f"),
+            crate::protocol::v1::Json::Bool(false)
         );
         assert_eq!(
-            aead.open(&key, &nonce, b"ad", &[0, 10]).unwrap_err(),
-            AeadError::Open
-        );
-        let mut short_aad = aead.seal(&key, &nonce, b"ad", b"pt");
-        short_aad[0] = 0xff;
-        short_aad[1] = 0xff;
-        assert_eq!(
-            aead.open(&key, &nonce, b"ad", &short_aad).unwrap_err(),
-            AeadError::Open
-        );
-    }
-
-    #[test]
-    fn persist_test_doubles() {
-        let key = AeadKey::from_bytes([1u8; 32]);
-        let nonce = AeadNonce::from_bytes([2u8; 12]);
-        let fat = FatAead;
-        let ct = fat.seal(&key, &nonce, b"ad", b"pt");
-        assert_eq!(fat.open(&key, &nonce, b"ad", &ct).expect("ok"), b"pt");
-        assert_eq!(
-            fat.open(&key, &nonce, b"ad", &[1, 2]).unwrap_err(),
-            AeadError::Open
+            json.decode(b"[]").expect("a"),
+            crate::protocol::v1::Json::Array(Vec::new())
         );
         assert_eq!(
-            ExplodingCompress.compress(b"x").len(),
-            COMMAND_MAX_COMPRESSED + 1
-        );
-        assert_eq!(ExplodingCompress.decompress(b"xy", 8).expect("id"), b"xy");
-        assert_eq!(MaxPadCompress.compress(b"x").len(), COMMAND_MAX_COMPRESSED);
-        assert_eq!(MaxPadCompress.decompress(b"z", 8).expect("id"), b"z");
-        assert_eq!(CodecCompress.compress(b"a"), b"a");
-        assert_eq!(
-            CodecCompress.decompress(b"a", 8).unwrap_err(),
-            CompressError::Codec
-        );
-        let padded = PadJson.encode(&Json::Null);
-        assert_eq!(padded.len(), COMMAND_MAX_UNCOMPRESSED + 1);
-        assert_eq!(PadJson.decode(b"null").expect("n"), Json::Null);
-    }
-
-    #[test]
-    fn det_json_roundtrip_and_errors() {
-        let port = DetJson;
-        assert_eq!(port.decode(b"null").expect("n"), Json::Null);
-        assert_eq!(port.decode(b" true ").expect("t"), Json::Bool(true));
-        assert_eq!(port.decode(b"false").expect("f"), Json::Bool(false));
-        assert_eq!(
-            port.decode(br#""hi""#).expect("s"),
-            Json::String("hi".into())
+            json.decode(b"{}").expect("o"),
+            crate::protocol::v1::Json::Object(Vec::new())
         );
         assert_eq!(
-            port.decode(br#""a\"b\\c\n\r\t\u0020""#).expect("esc"),
-            Json::String("a\"b\\c\n\r\t ".into())
+            json.decode(br#""hi""#).expect("s"),
+            crate::protocol::v1::Json::String("hi".into())
         );
-        assert_eq!(port.decode(b"[]").expect("a"), Json::Array(Vec::new()));
-        assert_eq!(port.decode(b"{}").expect("o"), Json::Object(Vec::new()));
+        let escaped = json.encode(&crate::protocol::v1::Json::String("a\"b\\c".into()));
         assert_eq!(
-            port.decode(b"[1]").unwrap_err(),
-            CanonicalJsonError::Invalid
+            json.decode(&escaped).expect("esc"),
+            crate::protocol::v1::Json::String("a\"b\\c".into())
         );
+        assert!(json.decode(b"null x").is_err());
+        assert!(json.decode(&[0xff]).is_err());
+        assert!(json.decode(b"nope").is_err());
+        assert!(json.decode(b"\"unterminated").is_err());
+        assert!(json.decode(br#""\q""#).is_err());
+        assert!(json.decode(b"[true x]").is_err());
+        assert!(json.decode(b"{,}").is_err());
+        assert!(json.decode(br#"{"a" true}"#).is_err());
+        assert!(json.decode(b"[true,false").is_err());
+        assert!(json.decode(br#"{"a":true"#).is_err());
         assert_eq!(
-            port.decode(b"{,}").unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(port.decode(b"{").unwrap_err(), CanonicalJsonError::Invalid);
-        assert_eq!(port.decode(b"[").unwrap_err(), CanonicalJsonError::Invalid);
-        assert_eq!(
-            port.decode(b"\"unterminated").unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(&[0xff]).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(b"nullx").unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        let obj = Json::Object(vec![
-            ("b".into(), Json::Bool(false)),
-            ("a".into(), Json::Null),
-        ]);
-        let encoded = port.encode(&obj);
-        assert_eq!(encoded, br#"{"a":null,"b":false}"#);
-        assert_eq!(
-            port.decode(br#"{"k":[]}"#).expect("nested"),
-            Json::Object(vec![("k".into(), Json::Array(Vec::new()))])
-        );
-        assert_eq!(
-            port.decode(b"{\"a\":1}").unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#""\uD800""#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#""\u""#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#""\q""#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#"{"a"}"#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#"[true,]"#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#"{"a":true,}"#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        let _ = port.encode(&Json::String("\u{0001}".into()));
-        let _ = port.encode(&Json::Bool(true));
-        let _ = port.encode(&Json::Bool(false));
-        let _ = port.encode(&Json::Array(vec![Json::Null, Json::Bool(true)]));
-        let _ = port.encode(&Json::String("\"\\\n\r\t".into()));
-        assert_eq!(
-            port.decode(b"[true x]").unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#"{"a":true x}"#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#"{a:true}"#).unwrap_err(),
-            CanonicalJsonError::Invalid
-        );
-        assert_eq!(
-            port.decode(br#"[true,false]"#).expect("two"),
-            Json::Array(vec![Json::Bool(true), Json::Bool(false)])
-        );
-        assert_eq!(
-            port.decode(br#"{"a":true,"b":false}"#).expect("two keys"),
-            Json::Object(vec![
-                ("a".into(), Json::Bool(true)),
-                ("b".into(), Json::Bool(false)),
+            json.decode(br#"[true,false]"#).expect("arr2"),
+            crate::protocol::v1::Json::Array(vec![
+                crate::protocol::v1::Json::Bool(true),
+                crate::protocol::v1::Json::Bool(false)
             ])
         );
         assert_eq!(
-            port.decode(br#""\u00zz""#).unwrap_err(),
-            CanonicalJsonError::Invalid
+            json.decode(br#"{"a":true,"b":false}"#).expect("obj2"),
+            crate::protocol::v1::Json::Object(vec![
+                ("a".into(), crate::protocol::v1::Json::Bool(true)),
+                ("b".into(), crate::protocol::v1::Json::Bool(false)),
+            ])
         );
+        assert!(EchoSign.verify(Policy::Classic, &[1], b"m", &[0]).is_err());
+        let _ = sample_defaults();
+        let mut engine = test_engine();
+        let header = engine
+            .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+            .expect("wrap");
+        engine.lock();
+        engine
+            .unlock(&header.header, &UnlockSecret::Passphrase("passpass".into()))
+            .expect("un");
+        let mac = XorHmac.mac(
+            &crate::protocol::v1::HmacSha256Key::from_bytes([1; 32]),
+            b"x",
+        );
+        assert_eq!(mac.as_bytes()[0], 1 ^ b'x');
     }
 }

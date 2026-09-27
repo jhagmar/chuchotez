@@ -1,7 +1,7 @@
 //! Domain crate: protocol types, ports, suites, and versioned engines.
 //!
 //! Zero third-party dependencies. Hosts depend on the `chuchotez` facade, keep
-//! a [`v1::Engine`] constructed with [`Policy`], and supply [`Rng`] on every
+//! a [`v1::Engine`] constructed with [`v1::Defaults`], and supply [`Rng`] on every
 //! entropy call.
 //!
 //! Wire objects live in [`protocol`]. Layout version is the module ([`v1`]

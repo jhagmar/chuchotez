@@ -11,8 +11,7 @@ pub type Random32Bytes = [u8; RANDOM32_LEN];
 /// [`RANDOM32_LEN`] cryptographically random bytes from [`Rng`].
 ///
 /// Branded so a hash digest or a key cannot be passed where fresh entropy is
-/// required. [`super::v1::Engine::create_invite`] assigns those bytes the
-/// Ticket-secret role.
+/// required.
 #[derive(Clone, Eq)]
 pub struct Random32(Random32Bytes);
 
