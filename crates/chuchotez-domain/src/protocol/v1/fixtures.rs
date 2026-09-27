@@ -514,7 +514,11 @@ mod tests {
             SeedRng(fill(1)).random32().as_bytes()
         );
         assert_eq!(XorHash.hash(b"ab")[0], b'a');
-        assert!(EchoArgon.hash(b"passpass", &[1; 16], 8, 1, 1).is_ok());
+        assert!(
+            EchoArgon
+                .hash(b"passpass", &super::super::argon::fixture_salt(), 8, 1, 1)
+                .is_ok()
+        );
         let seed = crate::protocol::v1::KemSeed::from_bytes([2; 64]);
         let keys = EchoKem.generate(Policy::Classic, &seed).expect("k");
         let (ss, ct) = EchoKem

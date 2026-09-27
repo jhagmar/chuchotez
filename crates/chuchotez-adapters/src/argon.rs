@@ -31,14 +31,19 @@ mod tests {
     use super::RustcryptoArgon2id;
     use chuchotez_domain::v1::{Argon2Error, Argon2id};
 
+    fn fixture_salt() -> [u8; 16] {
+        core::array::from_fn(|i| i as u8)
+    }
+
     #[test]
     fn argon2id_roundtrip_params() {
         let port = RustcryptoArgon2id;
-        let a = port.hash(b"passpass", &[1u8; 16], 8, 1, 1).expect("ok");
-        let b = port.hash(b"passpass", &[1u8; 16], 8, 1, 1).expect("ok2");
+        let salt = fixture_salt();
+        let a = port.hash(b"passpass", &salt, 8, 1, 1).expect("ok");
+        let b = port.hash(b"passpass", &salt, 8, 1, 1).expect("ok2");
         assert_eq!(a, b);
         assert_eq!(
-            port.hash(b"passpass", &[1u8; 16], 0, 1, 1).unwrap_err(),
+            port.hash(b"passpass", &salt, 0, 1, 1).unwrap_err(),
             Argon2Error::Refused
         );
         assert_eq!(port, RustcryptoArgon2id);

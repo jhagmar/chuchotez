@@ -15,6 +15,11 @@ impl core::fmt::Display for Argon2Error {
 
 impl std::error::Error for Argon2Error {}
 
+#[cfg(test)]
+pub(crate) fn fixture_salt() -> [u8; 16] {
+    core::array::from_fn(|i| i as u8)
+}
+
 /// RFC 9106 Argon2id. Adapters supply the primitive.
 pub trait Argon2id {
     /// Stretch `passphrase` with `salt` and parameters `m`, `t`, `p` to 32 bytes.
@@ -51,7 +56,7 @@ mod tests {
     fn argon_error() {
         assert_eq!(
             FailingArgon
-                .hash(b"passpass", &[0; 16], 8, 1, 1)
+                .hash(b"passpass", &super::fixture_salt(), 8, 1, 1)
                 .unwrap_err(),
             Argon2Error::Refused
         );

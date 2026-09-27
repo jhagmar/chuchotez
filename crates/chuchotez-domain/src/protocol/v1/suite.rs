@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(
             suite
                 .argon()
-                .hash(b"passpass", &[0; 16], 8, 1, 1)
+                .hash(b"passpass", &super::super::argon::fixture_salt(), 8, 1, 1)
                 .unwrap_err(),
             Argon2Error::Refused
         );
