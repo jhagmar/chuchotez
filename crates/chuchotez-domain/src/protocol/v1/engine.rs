@@ -1,12 +1,16 @@
 //! Host-owned handle bound to a v1 [`Suite`] and [`Defaults`].
 
+use super::chain::{
+    SendChain, chain_from_json, chain_key, chain_to_json, fragment_body, join, mk, packed_tx,
+    seal_packet, set_xor_for, step,
+};
 use super::codec::{
     durable_body_from_json, durable_body_to_json, ticket_from_json, ticket_to_json,
     vault_header_to_json,
 };
 use super::hmac::{HmacSha256Key, expand};
 use super::payload::{
-    DurableBody, Hlc, PACKET_LEN, PACKET_NONCE_LEN, PERSIST_MAX_UNCOMPRESSED,
+    ConversationSort, DurableBody, Hlc, PACKET_NONCE_LEN, PERSIST_MAX_UNCOMPRESSED,
     TICKET_MAX_UNCOMPRESSED, Ticket, TxEdit, TxMedia, TxNotice, TxPayload, TxReaction, TxText,
     UnlockSecret, VAULT_M, VAULT_P, VAULT_T, VaultHeader, time_bin,
 };
@@ -395,6 +399,7 @@ pub struct EngineState {
     blob_puts: Vec<BlobPut>,
     tickets: BTreeMap<[u8; 32], Ticket>,
     sync_tickets: BTreeMap<[u8; 32], Ticket>,
+    send_chains: BTreeMap<Vec<u8>, SendChain>,
     names: BTreeMap<[u8; 32], DisplayName>,
     pics: BTreeMap<[u8; 32], Option<super::ProfilePic>>,
     device_name: Option<DisplayName>,
@@ -417,6 +422,13 @@ impl EngineState {
     #[cfg(test)]
     pub(crate) fn set_next_seq(&mut self, seq: u64) {
         self.next_seq = seq;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_chain_seq(&self, conversation_id: &ConversationId) -> Option<u64> {
+        self.send_chains
+            .get(&chain_key(conversation_id, &[]))
+            .map(|c| c.packet_seq)
     }
 }
 
@@ -693,6 +705,64 @@ impl Engine {
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ct);
         Ok(out)
+    }
+
+    fn post_handshake_packets(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        conversation_id: ConversationId,
+        conv_secret: &[u8; 32],
+        tx_id: Tag,
+    ) -> Result<(), EngineError> {
+        let now = Self::require_tick(state)?;
+        let cid = *conversation_id.as_bytes();
+        let (sort, persistents) = if let Some(t) = state.tickets.get(&cid) {
+            (ConversationSort::HandshakeDm, t.persistents.clone())
+        } else if let Some(t) = state.sync_tickets.get(&cid) {
+            (ConversationSort::HandshakeSync, t.persistents.clone())
+        } else {
+            return Err(EngineError::UnknownIds);
+        };
+        let tag = Tag::from_bytes(
+            expand(
+                self.suite.hmac(),
+                &HmacSha256Key::from_bytes(*conv_secret),
+                &[
+                    b"chuchotez/1/handshake-invite".as_slice(),
+                    &time_bin(now).to_be_bytes(),
+                ]
+                .concat(),
+            )
+            .into_bytes(),
+        );
+        let body = state
+            .txs
+            .get(tx_id.as_bytes())
+            .ok_or(EngineError::UnknownIds)?
+            .clone();
+        let packed = packed_tx(&self.suite, &body);
+        let set_xor = set_xor_for(&state.txs, conversation_id);
+        let key = chain_key(&conversation_id, &[]);
+        let mut chain = match state.send_chains.get(&key) {
+            Some(c) => c.clone(),
+            None => join(self.suite.hmac(), conv_secret, sort, &[])?,
+        };
+        let packets = fragment_body(&self.suite, &packed, tx_id, set_xor, chain.packet_seq, &[])?;
+        for packet in packets {
+            let mk_bytes = mk(self.suite.hmac(), &chain);
+            let sealed = seal_packet(&self.suite, rng, &mk_bytes, &packet)?;
+            for ch in &persistents {
+                state.writes.push(DurableWrite {
+                    channel: ch.clone(),
+                    tag,
+                    body: sealed.clone(),
+                });
+            }
+            chain = step(self.suite.hmac(), &chain);
+        }
+        state.send_chains.insert(key, chain);
+        Ok(())
     }
 
     fn merge_tx(
@@ -982,7 +1052,8 @@ impl Engine {
         Ok(ok)
     }
 
-    /// Create a DM invite.
+    /// Create a DM invite. Posts sealed `PacketTxFragLast` (and `More`) of the
+    /// `TxNotice` at InviteTag. Handshake packets carry empty `actor_id`.
     pub fn create_invite(
         &self,
         mut state: EngineState,
@@ -1036,25 +1107,8 @@ impl Engine {
         state.next_seq = state.next_seq.saturating_add(1);
         state.txs.insert(tx_id, body);
         state.tickets.insert(*conversation_id.as_bytes(), ticket);
-        let tag = Tag::from_bytes(
-            expand(
-                self.suite.hmac(),
-                &HmacSha256Key::from_bytes(conv_secret),
-                &[
-                    b"chuchotez/1/handshake-invite".as_slice(),
-                    &time_bin(now).to_be_bytes(),
-                ]
-                .concat(),
-            )
-            .into_bytes(),
-        );
-        for ch in persistents {
-            state.writes.push(DurableWrite {
-                channel: ch,
-                tag,
-                body: vec![0u8; PACKET_LEN],
-            });
-        }
+        #[rustfmt::skip]
+        self.post_handshake_packets(&mut state, rng, conversation_id, &conv_secret, Tag::from_bytes(tx_id))?;
         Ok((
             MutateOk {
                 state,
@@ -1297,6 +1351,10 @@ impl Engine {
                 ),
             ]));
         }
+        let mut chains = Vec::new();
+        for (key, chain) in &state.send_chains {
+            chains.push(chain_to_json(self.suite.b64u(), key, chain));
+        }
         let json = Json::Object(vec![
             ("type".into(), Json::String("v1-engine-snapshot".into())),
             ("next_seq".into(), Json::Number(seq)),
@@ -1306,6 +1364,7 @@ impl Engine {
             ),
             ("txs".into(), Json::Array(txs)),
             ("tickets".into(), Json::Array(tickets)),
+            ("chains".into(), Json::Array(chains)),
         ]);
         let canonical = self.suite.canonical_json().encode(&json);
         (canonical.len() <= PERSIST_MAX_UNCOMPRESSED)
@@ -1344,6 +1403,9 @@ impl Engine {
         }
         state.tickets.remove(&cid);
         state.sync_tickets.remove(&cid);
+        state
+            .send_chains
+            .retain(|k, _| k.get(..32) != Some(cid.as_slice()));
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -1410,7 +1472,8 @@ impl Engine {
         })
     }
 
-    /// Create a Sync invite.
+    /// Create a Sync invite. Posts sealed `PacketTxFragLast` (and `More`) of
+    /// the `TxNotice` at InviteTag with empty `actor_id`.
     pub fn create_sync_invite(
         &self,
         mut state: EngineState,
@@ -1434,7 +1497,7 @@ impl Engine {
         if state.device_id.is_none() {
             state.device_id = Some(DeviceId::from(rng.random32()));
         }
-        let _ = self
+        let intake = self
             .suite
             .kem()
             .generate(policy, &KemSeed::from_pair(rng.random32(), rng.random32()))
@@ -1444,19 +1507,41 @@ impl Engine {
             .sign()
             .generate(policy, &SignSeed::from_pair(rng.random32(), rng.random32()))
             .map_err(|_| EngineError::MalformedPayload)?;
-        state.sync_tickets.insert(
-            *conversation_id.as_bytes(),
-            Ticket {
-                secret,
-                persistents,
-                expires,
+        let conv_secret = *secret.as_bytes();
+        let payload = TxPayload::Notice(TxNotice {
+            policy,
+            intake_pk: intake.public_bytes().to_vec(),
+            persistents: persistents.clone(),
+            ephemerals: self.defaults.ephemerals().to_vec(),
+            expires,
+        });
+        let tx_id = self.tx_id(&conv_secret, &payload);
+        let body = DurableBody {
+            conversation_id,
+            hlc: Hlc {
+                wall_ms: now.saturating_mul(1000),
+                counter: 0,
             },
-        );
+            payload,
+        };
+        let persist = self.persist_record(state.next_seq, &body)?;
+        state.next_seq = state.next_seq.saturating_add(1);
+        state.txs.insert(tx_id, body);
+        let ticket = Ticket {
+            secret,
+            persistents: persistents.clone(),
+            expires,
+        };
+        state
+            .sync_tickets
+            .insert(*conversation_id.as_bytes(), ticket);
         state.device_name = Some(name);
+        #[rustfmt::skip]
+        self.post_handshake_packets(&mut state, rng, conversation_id, &conv_secret, Tag::from_bytes(tx_id))?;
         Ok((
             MutateOk {
                 state,
-                persist: Vec::new(),
+                persist: vec![persist],
                 pings: Vec::new(),
             },
             conversation_id,
@@ -1541,7 +1626,13 @@ impl Engine {
         mut state: EngineState,
         _rng: &dyn Rng,
     ) -> Result<MutateOk, EngineError> {
+        let sync_ids: Vec<[u8; 32]> = state.sync_tickets.keys().copied().collect();
         state.sync_tickets.clear();
+        state.send_chains.retain(|k, _| {
+            k.get(..32)
+                .and_then(|id| id.try_into().ok())
+                .is_none_or(|id: [u8; 32]| !sync_ids.contains(&id))
+        });
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -2133,6 +2224,14 @@ impl Engine {
                 }
             }
         }
+        if let Some(Json::Array(chains)) = get("chains") {
+            for item in chains {
+                let (key, chain) = chain_from_json(self.suite.b64u(), item)?;
+                state.send_chains.insert(key, chain);
+            }
+        } else if get("chains").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
         Ok(state)
     }
 }
@@ -2231,9 +2330,15 @@ mod tests {
         ));
         let poll = engine.poll(&invited.state).expect("p2");
         let w = &poll.write_durable[0];
-        let acked = engine
+        assert_eq!(w.body.len(), crate::protocol::v1::PACKET_LEN);
+        let mut acked = engine
             .write_ack(invited.state.clone(), w.channel.clone(), w.tag, &w.body)
             .expect("ack");
+        for write in poll.write_durable.iter().skip(1) {
+            acked = engine
+                .write_ack(acked.state, write.channel.clone(), write.tag, &write.body)
+                .expect("ackn");
+        }
         assert!(
             engine
                 .poll(&acked.state)
@@ -2253,6 +2358,11 @@ mod tests {
         let _ = snap.persist();
         let _ = snap.pings();
         let restored = engine.apply_folded(&snap.snapshot).expect("fold");
+        assert!(invited.state.send_chain_seq(&cid).unwrap() >= 1);
+        assert_eq!(
+            invited.state.send_chain_seq(&cid),
+            restored.send_chain_seq(&cid)
+        );
         assert!(engine.apply(folded.clone(), &[]).is_err());
         let conv = engine
             .get_conversation(&acked.state, uid, iid, cid)
@@ -2668,6 +2778,13 @@ mod tests {
                 None,
             )
             .expect("sy");
+        assert_eq!(
+            engine.poll(&sync_ok.state).expect("sp").write_durable[0]
+                .body
+                .len(),
+            crate::protocol::v1::PACKET_LEN
+        );
+        assert!(sync_ok.state.send_chain_seq(&sid).unwrap() >= 1);
         assert!(matches!(
             engine
                 .get_conversation(&sync_ok.state, uid, iid, sid)
@@ -3048,6 +3165,32 @@ mod tests {
                 .unwrap_err(),
             EngineError::MalformedPersist
         );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("chains".into(), Json::Number(1)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("chains".into(), Json::Array(vec![Json::Null])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
         engine.lock();
         assert_eq!(
             engine
@@ -3152,5 +3295,118 @@ mod tests {
                 missing: BlockedMissing::DisplayName,
             }
         );
+    }
+
+    #[test]
+    fn invite_packets_open_from_ticket_secret() {
+        use super::super::chain::{join, open_skip_ahead};
+        use super::super::codec::ticket_from_json;
+        use super::super::payload::{ConversationSort, PACKET_LEN, TICKET_MAX_UNCOMPRESSED};
+        let mut engine = test_engine();
+        let rng = CounterRng::new();
+        engine
+            .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+            .expect("wrap");
+        let ticked = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("tick");
+        let (created, uid) = engine.create_user(ticked.state, &rng).expect("user");
+        let (created, iid) = engine
+            .create_identity(created.state, &rng, uid, Policy::Classic)
+            .expect("id");
+        let (invited, cid) = engine
+            .create_invite(created.state, &rng, uid, iid, 1_800_000_000, None)
+            .expect("inv");
+        let ids = ConversationRef {
+            user_id: uid,
+            identity_id: iid,
+            conversation_id: cid,
+        };
+        let ticket_s = engine.ticket_host_string(&invited.state, &ids).expect("t");
+        let packed = engine.suite.b64u().decode(&ticket_s).expect("dec");
+        let canonical = engine
+            .suite
+            .compress()
+            .decompress(&packed, TICKET_MAX_UNCOMPRESSED)
+            .expect("z");
+        let json = engine.suite.canonical_json().decode(&canonical).expect("j");
+        let ticket = ticket_from_json(engine.suite.b64u(), &json).expect("ticket");
+        let chain = join(
+            engine.suite.hmac(),
+            ticket.secret.as_bytes(),
+            ConversationSort::HandshakeDm,
+            &[],
+        )
+        .expect("join");
+        let poll = engine.poll(&invited.state).expect("p");
+        assert_eq!(poll.write_durable[0].body.len(), PACKET_LEN);
+        let opened = open_skip_ahead(
+            &engine.suite,
+            &chain,
+            &[],
+            1_700_000_000,
+            &poll.write_durable[0].body,
+        )
+        .expect("open");
+        assert!(!opened.from_cache);
+        let tx_id = *invited
+            .state
+            .txs
+            .iter()
+            .find(|(_, b)| b.conversation_id == cid)
+            .expect("tx")
+            .0;
+        let mut state = invited.state.clone();
+        let seq0 = state.send_chain_seq(&cid).expect("seq");
+        engine
+            .post_handshake_packets(
+                &mut state,
+                &rng,
+                cid,
+                ticket.secret.as_bytes(),
+                crate::protocol::v1::Tag::from_bytes(tx_id),
+            )
+            .expect("again");
+        assert!(state.send_chain_seq(&cid).expect("seq2") > seq0);
+        assert_eq!(
+            engine
+                .post_handshake_packets(
+                    &mut EngineState::new(),
+                    &rng,
+                    cid,
+                    ticket.secret.as_bytes(),
+                    crate::protocol::v1::Tag::from_bytes(tx_id),
+                )
+                .unwrap_err(),
+            EngineError::NotTicked
+        );
+        let mut unknown = invited.state.clone();
+        assert_eq!(
+            engine
+                .post_handshake_packets(
+                    &mut unknown,
+                    &rng,
+                    crate::protocol::v1::ConversationId::from_bytes([0; 32]),
+                    ticket.secret.as_bytes(),
+                    crate::protocol::v1::Tag::from_bytes(tx_id),
+                )
+                .unwrap_err(),
+            EngineError::UnknownIds
+        );
+        let mut missing_tx = invited.state.clone();
+        assert_eq!(
+            engine
+                .post_handshake_packets(
+                    &mut missing_tx,
+                    &rng,
+                    cid,
+                    ticket.secret.as_bytes(),
+                    crate::protocol::v1::Tag::from_bytes([0; 32]),
+                )
+                .unwrap_err(),
+            EngineError::UnknownIds
+        );
+        let dropped = engine.delete_conversation(state, ids).expect("dc");
+        assert!(dropped.state.send_chain_seq(&cid).is_none());
     }
 }

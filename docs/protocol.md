@@ -6,8 +6,8 @@ The [book](book.md) documents the locked Rust crate. rustdoc is that crate’s
 API reference.
 
 **Shipped** work is in the crates. **Planned** work is decided and waiting on a
-slice. Packet sending-chain seal/open, ingest reassembly, heal, live path,
-confirmation digest, and child-conversation spawn wait on a later slice.
+slice. Ingest reassembly, heal, live path, confirmation digest, and
+child-conversation spawn wait on a later slice.
 
 The **host** is the app. It supplies `random32`, stores the local log, and talks
 to the network. Chuchotez builds the envelopes.
@@ -21,7 +21,10 @@ and engine.
 
 The **inviter** starts a handshake. The **invitee** joins it. After both confirm
 a fingerprint, the library mints a child DM or Sync conversation with a new
-secret. Group invites are DM transactions. An Established DM is a **contact**.
+secret. Handshake conversations exist because the invitee has `Ticket.secret`
+and does not yet have a peer public key. Group invites are DM transactions on
+an Established DM (a **contact**). That conversation already has peer
+`SigningPublicKey` values, so Group has no Ticket, InviteTag, or intake KEM.
 
 A **`Policy`** is `Classic`, `PostQuantum`, or `Hybrid`. It chooses the
 public-key algorithms in [Algorithms](#algorithms). Policy is per identity.
@@ -693,9 +696,9 @@ EphTag = expand(eph_send_tag_key, eph_label || be<64>u(TimeBin))
 
 #### PacketPlain
 
-Sealed packet contents, padded to 484 bytes. `actor_id` is the sender
-`SigningPublicKey` on handshake, DM, and Group, and `DeviceId` on
-Synchronization.
+Sealed packet contents, padded to 484 bytes. HandshakeDm and HandshakeSync
+carry empty `actor_id`. DirectMessage and Group carry the sender
+`SigningPublicKey`. Synchronization carries `DeviceId`.
 
 ```
 PacketPlain = PacketTxFragMore / PacketTxFragLast / PacketXorAck
@@ -1274,7 +1277,18 @@ payloads are omitted from `messages`.
 #### Sending chain
 
 Each actor has a packet sending chain on a conversation: `root`, `C`,
-`epoch`, `packet_seq`. Join seeds:
+`epoch`, `packet_seq`. HandshakeDm and HandshakeSync omit `actor_id` so the
+invitee can derive `mk` from `Ticket.secret` alone:
+
+```
+root = expand(conversation_secret, chain_root_label)
+C    = expand(root, chain_c_label)
+epoch = 0
+packet_seq = 0
+```
+
+DirectMessage, Group, and Synchronization mix `actor_id` (`SigningPublicKey`
+or `DeviceId`):
 
 ```
 root = expand(conversation_secret, chain_root_label || actor_id)

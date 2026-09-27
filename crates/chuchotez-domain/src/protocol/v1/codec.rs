@@ -1471,7 +1471,6 @@ pub(crate) fn packet_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Pac
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn packed_packet(
     json: &dyn CanonicalJson,
     b64u: &dyn Base64Url,
@@ -1482,6 +1481,15 @@ pub(crate) fn packed_packet(
     (packed.len() <= PACKET_PAD_LEN)
         .then_some(packed)
         .ok_or(EngineError::BodyTooLarge)
+}
+
+pub(crate) fn packed_durable_body(
+    json: &dyn CanonicalJson,
+    b64u: &dyn Base64Url,
+    compress: &dyn Compress,
+    body: &DurableBody,
+) -> Vec<u8> {
+    compress.compress(&json.encode(&durable_body_to_json(b64u, body)))
 }
 
 pub(crate) fn durable_body_from_json(

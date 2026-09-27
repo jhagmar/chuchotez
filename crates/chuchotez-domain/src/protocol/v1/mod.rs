@@ -3,6 +3,7 @@
 mod aead;
 mod argon;
 mod b64u;
+mod chain;
 mod channel;
 mod codec;
 mod compress;
@@ -52,7 +53,7 @@ pub use kem::{
     kem_pk_len, kem_sk_len,
 };
 pub use payload::{
-    BIN_WINDOW, ConversationSort, DurableBody, GroupMember, Hlc, PACKET_LEN,
+    AEAD_TAG_LEN, BIN_WINDOW, ConversationSort, DurableBody, GroupMember, Hlc, PACKET_LEN,
     PACKET_MAX_UNCOMPRESSED, PACKET_PAD_LEN, PacketHealHalfXor, PacketHealHave, PacketHealWant,
     PacketPlain, PacketPresence, PacketPresenceActive, PacketTxFragLast, PacketTxFragMore,
     PacketTyping, PacketTypingActive, PacketXorAck, Ticket, TxEdit, TxGroupInvite, TxGroupRoster,
