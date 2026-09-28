@@ -713,7 +713,6 @@ pub(crate) fn pad(bytes: &[u8], n: usize) -> Result<Vec<u8>, ()> {
         .ok_or(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn unpad(bytes: &[u8]) -> &[u8] {
     let n = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     &bytes[..n]

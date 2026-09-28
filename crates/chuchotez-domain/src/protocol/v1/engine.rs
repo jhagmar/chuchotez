@@ -1,26 +1,28 @@
 //! Host-owned handle bound to a v1 [`Suite`] and [`Defaults`].
 
 use super::chain::{
-    SendChain, chain_from_json, chain_key, chain_to_json, fragment_body, join, mk, packed_tx,
-    seal_packet, set_xor_for, step,
+    CachedMk, SendChain, chain_from_json, chain_key, chain_to_json, fragment_body, join, mk,
+    open_skip_ahead, packed_tx, seal_packet, set_xor_for, step,
 };
 use super::codec::{
-    durable_body_from_json, durable_body_to_json, ticket_from_json, ticket_to_json,
+    durable_body_from_json, durable_body_to_json, durable_json, ticket_from_json, ticket_to_json,
     vault_header_to_json,
 };
-use super::hmac::{HmacSha256Key, expand};
+use super::hmac::{HmacSha256, HmacSha256Key, expand};
 use super::payload::{
-    ConversationSort, DurableBody, Hlc, PACKET_NONCE_LEN, PERSIST_MAX_UNCOMPRESSED,
-    TICKET_MAX_UNCOMPRESSED, Ticket, TxEdit, TxMedia, TxNotice, TxPayload, TxReaction, TxText,
-    UnlockSecret, VAULT_M, VAULT_P, VAULT_T, VaultHeader, time_bin,
+    BIN_WINDOW, ConversationSort, DurableBody, Hlc, PACKET_MAX_UNCOMPRESSED, PACKET_NONCE_LEN,
+    PERSIST_MAX_UNCOMPRESSED, PacketPlain, TICKET_MAX_UNCOMPRESSED, Ticket, TxEdit, TxMedia,
+    TxNotice, TxPayload, TxReaction, TxText, UnlockSecret, VAULT_M, VAULT_P, VAULT_T, VaultHeader,
+    time_bin,
 };
 use super::{
-    AEAD_NONCE_LEN, AeadKey, AeadNonce, ConversationId, Defaults, DeviceId, DisplayName,
-    DurableChannel, EngineError, EphemeralChannel, IdentityId, Json, KemSeed, Policy, Secret,
+    AEAD_NONCE_LEN, Address, AeadKey, AeadNonce, ConversationId, Defaults, DeviceId, DisplayName,
+    DurableChannel, EngineError, EphemeralChannel, IdentityId, Json, KemSeed, Kind, Policy, Secret,
     SignSeed, Suite, Tag, UserId,
 };
 use crate::protocol::Rng;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Persist format version in the nonce high four bytes.
 const PERSIST_VERSION: u32 = 1;
@@ -400,6 +402,10 @@ pub struct EngineState {
     tickets: BTreeMap<[u8; 32], Ticket>,
     sync_tickets: BTreeMap<[u8; 32], Ticket>,
     send_chains: BTreeMap<Vec<u8>, SendChain>,
+    recv_chains: BTreeMap<Vec<u8>, SendChain>,
+    skipped_mks: BTreeMap<Vec<u8>, Vec<CachedMk>>,
+    frags: BTreeMap<[u8; 32], FragSet>,
+    bin_progress: BTreeMap<(String, String, [u8; 32]), BinProgress>,
     names: BTreeMap<[u8; 32], DisplayName>,
     pics: BTreeMap<[u8; 32], Option<super::ProfilePic>>,
     device_name: Option<DisplayName>,
@@ -430,6 +436,36 @@ impl EngineState {
             .get(&chain_key(conversation_id, &[]))
             .map(|c| c.packet_seq)
     }
+
+    #[cfg(test)]
+    pub(crate) fn recv_chain_seq(&self, conversation_id: &ConversationId) -> Option<u64> {
+        self.recv_chains
+            .get(&chain_key(conversation_id, &[]))
+            .map(|c| c.packet_seq)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BinProgress {
+    channel: DurableChannel,
+    tag_key: [u8; 32],
+    watermark: Option<u64>,
+    completed: BTreeSet<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct FragSet {
+    conversation_id: [u8; 32],
+    parts: BTreeMap<u64, Vec<u8>>,
+    last_i: Option<u64>,
+}
+
+struct HandshakeHit {
+    cid: [u8; 32],
+    secret: [u8; 32],
+    sort: ConversationSort,
+    bin: u64,
+    tag_key: [u8; 32],
 }
 
 /// Host-owned handle bound to a suite and Defaults.
@@ -833,6 +869,10 @@ impl Engine {
             return Err(EngineError::ClockWentBackwards);
         }
         state.ticked = Some(now);
+        for entries in state.skipped_mks.values_mut() {
+            entries.retain(|e| e.expires_at > now);
+        }
+        state.skipped_mks.retain(|_, e| !e.is_empty());
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -843,28 +883,46 @@ impl Engine {
     /// Mapper query for the ticked now.
     pub fn poll(&self, state: &EngineState) -> Result<Poll, EngineError> {
         let now = Self::require_tick(state)?;
-        let _ = time_bin(now);
+        let w = time_bin(now);
+        let start = window_start(w);
         let mut list = Vec::new();
-        for ticket in state.tickets.values().chain(state.sync_tickets.values()) {
-            let tag = Tag::from_bytes(
-                expand(
-                    self.suite.hmac(),
-                    &HmacSha256Key::from_bytes(*ticket.secret.as_bytes()),
-                    &[
-                        b"chuchotez/1/handshake-invite".as_slice(),
-                        &time_bin(now).to_be_bytes(),
-                    ]
-                    .concat(),
-                )
-                .into_bytes(),
-            );
+        let mut listen_durable = Vec::new();
+        for (_, ticket, _) in handshake_rows(state) {
+            let secret = ticket.secret.as_bytes();
+            let tag_key = handshake_tag_key(self.suite.hmac(), secret);
             for ch in &ticket.persistents {
-                list.push(DurableLocator {
-                    channel: ch.clone(),
-                    tag,
-                });
+                let progress = state.bin_progress.get(&progress_key(ch, &tag_key));
+                let mut bins = BTreeSet::new();
+                for bin in start..=w.saturating_add(1) {
+                    if !bin_complete(progress, bin) {
+                        bins.insert(bin);
+                    }
+                }
+                for bin in listen_bins(w) {
+                    bins.insert(bin);
+                }
+                for bin in bins {
+                    list.push(DurableLocator {
+                        channel: ch.clone(),
+                        tag: invite_tag(self.suite.hmac(), secret, bin),
+                    });
+                }
+                for bin in listen_bins(w) {
+                    listen_durable.push(DurableLocator {
+                        channel: ch.clone(),
+                        tag: invite_tag(self.suite.hmac(), secret, bin),
+                    });
+                }
             }
         }
+        sort_durable_locators(&mut list);
+        list.dedup();
+        sort_durable_locators(&mut listen_durable);
+        listen_durable.dedup();
+        let mut write_durable = state.writes.clone();
+        sort_durable_writes(&mut write_durable);
+        let mut write_ephemeral = state.eph_writes.clone();
+        sort_ephemeral_writes(&mut write_ephemeral);
         let mut blocked = Vec::new();
         for tx in state.txs.values() {
             if let TxPayload::EngineCreateIdentity {
@@ -883,8 +941,9 @@ impl Engine {
         }
         Ok(Poll {
             list,
-            write_durable: state.writes.clone(),
-            write_ephemeral: state.eph_writes.clone(),
+            listen_durable,
+            write_durable,
+            write_ephemeral,
             blob_put: state.blob_puts.clone(),
             blocked,
             ..Poll::default()
@@ -904,13 +963,13 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         let secret = self.engine_secret()?;
         let mut payloads = Vec::new();
-        if !state
-            .txs
-            .values()
-            .any(|t| matches!(t.payload, TxPayload::EngineInit))
-        {
-            payloads.push(TxPayload::EngineInit);
-        }
+        payloads.extend(
+            (!state
+                .txs
+                .values()
+                .any(|t| matches!(t.payload, TxPayload::EngineInit)))
+            .then_some(TxPayload::EngineInit),
+        );
         payloads.push(TxPayload::EngineSetDefaults { defaults });
         self.mutate(state, &secret, payloads)
     }
@@ -1149,6 +1208,7 @@ impl Engine {
         let ticket = state
             .tickets
             .get(ids.conversation_id.as_bytes())
+            .or_else(|| state.sync_tickets.get(ids.conversation_id.as_bytes()))
             .ok_or(EngineError::UnknownIds)?;
         let json = ticket_to_json(self.suite.b64u(), ticket);
         let packed = self
@@ -1172,23 +1232,7 @@ impl Engine {
     ) -> Result<(MutateOk, ConversationId), EngineError> {
         let _ = (user_id, identity_id);
         let _ = Self::require_tick(&state)?;
-        let packed = self
-            .suite
-            .b64u()
-            .decode(ticket_host_string)
-            .map_err(|_| EngineError::MalformedTicket)?;
-        let canonical = self
-            .suite
-            .compress()
-            .decompress(&packed, TICKET_MAX_UNCOMPRESSED)
-            .map_err(|_| EngineError::MalformedTicket)?;
-        let json = self
-            .suite
-            .canonical_json()
-            .decode(&canonical)
-            .map_err(|_| EngineError::MalformedTicket)?;
-        let ticket =
-            ticket_from_json(self.suite.b64u(), &json).map_err(|_| EngineError::MalformedTicket)?;
+        let ticket = self.parse_ticket_host_string(ticket_host_string)?;
         let conversation_id = ConversationId::from(rng.random32());
         state.tickets.insert(*conversation_id.as_bytes(), ticket);
         Ok((
@@ -1240,17 +1284,19 @@ impl Engine {
         _user_id: UserId,
         _identity_id: IdentityId,
     ) -> Result<Vec<ConversationListRow>, EngineError> {
-        let mut rows = Vec::new();
-        for id in state.tickets.keys().chain(state.sync_tickets.keys()) {
-            let conversation_id = ConversationId::from_bytes(*id);
-            if let Some(conversation) = self.conversation_at(state, conversation_id) {
-                rows.push(ConversationListRow {
-                    conversation_id,
-                    conversation,
-                });
-            }
-        }
-        Ok(rows)
+        Ok(state
+            .tickets
+            .keys()
+            .chain(state.sync_tickets.keys())
+            .filter_map(|id| {
+                let conversation_id = ConversationId::from_bytes(*id);
+                self.conversation_at(state, conversation_id)
+                    .map(|conversation| ConversationListRow {
+                        conversation_id,
+                        conversation,
+                    })
+            })
+            .collect())
     }
 
     fn conversation_at(
@@ -1273,25 +1319,67 @@ impl Engine {
             if has_confirm {
                 return Some(Conversation::DirectMessage(DirectMessageQuery::Established));
             }
-            let inviter = if state.writes.is_empty() {
-                HandshakeInviter::NoticePinned {
-                    expires: ticket.expires,
-                }
-            } else {
-                HandshakeInviter::InviteCreated {
-                    expires: ticket.expires,
-                }
-            };
-            return Some(Conversation::HandshakeDm(Handshake::Inviter(inviter)));
+            return Some(Conversation::HandshakeDm(self.handshake_at(
+                state,
+                conversation_id,
+                ticket,
+            )));
         }
         if let Some(ticket) = state.sync_tickets.get(conversation_id.as_bytes()) {
-            return Some(Conversation::HandshakeSync(Handshake::Inviter(
-                HandshakeInviter::InviteCreated {
-                    expires: ticket.expires,
-                },
+            let has_reject = state.txs.values().any(|t| {
+                matches!(t.payload, TxPayload::Reject) && t.conversation_id == conversation_id
+            });
+            if has_reject {
+                return Some(Conversation::HandshakeSync(Handshake::Failed(
+                    FailedReason::ConfirmationRejected,
+                )));
+            }
+            return Some(Conversation::HandshakeSync(self.handshake_at(
+                state,
+                conversation_id,
+                ticket,
             )));
         }
         None
+    }
+
+    fn handshake_at(
+        &self,
+        state: &EngineState,
+        conversation_id: ConversationId,
+        ticket: &Ticket,
+    ) -> Handshake {
+        let is_inviter = state
+            .send_chains
+            .keys()
+            .any(|k| k.get(..32) == Some(conversation_id.as_bytes().as_slice()));
+        if is_inviter {
+            let pending = state
+                .writes
+                .iter()
+                .any(|w| ticket.persistents.iter().any(|ch| ch == &w.channel));
+            let inviter = if pending {
+                HandshakeInviter::InviteCreated {
+                    expires: ticket.expires,
+                }
+            } else {
+                HandshakeInviter::NoticePinned {
+                    expires: ticket.expires,
+                }
+            };
+            return Handshake::Inviter(inviter);
+        }
+        let notice = state.txs.values().find_map(|t| match &t.payload {
+            TxPayload::Notice(n) if t.conversation_id == conversation_id => Some(n),
+            _ => None,
+        });
+        match notice {
+            Some(n) => Handshake::Invitee(HandshakeInvitee::InviteReceived {
+                policy: n.policy,
+                expires: n.expires,
+            }),
+            None => Handshake::Invitee(HandshakeInvitee::TicketReceived),
+        }
     }
 
     fn conv_secret(
@@ -1355,6 +1443,71 @@ impl Engine {
         for (key, chain) in &state.send_chains {
             chains.push(chain_to_json(self.suite.b64u(), key, chain));
         }
+        let mut recv_chains = Vec::new();
+        for (key, chain) in &state.recv_chains {
+            recv_chains.push(chain_to_json(self.suite.b64u(), key, chain));
+        }
+        let mut skipped = Vec::new();
+        for (key, entries) in &state.skipped_mks {
+            let mut mks = Vec::new();
+            for e in entries {
+                mks.push(Json::Object(vec![
+                    ("mk".into(), super::codec::bstr(self.suite.b64u(), &e.mk)),
+                    ("expires_at".into(), Json::Number(e.expires_at)),
+                ]));
+            }
+            skipped.push(Json::Object(vec![
+                ("key".into(), super::codec::bstr(self.suite.b64u(), key)),
+                ("mks".into(), Json::Array(mks)),
+            ]));
+        }
+        let mut frags = Vec::new();
+        for (tx_id, set) in &state.frags {
+            let mut parts = Vec::new();
+            for (i, frag) in &set.parts {
+                parts.push(Json::Object(vec![
+                    ("i".into(), Json::Number(*i)),
+                    ("frag".into(), super::codec::bstr(self.suite.b64u(), frag)),
+                ]));
+            }
+            frags.push(Json::Object(vec![
+                ("tx_id".into(), super::codec::bstr(self.suite.b64u(), tx_id)),
+                (
+                    "conversation_id".into(),
+                    super::codec::bstr(self.suite.b64u(), &set.conversation_id),
+                ),
+                (
+                    "last_i".into(),
+                    set.last_i.map(Json::Number).unwrap_or(Json::Null),
+                ),
+                ("parts".into(), Json::Array(parts)),
+            ]));
+        }
+        let mut bins = Vec::new();
+        for progress in state.bin_progress.values() {
+            bins.push(Json::Object(vec![
+                ("channel".into(), durable_json(&progress.channel)),
+                (
+                    "tag_key".into(),
+                    super::codec::bstr(self.suite.b64u(), &progress.tag_key),
+                ),
+                (
+                    "watermark".into(),
+                    progress.watermark.map(Json::Number).unwrap_or(Json::Null),
+                ),
+                (
+                    "completed".into(),
+                    Json::Array(
+                        progress
+                            .completed
+                            .iter()
+                            .copied()
+                            .map(Json::Number)
+                            .collect(),
+                    ),
+                ),
+            ]));
+        }
         let json = Json::Object(vec![
             ("type".into(), Json::String("v1-engine-snapshot".into())),
             ("next_seq".into(), Json::Number(seq)),
@@ -1365,6 +1518,10 @@ impl Engine {
             ("txs".into(), Json::Array(txs)),
             ("tickets".into(), Json::Array(tickets)),
             ("chains".into(), Json::Array(chains)),
+            ("recv_chains".into(), Json::Array(recv_chains)),
+            ("skipped_mks".into(), Json::Array(skipped)),
+            ("frags".into(), Json::Array(frags)),
+            ("bins".into(), Json::Array(bins)),
         ]);
         let canonical = self.suite.canonical_json().encode(&json);
         (canonical.len() <= PERSIST_MAX_UNCOMPRESSED)
@@ -1398,14 +1555,28 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         self.require_ids(&state, &ids)?;
         let cid = *ids.conversation_id.as_bytes();
-        if !state.tickets.contains_key(&cid) && !state.sync_tickets.contains_key(&cid) {
-            return Err(EngineError::UnknownIds);
-        }
+        let ticket = state
+            .tickets
+            .get(&cid)
+            .or_else(|| state.sync_tickets.get(&cid))
+            .cloned()
+            .ok_or(EngineError::UnknownIds)?;
         state.tickets.remove(&cid);
         state.sync_tickets.remove(&cid);
         state
             .send_chains
             .retain(|k, _| k.get(..32) != Some(cid.as_slice()));
+        state
+            .recv_chains
+            .retain(|k, _| k.get(..32) != Some(cid.as_slice()));
+        state
+            .skipped_mks
+            .retain(|k, _| k.get(..32) != Some(cid.as_slice()));
+        state.frags.retain(|_, f| f.conversation_id != cid);
+        let tag_key = handshake_tag_key(self.suite.hmac(), ticket.secret.as_bytes());
+        for ch in &ticket.persistents {
+            state.bin_progress.remove(&progress_key(ch, &tag_key));
+        }
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -1413,7 +1584,8 @@ impl Engine {
         })
     }
 
-    /// Ingest a durable list snapshot.
+    /// Ingest a complete durable `list` snapshot. Completes that TimeBin in
+    /// `BinProgress`.
     pub fn ingest_list(
         &self,
         state: EngineState,
@@ -1422,31 +1594,47 @@ impl Engine {
         tag: Tag,
         bodies: &[Vec<u8>],
     ) -> Result<MutateOk, EngineError> {
-        let mut state = state;
-        for body in bodies {
-            state = self
-                .ingest_packet(state, rng, channel.clone(), tag, body)?
-                .state;
+        let now = Self::require_tick(&state)?;
+        let _ = self.require_dek()?;
+        let hits = self.handshake_hits(&state, &channel, &tag, now);
+        if hits.is_empty() {
+            return Err(EngineError::UnknownTag);
         }
+        let mut state = state;
+        let mut persist = Vec::new();
+        for body in bodies {
+            persist.extend(self.ingest_known_body(&mut state, rng, &hits, body)?);
+        }
+        self.complete_list_bin(&mut state, &channel, &hits[0], now);
         Ok(MutateOk {
             state,
-            persist: Vec::new(),
+            persist,
             pings: Vec::new(),
         })
     }
 
-    /// Ingest one mapper body.
+    /// Ingest one 512-byte mapper body. Opens with skip-ahead `mk` and
+    /// reassembles fragments.
     pub fn ingest_packet(
         &self,
-        state: EngineState,
-        _rng: &dyn Rng,
-        _channel: DurableChannel,
+        mut state: EngineState,
+        rng: &dyn Rng,
+        channel: DurableChannel,
         tag: Tag,
         body: &[u8],
     ) -> Result<MutateOk, EngineError> {
-        let _ = Self::require_tick(&state)?;
-        let _ = (tag, body);
-        Err(EngineError::UnknownTag)
+        let now = Self::require_tick(&state)?;
+        let _ = self.require_dek()?;
+        let hits = self.handshake_hits(&state, &channel, &tag, now);
+        if hits.is_empty() {
+            return Err(EngineError::UnknownTag);
+        }
+        let persist = self.ingest_known_body(&mut state, rng, &hits, body)?;
+        Ok(MutateOk {
+            state,
+            persist,
+            pings: Vec::new(),
+        })
     }
 
     /// Ack a blob put.
@@ -1494,9 +1682,11 @@ impl Engine {
             .map_err(|_| EngineError::ChannelBounds)?;
         let conversation_id = ConversationId::from(rng.random32());
         let secret = Secret::from(rng.random32());
-        if state.device_id.is_none() {
-            state.device_id = Some(DeviceId::from(rng.random32()));
-        }
+        state.device_id = Some(
+            state
+                .device_id
+                .unwrap_or_else(|| DeviceId::from(rng.random32())),
+        );
         let intake = self
             .suite
             .kem()
@@ -1562,13 +1752,21 @@ impl Engine {
         {
             return Err(EngineError::EmptyEngineRequired);
         }
-        self.receive_ticket(
-            state,
-            rng,
-            UserId::from_bytes([0; 32]),
-            IdentityId::from_bytes([0; 32]),
-            ticket_host_string,
-        )
+        let _ = Self::require_tick(&state)?;
+        let ticket = self.parse_ticket_host_string(ticket_host_string)?;
+        let conversation_id = ConversationId::from(rng.random32());
+        let mut state = state;
+        state
+            .sync_tickets
+            .insert(*conversation_id.as_bytes(), ticket);
+        Ok((
+            MutateOk {
+                state,
+                persist: Vec::new(),
+                pings: Vec::new(),
+            },
+            conversation_id,
+        ))
     }
 
     /// Set this device name.
@@ -1628,11 +1826,14 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         let sync_ids: Vec<[u8; 32]> = state.sync_tickets.keys().copied().collect();
         state.sync_tickets.clear();
-        state.send_chains.retain(|k, _| {
+        let drop_sync = |k: &Vec<u8>| {
             k.get(..32)
                 .and_then(|id| id.try_into().ok())
                 .is_none_or(|id: [u8; 32]| !sync_ids.contains(&id))
-        });
+        };
+        state.send_chains.retain(|k, _| drop_sync(k));
+        state.recv_chains.retain(|k, _| drop_sync(k));
+        state.skipped_mks.retain(|k, _| drop_sync(k));
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -2232,8 +2433,548 @@ impl Engine {
         } else if get("chains").is_some() {
             return Err(EngineError::MalformedPersist);
         }
+        if let Some(Json::Array(chains)) = get("recv_chains") {
+            for item in chains {
+                let (key, chain) = chain_from_json(self.suite.b64u(), item)?;
+                state.recv_chains.insert(key, chain);
+            }
+        } else if get("recv_chains").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
+        if let Some(Json::Array(items)) = get("skipped_mks") {
+            for item in items {
+                let Json::Object(m) = item else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                let key = decode_fold_bstr(
+                    self.suite.b64u(),
+                    getm("key").ok_or(EngineError::MalformedPersist)?,
+                )?;
+                let Json::Array(mks) = getm("mks").ok_or(EngineError::MalformedPersist)? else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let mut entries = Vec::new();
+                for mk in mks {
+                    let Json::Object(mm) = mk else {
+                        return Err(EngineError::MalformedPersist);
+                    };
+                    let gete = |k: &str| mm.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                    let mk_v = decode_fold32(
+                        self.suite.b64u(),
+                        gete("mk").ok_or(EngineError::MalformedPersist)?,
+                    )?;
+                    let Json::Number(expires_at) =
+                        gete("expires_at").ok_or(EngineError::MalformedPersist)?
+                    else {
+                        return Err(EngineError::MalformedPersist);
+                    };
+                    entries.push(CachedMk {
+                        mk: mk_v,
+                        expires_at: *expires_at,
+                    });
+                }
+                state.skipped_mks.insert(key, entries);
+            }
+        } else if get("skipped_mks").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
+        if let Some(Json::Array(items)) = get("frags") {
+            for item in items {
+                let Json::Object(m) = item else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                let tx_id = decode_fold32(
+                    self.suite.b64u(),
+                    getm("tx_id").ok_or(EngineError::MalformedPersist)?,
+                )?;
+                let conversation_id = decode_fold32(
+                    self.suite.b64u(),
+                    getm("conversation_id").ok_or(EngineError::MalformedPersist)?,
+                )?;
+                let last_i = match getm("last_i") {
+                    Some(Json::Null) | None => None,
+                    Some(Json::Number(n)) => Some(*n),
+                    _ => return Err(EngineError::MalformedPersist),
+                };
+                let Json::Array(parts_v) = getm("parts").ok_or(EngineError::MalformedPersist)?
+                else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let mut parts = BTreeMap::new();
+                for part in parts_v {
+                    let Json::Object(pm) = part else {
+                        return Err(EngineError::MalformedPersist);
+                    };
+                    let getp = |k: &str| pm.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                    let Json::Number(i) = getp("i").ok_or(EngineError::MalformedPersist)? else {
+                        return Err(EngineError::MalformedPersist);
+                    };
+                    let frag = decode_fold_bstr(
+                        self.suite.b64u(),
+                        getp("frag").ok_or(EngineError::MalformedPersist)?,
+                    )?;
+                    parts.insert(*i, frag);
+                }
+                state.frags.insert(
+                    tx_id,
+                    FragSet {
+                        conversation_id,
+                        parts,
+                        last_i,
+                    },
+                );
+            }
+        } else if get("frags").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
+        if let Some(Json::Array(items)) = get("bins") {
+            for item in items {
+                let Json::Object(m) = item else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                let channel =
+                    parse_fold_channel(getm("channel").ok_or(EngineError::MalformedPersist)?)?;
+                let tag_key = decode_fold32(
+                    self.suite.b64u(),
+                    getm("tag_key").ok_or(EngineError::MalformedPersist)?,
+                )?;
+                let watermark = match getm("watermark").ok_or(EngineError::MalformedPersist)? {
+                    Json::Null => None,
+                    Json::Number(n) => Some(*n),
+                    _ => return Err(EngineError::MalformedPersist),
+                };
+                let Json::Array(completed_v) =
+                    getm("completed").ok_or(EngineError::MalformedPersist)?
+                else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let mut completed = BTreeSet::new();
+                for c in completed_v {
+                    let Json::Number(n) = c else {
+                        return Err(EngineError::MalformedPersist);
+                    };
+                    completed.insert(*n);
+                }
+                let key = progress_key(&channel, &tag_key);
+                state.bin_progress.insert(
+                    key,
+                    BinProgress {
+                        channel,
+                        tag_key,
+                        watermark,
+                        completed,
+                    },
+                );
+            }
+        } else if get("bins").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
         Ok(state)
     }
+
+    fn parse_ticket_host_string(&self, ticket_host_string: &str) -> Result<Ticket, EngineError> {
+        let packed = self
+            .suite
+            .b64u()
+            .decode(ticket_host_string)
+            .map_err(|_| EngineError::MalformedTicket)?;
+        let canonical = self
+            .suite
+            .compress()
+            .decompress(&packed, TICKET_MAX_UNCOMPRESSED)
+            .map_err(|_| EngineError::MalformedTicket)?;
+        let json = self
+            .suite
+            .canonical_json()
+            .decode(&canonical)
+            .map_err(|_| EngineError::MalformedTicket)?;
+        ticket_from_json(self.suite.b64u(), &json).map_err(|_| EngineError::MalformedTicket)
+    }
+
+    fn handshake_hits(
+        &self,
+        state: &EngineState,
+        channel: &DurableChannel,
+        tag: &Tag,
+        now: u64,
+    ) -> Vec<HandshakeHit> {
+        let w = time_bin(now);
+        let start = window_start(w);
+        let end = w.saturating_add(1);
+        let mut hits = Vec::new();
+        for (cid, ticket, sort) in handshake_rows(state) {
+            if !ticket.persistents.iter().any(|ch| ch == channel) {
+                continue;
+            }
+            let secret = *ticket.secret.as_bytes();
+            let tag_key = handshake_tag_key(self.suite.hmac(), &secret);
+            for bin in start..=end {
+                if invite_tag(self.suite.hmac(), &secret, bin) == *tag {
+                    hits.push(HandshakeHit {
+                        cid,
+                        secret,
+                        sort,
+                        bin,
+                        tag_key,
+                    });
+                }
+            }
+        }
+        hits
+    }
+
+    fn ingest_known_body(
+        &self,
+        state: &mut EngineState,
+        _rng: &dyn Rng,
+        hits: &[HandshakeHit],
+        body: &[u8],
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        let now = Self::require_tick(state)?;
+        for hit in hits {
+            match self.open_and_merge(state, hit, now, body) {
+                Ok(persist) => return Ok(persist),
+                Err(EngineError::UnknownTag) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn open_and_merge(
+        &self,
+        state: &mut EngineState,
+        hit: &HandshakeHit,
+        now: u64,
+        body: &[u8],
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        let key = chain_key(&ConversationId::from_bytes(hit.cid), &[]);
+        let start = join(self.suite.hmac(), &hit.secret, hit.sort, &[])?;
+        let mut cached = state.skipped_mks.get(&key).cloned().unwrap_or_default();
+        cached.retain(|e| e.expires_at > now);
+        let opened = open_skip_ahead(&self.suite, &start, &cached, now, body)?;
+        cached.extend(opened.skipped);
+        cached.retain(|e| e.expires_at > now);
+        if cached.is_empty() {
+            state.skipped_mks.remove(&key);
+        } else {
+            state.skipped_mks.insert(key.clone(), cached);
+        }
+        if !opened.from_cache {
+            state.recv_chains.insert(key, opened.chain);
+        } else {
+            state.recv_chains.entry(key).or_insert(start);
+        }
+        let Some(part) = frag_parts(&opened.packet) else {
+            return Ok(Vec::new());
+        };
+        let set = state.frags.entry(part.tx_id).or_insert_with(|| FragSet {
+            conversation_id: hit.cid,
+            parts: BTreeMap::new(),
+            last_i: None,
+        });
+        if let Some(existing) = set.parts.get(&part.frag_i)
+            && existing != &part.frag
+        {
+            return Err(EngineError::Equivocation);
+        }
+        if let Some(prev_last) = set.last_i
+            && let Some(new_last) = part.last_i
+            && prev_last != new_last
+        {
+            return Err(EngineError::Equivocation);
+        }
+        set.parts.insert(part.frag_i, part.frag);
+        if let Some(n) = part.last_i {
+            set.last_i = Some(n);
+        }
+        let Some(last) = set.last_i else {
+            return Ok(Vec::new());
+        };
+        for i in 0..=last {
+            if !set.parts.contains_key(&i) {
+                return Ok(Vec::new());
+            }
+        }
+        let mut packed = Vec::new();
+        for i in 0..=last {
+            packed.extend_from_slice(&set.parts[&i]);
+        }
+        state.frags.remove(&part.tx_id);
+        let canonical = self
+            .suite
+            .compress()
+            .decompress(&packed, PACKET_MAX_UNCOMPRESSED)
+            .unwrap_or_default();
+        let json = match self.suite.canonical_json().decode(&canonical) {
+            Ok(j) => j,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let durable = match durable_body_from_json(self.suite.b64u(), &json) {
+            Ok(b) => b,
+            Err(()) => return Ok(Vec::new()),
+        };
+        if *durable.conversation_id.as_bytes() != hit.cid {
+            rekey_conversation(state, hit.cid, *durable.conversation_id.as_bytes());
+        }
+        if let Some(existing) = state.txs.get(&part.tx_id) {
+            if existing.payload == durable.payload {
+                return Ok(Vec::new());
+            }
+            return Err(EngineError::Equivocation);
+        }
+        let persist = self.persist_record(state.next_seq, &durable)?;
+        state.next_seq = state.next_seq.saturating_add(1);
+        state.txs.insert(part.tx_id, durable);
+        Ok(vec![persist])
+    }
+
+    fn complete_list_bin(
+        &self,
+        state: &mut EngineState,
+        channel: &DurableChannel,
+        hit: &HandshakeHit,
+        now: u64,
+    ) {
+        let start = window_start(time_bin(now));
+        let key = progress_key(channel, &hit.tag_key);
+        let progress = state
+            .bin_progress
+            .entry(key)
+            .or_insert_with(|| BinProgress {
+                channel: channel.clone(),
+                tag_key: hit.tag_key,
+                watermark: None,
+                completed: BTreeSet::new(),
+            });
+        prune_progress(progress, start);
+        if progress.watermark.is_some_and(|w| hit.bin <= w) {
+            return;
+        }
+        progress.completed.insert(hit.bin);
+        loop {
+            let next = match progress.watermark {
+                None => start,
+                Some(w) => w.saturating_add(1),
+            };
+            if progress.completed.remove(&next) {
+                progress.watermark = Some(next);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn handshake_rows(state: &EngineState) -> Vec<([u8; 32], Ticket, ConversationSort)> {
+    let mut rows = Vec::new();
+    for (id, ticket) in &state.tickets {
+        rows.push((*id, ticket.clone(), ConversationSort::HandshakeDm));
+    }
+    for (id, ticket) in &state.sync_tickets {
+        rows.push((*id, ticket.clone(), ConversationSort::HandshakeSync));
+    }
+    rows
+}
+
+fn window_start(w: u64) -> u64 {
+    w.saturating_sub(BIN_WINDOW.saturating_sub(1))
+}
+
+fn listen_bins(w: u64) -> [u64; 3] {
+    [w.saturating_sub(1), w, w.saturating_add(1)]
+}
+
+fn handshake_tag_key(hmac: &dyn HmacSha256, secret: &[u8; 32]) -> [u8; 32] {
+    expand(
+        hmac,
+        &HmacSha256Key::from_bytes(*secret),
+        b"chuchotez/1/handshake-invite",
+    )
+    .into_bytes()
+}
+
+fn invite_tag(hmac: &dyn HmacSha256, secret: &[u8; 32], bin: u64) -> Tag {
+    Tag::from_bytes(
+        expand(
+            hmac,
+            &HmacSha256Key::from_bytes(*secret),
+            &[
+                b"chuchotez/1/handshake-invite".as_slice(),
+                &bin.to_be_bytes(),
+            ]
+            .concat(),
+        )
+        .into_bytes(),
+    )
+}
+
+fn progress_key(channel: &DurableChannel, tag_key: &[u8; 32]) -> (String, String, [u8; 32]) {
+    (
+        channel.kind().as_str().into(),
+        channel.address().as_str().into(),
+        *tag_key,
+    )
+}
+
+fn bin_complete(progress: Option<&BinProgress>, bin: u64) -> bool {
+    let Some(p) = progress else {
+        return false;
+    };
+    p.watermark.is_some_and(|w| bin <= w) || p.completed.contains(&bin)
+}
+
+fn prune_progress(progress: &mut BinProgress, start: u64) {
+    if let Some(w) = progress.watermark
+        && w < start
+    {
+        progress.watermark = None;
+    }
+    progress.completed.retain(|&b| b >= start);
+    loop {
+        let next = match progress.watermark {
+            None => start,
+            Some(w) => w.saturating_add(1),
+        };
+        if progress.completed.remove(&next) {
+            progress.watermark = Some(next);
+        } else {
+            break;
+        }
+    }
+}
+
+fn locator_ord(a: &DurableLocator, b: &DurableLocator) -> Ordering {
+    a.channel
+        .kind()
+        .as_str()
+        .cmp(b.channel.kind().as_str())
+        .then_with(|| {
+            a.channel
+                .address()
+                .as_str()
+                .cmp(b.channel.address().as_str())
+        })
+        .then_with(|| a.tag.as_bytes().cmp(b.tag.as_bytes()))
+}
+
+fn sort_durable_locators(locators: &mut [DurableLocator]) {
+    locators.sort_by(locator_ord);
+}
+
+fn sort_durable_writes(writes: &mut [DurableWrite]) {
+    writes.sort_by(|a, b| {
+        locator_ord(
+            &DurableLocator {
+                channel: a.channel.clone(),
+                tag: a.tag,
+            },
+            &DurableLocator {
+                channel: b.channel.clone(),
+                tag: b.tag,
+            },
+        )
+    });
+}
+
+fn sort_ephemeral_writes(writes: &mut [EphemeralWrite]) {
+    writes.sort_by(|a, b| {
+        a.channel
+            .kind()
+            .as_str()
+            .cmp(b.channel.kind().as_str())
+            .then_with(|| {
+                a.channel
+                    .address()
+                    .as_str()
+                    .cmp(b.channel.address().as_str())
+            })
+            .then_with(|| a.tag.as_bytes().cmp(b.tag.as_bytes()))
+    });
+}
+
+struct FragPart {
+    tx_id: [u8; 32],
+    frag_i: u64,
+    frag: Vec<u8>,
+    last_i: Option<u64>,
+}
+
+fn frag_parts(packet: &PacketPlain) -> Option<FragPart> {
+    match packet {
+        PacketPlain::TxFragMore(p) => Some(FragPart {
+            tx_id: *p.tx_id.as_bytes(),
+            frag_i: p.frag_i,
+            frag: p.frag.clone(),
+            last_i: None,
+        }),
+        PacketPlain::TxFragLast(p) => Some(FragPart {
+            tx_id: *p.tx_id.as_bytes(),
+            frag_i: p.frag_i,
+            frag: p.frag.clone(),
+            last_i: Some(p.frag_i),
+        }),
+        _ => None,
+    }
+}
+
+fn rekey_conversation(state: &mut EngineState, from: [u8; 32], to: [u8; 32]) {
+    if let Some(t) = state.tickets.remove(&from) {
+        state.tickets.insert(to, t);
+    }
+    if let Some(t) = state.sync_tickets.remove(&from) {
+        state.sync_tickets.insert(to, t);
+    }
+    rekey_prefix(&mut state.send_chains, from, to);
+    rekey_prefix(&mut state.recv_chains, from, to);
+    rekey_prefix(&mut state.skipped_mks, from, to);
+    for frag in state.frags.values_mut() {
+        frag.conversation_id = rekey_cid(frag.conversation_id, from, to);
+    }
+}
+
+#[rustfmt::skip]
+fn rekey_cid(cid: [u8; 32], from: [u8; 32], to: [u8; 32]) -> [u8; 32] {
+    if cid == from { to } else { cid }
+}
+
+#[rustfmt::skip]
+fn rekey_prefix<V>(map: &mut BTreeMap<Vec<u8>, V>, from: [u8; 32], to: [u8; 32]) {
+    *map = std::mem::take(map).into_iter().map(|(k, v)| {
+        if k.len() >= 32 && k[..32] == from { let mut nk = to.to_vec(); nk.extend_from_slice(&k[32..]); (nk, v) } else { (k, v) }
+    }).collect();
+}
+
+fn decode_fold_bstr(b64u: &dyn super::Base64Url, value: &Json) -> Result<Vec<u8>, EngineError> {
+    let Json::String(s) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    b64u.decode(s).map_err(|_| EngineError::MalformedPersist)
+}
+
+fn decode_fold32(b64u: &dyn super::Base64Url, value: &Json) -> Result<[u8; 32], EngineError> {
+    decode_fold_bstr(b64u, value)?
+        .try_into()
+        .map_err(|_| EngineError::MalformedPersist)
+}
+
+fn parse_fold_channel(value: &Json) -> Result<DurableChannel, EngineError> {
+    let Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let get = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+    let Json::String(kind) = get("kind").ok_or(EngineError::MalformedPersist)? else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let Json::String(address) = get("address").ok_or(EngineError::MalformedPersist)? else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let kind = Kind::try_from(kind.as_str()).map_err(|_| EngineError::MalformedPersist)?;
+    let address = Address::try_from(address.as_str()).map_err(|_| EngineError::MalformedPersist)?;
+    Ok(DurableChannel::new(kind, address))
 }
 
 #[cfg(test)]
@@ -2273,6 +3014,12 @@ mod tests {
         let set = engine
             .set_defaults(ticked.state.clone(), defaults)
             .expect("set");
+        let set = engine
+            .set_defaults(
+                set.state,
+                engine.get_defaults(&EngineState::new()).expect("gd2"),
+            )
+            .expect("set2");
         let (created, uid) = engine.create_user(set.state, &rng).expect("user");
         assert_eq!(engine.list_users(&created.state).expect("u")[0], uid);
         assert_eq!(
@@ -2527,7 +3274,7 @@ mod tests {
             .apply(kick_fresh.state, &kicked.persist()[0])
             .expect("ak");
         engine.leave_sync(sync_ok.state, &rng).expect("ls");
-        assert_eq!(
+        assert!(
             engine
                 .ingest_list(
                     invited.state.clone(),
@@ -2536,8 +3283,7 @@ mod tests {
                     w.tag,
                     &[vec![1]]
                 )
-                .unwrap_err(),
-            EngineError::UnknownTag
+                .is_ok()
         );
         assert!(
             engine
@@ -2778,6 +3524,16 @@ mod tests {
                 None,
             )
             .expect("sy");
+        let _ = engine
+            .create_sync_invite(
+                sync_ok.state.clone(),
+                &rng,
+                Policy::Classic,
+                1_900_000_001,
+                "phone2",
+                None,
+            )
+            .expect("sy2");
         assert_eq!(
             engine.poll(&sync_ok.state).expect("sp").write_durable[0]
                 .body
@@ -3191,6 +3947,560 @@ mod tests {
                 .unwrap_err(),
             EngineError::MalformedPersist
         );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("recv_chains".into(), Json::Number(1)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("skipped_mks".into(), Json::Number(1)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("skipped_mks".into(), Json::Array(vec![Json::Null])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "skipped_mks".into(),
+                            Json::Array(vec![Json::Object(vec![("key".into(), Json::Number(1))])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("frags".into(), Json::Number(1)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("frags".into(), Json::Array(vec![Json::Null])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("bins".into(), Json::Number(1)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("bins".into(), Json::Array(vec![Json::Null])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![("channel".into(), Json::Null)])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "skipped_mks".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("key".into(), Json::String("00".repeat(32))),
+                                ("mks".into(), Json::Number(1)),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "skipped_mks".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("key".into(), Json::String("00".repeat(32))),
+                                ("mks".into(), Json::Array(vec![Json::Null])),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "frags".into(),
+                            Json::Array(vec![Json::Object(vec![(
+                                "tx_id".into(),
+                                Json::Number(1)
+                            )])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "frags".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("tx_id".into(), Json::String("00".repeat(32))),
+                                ("conversation_id".into(), Json::String("00".repeat(32))),
+                                ("last_i".into(), Json::Bool(true)),
+                                ("parts".into(), Json::Array(Vec::new())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "frags".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("tx_id".into(), Json::String("00".repeat(32))),
+                                ("conversation_id".into(), Json::String("00".repeat(32))),
+                                ("last_i".into(), Json::Null),
+                                ("parts".into(), Json::Number(1)),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "frags".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("tx_id".into(), Json::String("00".repeat(32))),
+                                ("conversation_id".into(), Json::String("00".repeat(32))),
+                                ("last_i".into(), Json::Null),
+                                ("parts".into(), Json::Array(vec![Json::Null])),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                (
+                                    "channel".into(),
+                                    Json::Object(vec![
+                                        ("kind".into(), Json::Number(1)),
+                                        ("address".into(), Json::String("x".into())),
+                                    ])
+                                ),
+                                ("tag_key".into(), Json::String("00".repeat(32))),
+                                ("watermark".into(), Json::Null),
+                                ("completed".into(), Json::Array(Vec::new())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                (
+                                    "channel".into(),
+                                    Json::Object(vec![
+                                        ("kind".into(), Json::String("nostr".into())),
+                                        ("address".into(), Json::Number(1)),
+                                    ])
+                                ),
+                                ("tag_key".into(), Json::String("00".repeat(32))),
+                                ("watermark".into(), Json::Null),
+                                ("completed".into(), Json::Array(Vec::new())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        let hex32 = "00".repeat(32);
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "skipped_mks".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("key".into(), Json::String(hex32.clone())),
+                                (
+                                    "mks".into(),
+                                    Json::Array(vec![Json::Object(vec![
+                                        ("mk".into(), Json::String(hex32.clone())),
+                                        ("expires_at".into(), Json::Bool(true)),
+                                    ])])
+                                ),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "skipped_mks".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("key".into(), Json::String(hex32.clone())),
+                                (
+                                    "mks".into(),
+                                    Json::Array(vec![Json::Object(vec![(
+                                        "expires_at".into(),
+                                        Json::Number(1)
+                                    )])])
+                                ),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "skipped_mks".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("key".into(), Json::String(hex32.clone())),
+                                (
+                                    "mks".into(),
+                                    Json::Array(vec![Json::Object(vec![
+                                        ("mk".into(), Json::String("00".into())),
+                                        ("expires_at".into(), Json::Number(1)),
+                                    ])])
+                                ),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "frags".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("tx_id".into(), Json::String(hex32.clone())),
+                                ("conversation_id".into(), Json::String("00".into())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "frags".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("tx_id".into(), Json::String(hex32.clone())),
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("last_i".into(), Json::Null),
+                                (
+                                    "parts".into(),
+                                    Json::Array(vec![Json::Object(vec![(
+                                        "i".into(),
+                                        Json::Bool(true)
+                                    )])])
+                                ),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "frags".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("tx_id".into(), Json::String(hex32.clone())),
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("last_i".into(), Json::Null),
+                                (
+                                    "parts".into(),
+                                    Json::Array(vec![Json::Object(vec![
+                                        ("i".into(), Json::Number(0)),
+                                        ("frag".into(), Json::Number(1)),
+                                    ])])
+                                ),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        let ch = Json::Object(vec![
+            ("kind".into(), Json::String("nostr".into())),
+            ("address".into(), Json::String("wss://relay.example".into())),
+        ]);
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("channel".into(), ch.clone()),
+                                ("watermark".into(), Json::Null),
+                                ("completed".into(), Json::Array(Vec::new())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("channel".into(), ch.clone()),
+                                ("tag_key".into(), Json::String("00".into())),
+                                ("watermark".into(), Json::Null),
+                                ("completed".into(), Json::Array(Vec::new())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("channel".into(), ch.clone()),
+                                ("tag_key".into(), Json::String(hex32.clone())),
+                                ("watermark".into(), Json::Bool(true)),
+                                ("completed".into(), Json::Array(Vec::new())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("channel".into(), ch.clone()),
+                                ("tag_key".into(), Json::String(hex32.clone())),
+                                ("watermark".into(), Json::Null),
+                                ("completed".into(), Json::Number(1)),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "bins".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("channel".into(), ch),
+                                ("tag_key".into(), Json::String(hex32)),
+                                ("watermark".into(), Json::Number(3)),
+                                ("completed".into(), Json::Array(vec![Json::Bool(true)])),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
         engine.lock();
         assert_eq!(
             engine
@@ -3408,5 +4718,767 @@ mod tests {
         );
         let dropped = engine.delete_conversation(state, ids).expect("dc");
         assert!(dropped.state.send_chain_seq(&cid).is_none());
+    }
+
+    #[test]
+    fn ingest_list_merges_notice_and_completes_bin() {
+        use super::super::chain::{join, mk, seal_packet, step};
+        use super::super::codec::ticket_from_json;
+        use super::super::payload::{
+            ConversationSort, PacketPlain, PacketTxFragLast, PacketTxFragMore, PacketXorAck,
+            TICKET_MAX_UNCOMPRESSED,
+        };
+        use super::{Conversation, Handshake, HandshakeInvitee, HandshakeInviter};
+        use crate::protocol::v1::Tag;
+        let mut engine = test_engine();
+        let rng = CounterRng::new();
+        engine
+            .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+            .expect("wrap");
+        let ticked = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("tick");
+        let (created, uid) = engine.create_user(ticked.state, &rng).expect("user");
+        let (created, iid) = engine
+            .create_identity(created.state, &rng, uid, Policy::Classic)
+            .expect("id");
+        let (invited, cid) = engine
+            .create_invite(created.state, &rng, uid, iid, 1_800_000_000, None)
+            .expect("inv");
+        let ids = ConversationRef {
+            user_id: uid,
+            identity_id: iid,
+            conversation_id: cid,
+        };
+        let ticket_s = engine.ticket_host_string(&invited.state, &ids).expect("t");
+        let poll = engine.poll(&invited.state).expect("p");
+        assert_eq!(poll.listen_durable.len(), 3);
+        assert!(poll.listen_ephemeral.is_empty());
+        assert!(poll.list.len() >= 3);
+        for i in 1..poll.list.len() {
+            let a = &poll.list[i - 1];
+            let b = &poll.list[i];
+            assert!(
+                a.channel.kind().as_str() < b.channel.kind().as_str()
+                    || a.channel.kind().as_str() == b.channel.kind().as_str()
+                        && (a.channel.address().as_str() < b.channel.address().as_str()
+                            || a.channel.address().as_str() == b.channel.address().as_str()
+                                && a.tag.as_bytes() <= b.tag.as_bytes())
+            );
+        }
+        let w = &poll.write_durable[0];
+        let bodies: Vec<Vec<u8>> = poll.write_durable.iter().map(|x| x.body.clone()).collect();
+        let invitee_tick = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("itick");
+        let (received, placeholder) = engine
+            .receive_ticket(invitee_tick.state, &rng, uid, iid, &ticket_s)
+            .expect("recv");
+        assert!(matches!(
+            engine
+                .get_conversation(&received.state, uid, iid, placeholder)
+                .expect("q0"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+        ));
+        let empty = engine
+            .ingest_list(received.state.clone(), &rng, w.channel.clone(), w.tag, &[])
+            .expect("empty");
+        assert!(matches!(
+            engine
+                .get_conversation(&empty.state, uid, iid, placeholder)
+                .expect("q1"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+        ));
+        assert_eq!(
+            engine
+                .ingest_packet(
+                    empty.state.clone(),
+                    &rng,
+                    w.channel.clone(),
+                    crate::protocol::v1::Tag::from_bytes([0; 32]),
+                    &bodies[0]
+                )
+                .unwrap_err(),
+            EngineError::UnknownTag
+        );
+        let ingested = engine
+            .ingest_list(empty.state, &rng, w.channel.clone(), w.tag, &bodies)
+            .expect("ing");
+        assert!(!ingested.persist().is_empty());
+        let rows = engine
+            .list_conversations(&ingested.state, uid, iid)
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_id, cid);
+        assert!(matches!(
+            rows[0].conversation,
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::InviteReceived {
+                policy: Policy::Classic,
+                ..
+            }))
+        ));
+        assert!(ingested.state.recv_chain_seq(&cid).is_some());
+        let again = engine
+            .ingest_list(
+                ingested.state.clone(),
+                &rng,
+                w.channel.clone(),
+                w.tag,
+                &bodies,
+            )
+            .expect("dup");
+        assert!(again.persist().is_empty());
+        let snap = engine.fold(ingested.state.clone()).expect("fold");
+        let restored = engine.apply_folded(&snap.snapshot).expect("af");
+        assert_eq!(
+            restored.recv_chain_seq(&cid),
+            ingested.state.recv_chain_seq(&cid)
+        );
+        assert!(matches!(
+            engine
+                .get_conversation(&restored, uid, iid, cid)
+                .expect("qr"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::InviteReceived { .. }))
+        ));
+        let mut collide = ingested.state.clone();
+        let notice_id = *collide
+            .txs
+            .iter()
+            .find(|(_, b)| matches!(b.payload, TxPayload::Notice(_)))
+            .expect("nid")
+            .0;
+        collide.txs.insert(
+            notice_id,
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Confirm,
+            },
+        );
+        assert_eq!(
+            engine
+                .ingest_list(collide, &rng, w.channel.clone(), w.tag, &bodies)
+                .unwrap_err(),
+            EngineError::Equivocation
+        );
+        let mut listed = ingested.state.clone();
+        let locators = engine.poll(&listed).expect("pl").list;
+        for loc in locators {
+            listed = engine
+                .ingest_list(listed, &rng, loc.channel, loc.tag, &[])
+                .expect("catch")
+                .state;
+        }
+        assert_eq!(engine.poll(&listed).expect("pl2").list.len(), 3);
+        listed = engine
+            .ingest_list(listed, &rng, w.channel.clone(), w.tag, &[])
+            .expect("againw")
+            .state;
+        let far = engine.tick(listed, 1_700_000_000 + 80 * 3600).expect("far");
+        let fp = engine.poll(&far.state).expect("fpoll");
+        engine
+            .ingest_list(
+                far.state,
+                &rng,
+                fp.list[0].channel.clone(),
+                fp.list[0].tag,
+                &[],
+            )
+            .expect("prune");
+        let packed = engine.suite.b64u().decode(&ticket_s).expect("dec");
+        let canonical = engine
+            .suite
+            .compress()
+            .decompress(&packed, TICKET_MAX_UNCOMPRESSED)
+            .expect("z");
+        let json = engine.suite.canonical_json().decode(&canonical).expect("j");
+        let ticket = ticket_from_json(engine.suite.b64u(), &json).expect("ticket");
+        let chain = join(
+            engine.suite.hmac(),
+            ticket.secret.as_bytes(),
+            ConversationSort::HandshakeDm,
+            &[],
+        )
+        .expect("join");
+        let tx_id = Tag::from_bytes(notice_id);
+        let more = PacketPlain::TxFragMore(PacketTxFragMore {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            tx_id,
+            frag_i: 0,
+            frag: vec![1],
+        });
+        let last = PacketPlain::TxFragLast(PacketTxFragLast {
+            actor_id: Vec::new(),
+            packet_seq: 1,
+            tx_id,
+            frag_i: 1,
+            frag: vec![2],
+            set_xor: Tag::from_bytes([0; 32]),
+        });
+        let b_more =
+            seal_packet(&engine.suite, &rng, &mk(engine.suite.hmac(), &chain), &more).expect("sm");
+        let chain1 = step(engine.suite.hmac(), &chain);
+        let b_last = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain1),
+            &last,
+        )
+        .expect("sl");
+        let invitee2 = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("t2")
+            .state;
+        let (recv2, ph2) = engine
+            .receive_ticket(invitee2, &rng, uid, iid, &ticket_s)
+            .expect("r2");
+        let partial = engine
+            .ingest_packet(recv2.state, &rng, w.channel.clone(), w.tag, &b_more)
+            .expect("more");
+        assert!(matches!(
+            engine
+                .get_conversation(&partial.state, uid, iid, ph2)
+                .expect("qp"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+        ));
+        let fold_partial = engine.fold(partial.state.clone()).expect("fp");
+        let restored_partial = engine.apply_folded(&fold_partial.snapshot).expect("afp");
+        let skip_first = engine
+            .ingest_packet(restored_partial, &rng, w.channel.clone(), w.tag, &b_last)
+            .expect("last");
+        assert!(matches!(
+            engine
+                .get_conversation(&skip_first.state, uid, iid, ph2)
+                .expect("ql"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+        ));
+        let xor = PacketPlain::XorAck(PacketXorAck {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            set_xor: Tag::from_bytes([1; 32]),
+        });
+        let b_xor =
+            seal_packet(&engine.suite, &rng, &mk(engine.suite.hmac(), &chain), &xor).expect("sx");
+        let invitee3 = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("t3")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("r3");
+        let skipped = engine
+            .ingest_packet(invitee3.0.state, &rng, w.channel.clone(), w.tag, &b_xor)
+            .expect("xor");
+        assert!(matches!(
+            engine
+                .get_conversation(&skipped.state, uid, iid, invitee3.1)
+                .expect("qx"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+        ));
+        let bad_last = PacketPlain::TxFragLast(PacketTxFragLast {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            tx_id: Tag::from_bytes([9; 32]),
+            frag_i: 0,
+            frag: b"not-json".to_vec(),
+            set_xor: Tag::from_bytes([0; 32]),
+        });
+        let b_bad = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain),
+            &bad_last,
+        )
+        .expect("sb");
+        engine
+            .ingest_packet(skipped.state, &rng, w.channel.clone(), w.tag, &b_bad)
+            .expect("bad");
+        let (sync_ok, sid) = engine
+            .create_sync_invite(
+                invited.state.clone(),
+                &rng,
+                Policy::Classic,
+                1_900_000_000,
+                "phone",
+                None,
+            )
+            .expect("sync");
+        let sync_ids = ConversationRef {
+            user_id: uid,
+            identity_id: iid,
+            conversation_id: sid,
+        };
+        let sync_ticket = engine
+            .ticket_host_string(&sync_ok.state, &sync_ids)
+            .expect("st");
+        let sync_poll = engine.poll(&sync_ok.state).expect("sp");
+        let dm_tags: Vec<_> = poll.write_durable.iter().map(|w| w.tag).collect();
+        let sync_writes: Vec<_> = sync_poll
+            .write_durable
+            .iter()
+            .filter(|w| !dm_tags.iter().any(|t| t == &w.tag))
+            .cloned()
+            .collect();
+        let mut acked = sync_ok.state.clone();
+        for write in &sync_poll.write_durable {
+            acked = engine
+                .write_ack(acked, write.channel.clone(), write.tag, &write.body)
+                .expect("sack")
+                .state;
+        }
+        assert!(matches!(
+            engine.get_conversation(&acked, uid, iid, sid).expect("sq"),
+            Conversation::HandshakeSync(Handshake::Inviter(HandshakeInviter::NoticePinned { .. }))
+        ));
+        let sync_invitee = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("stt")
+            .state;
+        let (sync_recv, _) = engine
+            .receive_sync_ticket(sync_invitee, &rng, &sync_ticket)
+            .expect("srt");
+        let sw = &sync_writes[0];
+        let sync_bodies: Vec<Vec<u8>> = sync_writes.iter().map(|x| x.body.clone()).collect();
+        let sync_ing = engine
+            .ingest_list(
+                sync_recv.state,
+                &rng,
+                sw.channel.clone(),
+                sw.tag,
+                &sync_bodies,
+            )
+            .expect("si");
+        let sync_rows = engine
+            .list_conversations(
+                &sync_ing.state,
+                UserId::from_bytes([0; 32]),
+                IdentityId::from_bytes([0; 32]),
+            )
+            .expect("srows");
+        assert!(matches!(
+            sync_rows[0].conversation,
+            Conversation::HandshakeSync(Handshake::Invitee(HandshakeInvitee::InviteReceived {
+                policy: Policy::Classic,
+                ..
+            }))
+        ));
+        let mut leave_state = sync_ing.state.clone();
+        leave_state.skipped_mks.insert(
+            sid.as_bytes().to_vec(),
+            vec![super::super::chain::CachedMk {
+                mk: [2; 32],
+                expires_at: u64::MAX,
+            }],
+        );
+        leave_state.skipped_mks.insert(
+            vec![9],
+            vec![super::super::chain::CachedMk {
+                mk: [8; 32],
+                expires_at: u64::MAX,
+            }],
+        );
+        engine.leave_sync(leave_state, &rng).expect("lsing");
+        let disagree = PacketPlain::TxFragMore(PacketTxFragMore {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            tx_id,
+            frag_i: 0,
+            frag: b"aaaa".to_vec(),
+        });
+        let b_dis = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain),
+            &disagree,
+        )
+        .expect("sd");
+        let (recv_dis, _) = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("td")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("rd");
+        let first_dis = engine
+            .ingest_packet(recv_dis.state, &rng, w.channel.clone(), w.tag, &b_more)
+            .expect("d1");
+        let disagree2 = PacketPlain::TxFragMore(PacketTxFragMore {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            tx_id,
+            frag_i: 0,
+            frag: b"bbbb".to_vec(),
+        });
+        let b_dis2 = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain),
+            &disagree2,
+        )
+        .expect("sd2");
+        assert_eq!(
+            engine
+                .ingest_packet(first_dis.state, &rng, w.channel.clone(), w.tag, &b_dis2)
+                .unwrap_err(),
+            EngineError::Equivocation
+        );
+        let _ = b_dis;
+        assert_eq!(
+            engine
+                .ingest_list(
+                    ingested.state.clone(),
+                    &rng,
+                    w.channel.clone(),
+                    crate::protocol::v1::Tag::from_bytes([2; 32]),
+                    &[]
+                )
+                .unwrap_err(),
+            EngineError::UnknownTag
+        );
+        let other = crate::protocol::v1::DurableChannel::new(
+            crate::protocol::v1::Kind::try_from("blossom").expect("k"),
+            crate::protocol::v1::Address::try_from("https://blob.example").expect("a"),
+        );
+        assert_eq!(
+            engine
+                .ingest_list(ingested.state.clone(), &rng, other, w.tag, &[])
+                .unwrap_err(),
+            EngineError::UnknownTag
+        );
+        let last_hi = PacketPlain::TxFragLast(PacketTxFragLast {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            tx_id,
+            frag_i: 2,
+            frag: vec![1],
+            set_xor: Tag::from_bytes([0; 32]),
+        });
+        let last_hi2 = PacketPlain::TxFragLast(PacketTxFragLast {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            tx_id,
+            frag_i: 3,
+            frag: vec![1],
+            set_xor: Tag::from_bytes([0; 32]),
+        });
+        let b_hi = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain),
+            &last_hi,
+        )
+        .expect("shi");
+        let b_hi2 = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain),
+            &last_hi2,
+        )
+        .expect("shi2");
+        let (recv_hi, _) = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("thi")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("rhi");
+        let partial_hi = engine
+            .ingest_packet(recv_hi.state, &rng, w.channel.clone(), w.tag, &b_hi)
+            .expect("hi");
+        let _ = engine.fold(partial_hi.state.clone()).expect("fhi");
+        engine
+            .apply_folded(
+                &engine
+                    .fold(partial_hi.state.clone())
+                    .expect("fhi2")
+                    .snapshot,
+            )
+            .expect("afhi");
+        assert_eq!(
+            engine
+                .ingest_packet(partial_hi.state, &rng, w.channel.clone(), w.tag, &b_hi2)
+                .unwrap_err(),
+            EngineError::Equivocation
+        );
+        let too_big = PacketPlain::TxFragLast(PacketTxFragLast {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            tx_id: Tag::from_bytes([7; 32]),
+            frag_i: super::super::chain::MAX_FRAGS,
+            frag: vec![1],
+            set_xor: Tag::from_bytes([0; 32]),
+        });
+        let b_big = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain),
+            &too_big,
+        )
+        .expect("sbig");
+        let (recv_big, _) = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("tbig")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("rbig");
+        engine
+            .ingest_packet(recv_big.state, &rng, w.channel.clone(), w.tag, &b_big)
+            .expect("big");
+        let b_null = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain),
+            &PacketPlain::TxFragLast(PacketTxFragLast {
+                actor_id: Vec::new(),
+                packet_seq: 0,
+                tx_id: Tag::from_bytes([6; 32]),
+                frag_i: 0,
+                frag: b"null".to_vec(),
+                set_xor: Tag::from_bytes([0; 32]),
+            }),
+        )
+        .expect("snull");
+        let (recv_null, _) = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("tnull")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("rnull");
+        engine
+            .ingest_packet(recv_null.state, &rng, w.channel.clone(), w.tag, &b_null)
+            .expect("inull");
+        let (recv_cache, phc) = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("tc")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("rc");
+        let cached_first = engine
+            .ingest_packet(recv_cache.state, &rng, w.channel.clone(), w.tag, &b_last)
+            .expect("clast");
+        let cached_second = engine
+            .ingest_packet(cached_first.state, &rng, w.channel.clone(), w.tag, &b_more)
+            .expect("cmore");
+        assert!(matches!(
+            engine
+                .get_conversation(&cached_second.state, uid, iid, phc)
+                .expect("qc"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+        ));
+        engine
+            .tick(cached_second.state, 1_700_000_000 + 172_801)
+            .expect("texp");
+        let mut named = ingested.state.clone();
+        named.txs.insert(
+            [0; 32],
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::EngineCreateUser { user_id: uid },
+            },
+        );
+        assert!(matches!(
+            engine.get_conversation(&named, uid, iid, cid).expect("qn"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::InviteReceived { .. }))
+        ));
+        let mut eph_state = ingested.state.clone();
+        eph_state.eph_writes.push(super::EphemeralWrite {
+            channel: crate::protocol::v1::EphemeralChannel::new(
+                crate::protocol::v1::Kind::try_from("webrtc").expect("wk"),
+                crate::protocol::v1::Address::try_from("https://eph.example").expect("wa"),
+            ),
+            tag: Tag::from_bytes([4; 32]),
+            body: vec![0; crate::protocol::v1::PACKET_LEN],
+        });
+        eph_state.eph_writes.push(super::EphemeralWrite {
+            channel: crate::protocol::v1::EphemeralChannel::new(
+                crate::protocol::v1::Kind::try_from("webrtc").expect("wk2"),
+                crate::protocol::v1::Address::try_from("wss://eph.example").expect("wa2"),
+            ),
+            tag: Tag::from_bytes([5; 32]),
+            body: vec![0; crate::protocol::v1::PACKET_LEN],
+        });
+        eph_state.eph_writes.push(super::EphemeralWrite {
+            channel: crate::protocol::v1::EphemeralChannel::new(
+                crate::protocol::v1::Kind::try_from("webrtc").expect("wk3"),
+                crate::protocol::v1::Address::try_from("https://eph.example").expect("wa3"),
+            ),
+            tag: Tag::from_bytes([6; 32]),
+            body: vec![0; crate::protocol::v1::PACKET_LEN],
+        });
+        let _ = engine.poll(&eph_state).expect("peph");
+        let mut drain = ingested.state.clone();
+        for progress in drain.bin_progress.values_mut() {
+            progress.watermark = Some(472_220);
+            progress.completed.insert(472_221);
+        }
+        let drained = engine
+            .ingest_list(drain, &rng, w.channel.clone(), w.tag, &[])
+            .expect("drain");
+        engine
+            .apply_folded(&engine.fold(drained.state).expect("fdrain").snapshot)
+            .expect("afdrain");
+        let rejected = engine
+            .reject_established(sync_ok.state.clone(), &rng, sync_ids)
+            .expect("srej");
+        assert!(matches!(
+            engine
+                .get_conversation(&rejected.state, uid, iid, sid)
+                .expect("srejq"),
+            Conversation::HandshakeSync(Handshake::Failed(
+                super::FailedReason::ConfirmationRejected
+            ))
+        ));
+        let dummy_more = PacketPlain::TxFragMore(PacketTxFragMore {
+            actor_id: Vec::new(),
+            packet_seq: 1,
+            tx_id: Tag::from_bytes([8; 32]),
+            frag_i: 0,
+            frag: vec![1],
+        });
+        let chain1 = step(engine.suite.hmac(), &chain);
+        let b_dummy = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &chain1),
+            &dummy_more,
+        )
+        .expect("sdummy");
+        let (recv_rk, ph_rk) = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("trk")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("rrk");
+        let with_frag = engine
+            .ingest_packet(recv_rk.state, &rng, w.channel.clone(), w.tag, &b_dummy)
+            .expect("idummy");
+        assert!(!with_frag.state.frags.is_empty());
+        let mut with_frag_state = with_frag.state;
+        with_frag_state.frags.insert(
+            [9; 32],
+            super::FragSet {
+                conversation_id: [1; 32],
+                parts: std::collections::BTreeMap::new(),
+                last_i: None,
+            },
+        );
+        with_frag_state.skipped_mks.insert(
+            ph_rk.as_bytes().to_vec(),
+            vec![super::super::chain::CachedMk {
+                mk: [3; 32],
+                expires_at: u64::MAX,
+            }],
+        );
+        let mut long_key = ph_rk.as_bytes().to_vec();
+        long_key.extend_from_slice(&[7; 8]);
+        with_frag_state.skipped_mks.insert(
+            long_key,
+            vec![super::super::chain::CachedMk {
+                mk: [6; 32],
+                expires_at: u64::MAX,
+            }],
+        );
+        with_frag_state.skipped_mks.insert(
+            [0xff; 32].to_vec(),
+            vec![super::super::chain::CachedMk {
+                mk: [4; 32],
+                expires_at: u64::MAX,
+            }],
+        );
+        with_frag_state.skipped_mks.insert(
+            vec![1, 2],
+            vec![super::super::chain::CachedMk {
+                mk: [5; 32],
+                expires_at: u64::MAX,
+            }],
+        );
+        let rekeyed = engine
+            .ingest_list(with_frag_state, &rng, w.channel.clone(), w.tag, &bodies)
+            .expect("rekeyfrag");
+        let mut drop_state = invited.state.clone();
+        drop_state.recv_chains = rekeyed.state.recv_chains.clone();
+        drop_state.skipped_mks = rekeyed.state.skipped_mks.clone();
+        drop_state.frags = rekeyed.state.frags.clone();
+        engine.delete_conversation(drop_state, ids).expect("deling");
+        let eph_a = crate::protocol::v1::EphemeralChannel::new(
+            crate::protocol::v1::Kind::try_from("webrtc").expect("ska"),
+            crate::protocol::v1::Address::try_from("https://eph.example").expect("saa"),
+        );
+        let eph_b = crate::protocol::v1::EphemeralChannel::new(
+            crate::protocol::v1::Kind::try_from("webrtc").expect("skb"),
+            crate::protocol::v1::Address::try_from("wss://eph.example").expect("sab"),
+        );
+        let mut eph = vec![
+            super::EphemeralWrite {
+                channel: eph_a.clone(),
+                tag: Tag::from_bytes([1; 32]),
+                body: vec![0; crate::protocol::v1::PACKET_LEN],
+            },
+            super::EphemeralWrite {
+                channel: eph_a,
+                tag: Tag::from_bytes([2; 32]),
+                body: vec![0; crate::protocol::v1::PACKET_LEN],
+            },
+            super::EphemeralWrite {
+                channel: eph_b,
+                tag: Tag::from_bytes([1; 32]),
+                body: vec![0; crate::protocol::v1::PACKET_LEN],
+            },
+        ];
+        super::sort_ephemeral_writes(&mut eph);
+        engine.lock();
+        assert_eq!(
+            engine
+                .ingest_list(ingested.state.clone(), &rng, w.channel.clone(), w.tag, &[])
+                .unwrap_err(),
+            EngineError::Locked
+        );
     }
 }

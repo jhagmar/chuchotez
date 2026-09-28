@@ -104,10 +104,13 @@ DEK, `tick`, `create_user`, `create_identity` with a Policy, `create_invite`,
 `ticket_host_string`. Fill `Random32` from a CSPRNG in a real host. After
 `receive_ticket`, the invitee lists the invite tag. `create_invite` posts
 sealed 512-byte `PacketTxFrag` bodies on the handshake sending chain.
-`ingest_list` / `ingest_packet` of reassembled handshake bodies, heal,
-live-path XOR-acks, confirmation digest bytes, and spawning a
-child DM secret from intros are a later slice; those methods exist and fail
-closed (`UnknownTag`, empty digest) until that slice.
+`ingest_list` / `ingest_packet` open those bodies with skip-ahead `mk`,
+reassemble fragments, and merge `DurableBody`. A full durable list completes
+that TimeBin in `BinProgress`. Empty invite-tag snapshot leaves Invitee
+`TicketReceived`; a valid `TxNotice` is `InviteReceived`. Heal, live-path
+XOR-acks, confirmation digest bytes, and spawning a child DM secret from
+intros wait on later slices; `confirmation_digest` is an empty string until
+that slice.
 
 `std_suite` ships HMAC-SHA-256 over `libcrux-hmac` (`LibcruxHmac`), raw
 Deflate over `flate2` (`miniz_oxide`, `Compression::best()`), unpadded
@@ -139,7 +142,6 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 
 ## Later slices
 
-- Reassemble `ingest_list` / `ingest_packet` into `DurableBody` merge.
 - Heal half-xor / want / have.
 - Live path (ephemeral first, persistent after 3 ticked seconds).
 - Confirmation digest and child DM / Sync spawn from intros.
