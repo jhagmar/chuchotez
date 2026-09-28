@@ -688,7 +688,6 @@ pub(crate) fn policy_str(policy: Policy) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn parse_policy(s: &str) -> Option<Policy> {
     match s {
         "Classic" => Some(PolicyEnum::Classic),

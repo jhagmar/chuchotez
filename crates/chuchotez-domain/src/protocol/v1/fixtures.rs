@@ -88,6 +88,9 @@ impl Compress for IdentityCompress {
         if src.len() > max_uncompressed {
             return Err(CompressError::Oversize);
         }
+        if src.starts_with(&[0xfe, 0xfd]) {
+            return Err(CompressError::Codec);
+        }
         let n = src.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         Ok(src[..n].to_vec())
     }
@@ -383,6 +386,9 @@ impl Kem for EchoKem {
         pk: &[u8],
         seed: &KemSeed,
     ) -> Result<(Vec<u8>, Vec<u8>), KemError> {
+        if pk.len() != kem_pk_len(policy) {
+            return Err(KemError::Wrap);
+        }
         let mut shared = [0u8; 32];
         shared.copy_from_slice(&seed.as_bytes()[..32]);
         if let Some(p) = pk.first() {
@@ -526,6 +532,7 @@ mod tests {
         let (ss, ct) = EchoKem
             .wrap(Policy::Classic, keys.public_bytes(), &seed)
             .expect("w");
+        assert!(EchoKem.wrap(Policy::Classic, &[], &seed).is_err());
         assert_eq!(
             EchoKem
                 .unwrap(Policy::Classic, keys.secret_bytes(), &ct)
@@ -546,6 +553,7 @@ mod tests {
         );
         assert_eq!(IdentityCompress.compress(b"x"), b"x");
         assert!(IdentityCompress.decompress(&[0; 8], 4).is_err());
+        assert!(IdentityCompress.decompress(&[0xfe, 0xfd], 8).is_err());
         assert_eq!(
             IdentityCompress.decompress(&[b'a', 0, 0], 8).expect("z"),
             b"a"
