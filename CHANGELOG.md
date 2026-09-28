@@ -19,5 +19,9 @@ channel lists are length 1..=4; ephemeral lists are 0..=4. `PacketPlain`
 alternatives map through `J` / `J⁻¹`. `packed(PacketPlain)` that exceeds
 `PACKET_PAD_LEN` (484) is `BodyTooLarge`. Handshake sending-chain join omits
 `actor_id`; `create_invite` and `create_sync_invite` post 512-byte sealed
-`PacketTxFrag` bodies of `TxNotice` at InviteTag. Group invites use an
+`PacketTxFrag` bodies of `TxNotice` at InviteTag. `ingest_list` /
+`ingest_packet` open those bodies with skip-ahead `mk`, reassemble by `tx_id`
+and `frag_i`, and merge. A full durable list completes that TimeBin in
+`BinProgress`. Empty invite-tag snapshot leaves Invitee `TicketReceived`. A
+valid `TxNotice` is Invitee `InviteReceived`. Group invites use an
 Established DM and have no Ticket, InviteTag, or intake KEM.

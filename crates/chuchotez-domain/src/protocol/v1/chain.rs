@@ -4,7 +4,7 @@ use super::codec::{packed_durable_body, packed_packet, packet_from_json};
 use super::hmac::{HmacSha256, HmacSha256Key, expand};
 use super::payload::{
     ConversationSort, DurableBody, PACKET_LEN, PACKET_MAX_UNCOMPRESSED, PACKET_NONCE_LEN,
-    PACKET_PAD_LEN, PacketPlain, PacketTxFragLast, PacketTxFragMore,
+    PACKET_PAD_LEN, PacketPlain, PacketTxFragLast, PacketTxFragMore, unpad,
 };
 use super::{AeadKey, AeadNonce, Base64Url, ConversationId, EngineError, Json, Suite, Tag};
 use crate::protocol::Rng;
@@ -13,11 +13,8 @@ pub(crate) const MK_LABEL: &[u8] = b"chuchotez/1/packet-mk";
 pub(crate) const STEP_LABEL: &[u8] = b"chuchotez/1/packet-step";
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EPH_MK_LABEL: &[u8] = b"chuchotez/1/eph-mk";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SKIP_AHEAD: u64 = 50;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LATER_EPOCHS: u64 = 8;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MK_CACHE_SECS: u64 = 172_800;
 pub(crate) const MAX_FRAGS: u64 = 64;
 
@@ -40,7 +37,6 @@ impl core::fmt::Debug for SendChain {
 }
 
 /// A skipped `mk` kept until `expires_at` ticked seconds.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct CachedMk {
     pub mk: [u8; 32],
@@ -56,7 +52,6 @@ impl core::fmt::Debug for CachedMk {
 }
 
 /// Successful skip-ahead open.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct Opened {
     pub packet: PacketPlain,
@@ -157,7 +152,6 @@ pub(crate) fn seal_packet(
         .ok_or(EngineError::MalformedPayload)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn open_plain(suite: &Suite, mk_bytes: &[u8; 32], body: &[u8]) -> Result<PacketPlain, EngineError> {
     if body.len() != PACKET_LEN {
         return Err(EngineError::UnknownTag);
@@ -174,9 +168,10 @@ fn open_plain(suite: &Suite, mk_bytes: &[u8; 32], body: &[u8]) -> Result<PacketP
             &body[PACKET_NONCE_LEN..],
         )
         .map_err(|_| EngineError::UnknownTag)?;
+    let packed = unpad(&pt);
     let raw = suite
         .compress()
-        .decompress(&pt, PACKET_MAX_UNCOMPRESSED)
+        .decompress(packed, PACKET_MAX_UNCOMPRESSED)
         .unwrap_or_default();
     let json = suite
         .canonical_json()
@@ -185,7 +180,6 @@ fn open_plain(suite: &Suite, mk_bytes: &[u8; 32], body: &[u8]) -> Result<PacketP
     packet_from_json(suite.b64u(), &json).map_err(|_| EngineError::UnknownTag)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn open_skip_ahead(
     suite: &Suite,
     start: &SendChain,

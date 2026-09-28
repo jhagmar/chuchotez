@@ -6,8 +6,8 @@ The [book](book.md) documents the locked Rust crate. rustdoc is that crate’s
 API reference.
 
 **Shipped** work is in the crates. **Planned** work is decided and waiting on a
-slice. Ingest reassembly, heal, live path, confirmation digest, and
-child-conversation spawn wait on a later slice.
+slice. Heal, live path, confirmation digest, and child-conversation spawn wait
+on a later slice.
 
 The **host** is the app. It supplies `random32`, stores the local log, and talks
 to the network. Chuchotez builds the envelopes.
