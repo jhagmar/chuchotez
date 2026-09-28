@@ -9,16 +9,18 @@ use super::codec::{
     vault_header_to_json,
 };
 use super::hmac::{HmacSha256, HmacSha256Key, expand};
+use super::kem::{KeyPair, kem_ct_len, kem_pk_len};
 use super::payload::{
     BIN_WINDOW, ConversationSort, DurableBody, Hlc, PACKET_MAX_UNCOMPRESSED, PACKET_NONCE_LEN,
-    PERSIST_MAX_UNCOMPRESSED, PacketPlain, TICKET_MAX_UNCOMPRESSED, Ticket, TxEdit, TxMedia,
-    TxNotice, TxPayload, TxReaction, TxText, UnlockSecret, VAULT_M, VAULT_P, VAULT_T, VaultHeader,
-    time_bin,
+    PERSIST_MAX_UNCOMPRESSED, PacketPlain, TICKET_MAX_UNCOMPRESSED, Ticket, TxEdit, TxInviteeIntro,
+    TxInviterIntro, TxMedia, TxNotice, TxPayload, TxReaction, TxText, UnlockSecret, VAULT_M,
+    VAULT_P, VAULT_T, VaultHeader, parse_policy, policy_str, time_bin,
 };
+use super::sign::{SigningKeyPair, sign_pk_len};
 use super::{
     AEAD_NONCE_LEN, Address, AeadKey, AeadNonce, ConversationId, Defaults, DeviceId, DisplayName,
-    DurableChannel, EngineError, EphemeralChannel, IdentityId, Json, KemSeed, Kind, Policy, Secret,
-    SignSeed, Suite, Tag, UserId,
+    DurableChannel, EngineError, EphemeralChannel, IdentityId, Json, KemSeed, Kind, OnWirePrefs,
+    Policy, Secret, SignSeed, Suite, Tag, TagKey, UserId,
 };
 use crate::protocol::Rng;
 use std::cmp::Ordering;
@@ -410,6 +412,11 @@ pub struct EngineState {
     pics: BTreeMap<[u8; 32], Option<super::ProfilePic>>,
     device_name: Option<DisplayName>,
     device_id: Option<DeviceId>,
+    failed: BTreeMap<[u8; 32], FailedReason>,
+    owners: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>,
+    inviters: BTreeSet<[u8; 32]>,
+    device_enc: Option<KeyPair>,
+    device_sign: Option<SigningKeyPair>,
 }
 
 impl EngineState {
@@ -459,6 +466,8 @@ struct FragSet {
     parts: BTreeMap<u64, Vec<u8>>,
     last_i: Option<u64>,
 }
+
+type CallingParts = (DisplayName, Option<super::ProfilePic>, Vec<u8>, Vec<u8>);
 
 struct HandshakeHit {
     cid: [u8; 32],
@@ -860,7 +869,8 @@ impl Engine {
         })
     }
 
-    /// Advance the clock.
+    /// Advance the clock. Stores `InviteExpired` when `now` is past `expires`
+    /// and the handshake is still pre-confirm.
     pub fn tick(&self, mut state: EngineState, now: u64) -> Result<MutateOk, EngineError> {
         let _ = self.require_dek()?;
         if let Some(prev) = state.ticked
@@ -873,6 +883,24 @@ impl Engine {
             entries.retain(|e| e.expires_at > now);
         }
         state.skipped_mks.retain(|_, e| !e.is_empty());
+        let mut expired = Vec::new();
+        for (cid, ticket, _) in handshake_rows(&state) {
+            if state.failed.contains_key(&cid) || now <= ticket.expires {
+                continue;
+            }
+            let conversation_id = ConversationId::from_bytes(cid);
+            let confirmed = state.txs.values().any(|t| {
+                matches!(t.payload, TxPayload::Confirm) && t.conversation_id == conversation_id
+            });
+            if !confirmed {
+                expired.push((cid, ticket.expires));
+            }
+        }
+        for (cid, expires) in expired {
+            state
+                .failed
+                .insert(cid, FailedReason::InviteExpired { expires });
+        }
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -938,6 +966,19 @@ impl Engine {
                     missing: BlockedMissing::DisplayName,
                 });
             }
+        }
+        if state.device_name.is_none()
+            && state
+                .txs
+                .values()
+                .all(|t| !matches!(t.payload, TxPayload::EngineCreateUser { .. }))
+            && !state.sync_tickets.is_empty()
+        {
+            blocked.push(BlockedIdentity {
+                user_id: UserId::from_bytes([0; 32]),
+                identity_id: IdentityId::from_bytes([0; 32]),
+                missing: BlockedMissing::DisplayName,
+            });
         }
         Ok(Poll {
             list,
@@ -1071,7 +1112,7 @@ impl Engine {
     pub fn set_display_name(
         &self,
         state: EngineState,
-        _rng: &dyn Rng,
+        rng: &dyn Rng,
         user_id: UserId,
         identity_id: IdentityId,
         name: &str,
@@ -1088,6 +1129,8 @@ impl Engine {
             }],
         )?;
         ok.state.names.insert(*identity_id.as_bytes(), name);
+        let extra = self.mint_pending_intros(&mut ok.state, rng)?;
+        ok.persist.extend(extra);
         Ok(ok)
     }
 
@@ -1166,6 +1209,11 @@ impl Engine {
         state.next_seq = state.next_seq.saturating_add(1);
         state.txs.insert(tx_id, body);
         state.tickets.insert(*conversation_id.as_bytes(), ticket);
+        state.owners.insert(
+            *conversation_id.as_bytes(),
+            (*user_id.as_bytes(), *identity_id.as_bytes()),
+        );
+        state.inviters.insert(*conversation_id.as_bytes());
         #[rustfmt::skip]
         self.post_handshake_packets(&mut state, rng, conversation_id, &conv_secret, Tag::from_bytes(tx_id))?;
         Ok((
@@ -1230,11 +1278,14 @@ impl Engine {
         identity_id: IdentityId,
         ticket_host_string: &str,
     ) -> Result<(MutateOk, ConversationId), EngineError> {
-        let _ = (user_id, identity_id);
         let _ = Self::require_tick(&state)?;
         let ticket = self.parse_ticket_host_string(ticket_host_string)?;
         let conversation_id = ConversationId::from(rng.random32());
         state.tickets.insert(*conversation_id.as_bytes(), ticket);
+        state.owners.insert(
+            *conversation_id.as_bytes(),
+            (*user_id.as_bytes(), *identity_id.as_bytes()),
+        );
         Ok((
             MutateOk {
                 state,
@@ -1305,6 +1356,9 @@ impl Engine {
         conversation_id: ConversationId,
     ) -> Option<Conversation> {
         if let Some(ticket) = state.tickets.get(conversation_id.as_bytes()) {
+            if let Some(reason) = state.failed.get(conversation_id.as_bytes()) {
+                return Some(Conversation::HandshakeDm(Handshake::Failed(*reason)));
+            }
             let has_confirm = state.txs.values().any(|t| {
                 matches!(t.payload, TxPayload::Confirm) && t.conversation_id == conversation_id
             });
@@ -1326,6 +1380,12 @@ impl Engine {
             )));
         }
         if let Some(ticket) = state.sync_tickets.get(conversation_id.as_bytes()) {
+            if let Some(reason) = state.failed.get(conversation_id.as_bytes()) {
+                return Some(Conversation::HandshakeSync(Handshake::Failed(*reason)));
+            }
+            let has_confirm = state.txs.values().any(|t| {
+                matches!(t.payload, TxPayload::Confirm) && t.conversation_id == conversation_id
+            });
             let has_reject = state.txs.values().any(|t| {
                 matches!(t.payload, TxPayload::Reject) && t.conversation_id == conversation_id
             });
@@ -1333,6 +1393,11 @@ impl Engine {
                 return Some(Conversation::HandshakeSync(Handshake::Failed(
                     FailedReason::ConfirmationRejected,
                 )));
+            }
+            if has_confirm {
+                return Some(Conversation::Synchronization(
+                    SynchronizationQuery::SyncEstablished,
+                ));
             }
             return Some(Conversation::HandshakeSync(self.handshake_at(
                 state,
@@ -1349,36 +1414,52 @@ impl Engine {
         conversation_id: ConversationId,
         ticket: &Ticket,
     ) -> Handshake {
-        let is_inviter = state
-            .send_chains
-            .keys()
-            .any(|k| k.get(..32) == Some(conversation_id.as_bytes().as_slice()));
+        let pending = state
+            .writes
+            .iter()
+            .any(|w| ticket.persistents.iter().any(|ch| ch == &w.channel));
+        let notice = notice_for(state, conversation_id);
+        let invitee_intro = invitee_intro_for(state, conversation_id).is_some();
+        let inviter_intro = inviter_intro_for(state, conversation_id).is_some();
+        let is_inviter = state.inviters.contains(conversation_id.as_bytes());
+        let digest = String::new();
         if is_inviter {
-            let pending = state
-                .writes
-                .iter()
-                .any(|w| ticket.persistents.iter().any(|ch| ch == &w.channel));
-            let inviter = if pending {
-                HandshakeInviter::InviteCreated {
-                    expires: ticket.expires,
+            let expires = ticket.expires;
+            if inviter_intro {
+                if pending {
+                    return Handshake::Inviter(HandshakeInviter::IntroductionMinted { expires });
                 }
-            } else {
-                HandshakeInviter::NoticePinned {
-                    expires: ticket.expires,
-                }
-            };
-            return Handshake::Inviter(inviter);
+                return Handshake::Inviter(HandshakeInviter::Confirming {
+                    expires,
+                    confirmation_digest: digest,
+                });
+            }
+            if pending {
+                return Handshake::Inviter(HandshakeInviter::InviteCreated { expires });
+            }
+            return Handshake::Inviter(HandshakeInviter::NoticePinned { expires });
         }
-        let notice = state.txs.values().find_map(|t| match &t.payload {
-            TxPayload::Notice(n) if t.conversation_id == conversation_id => Some(n),
-            _ => None,
-        });
-        match notice {
-            Some(n) => Handshake::Invitee(HandshakeInvitee::InviteReceived {
+        match (notice, invitee_intro, inviter_intro) {
+            (Some(n), _, true) => Handshake::Invitee(HandshakeInvitee::Confirming {
+                policy: n.policy,
+                expires: n.expires,
+                confirmation_digest: digest,
+            }),
+            (Some(n), true, false) if pending => {
+                Handshake::Invitee(HandshakeInvitee::IntroductionMinted {
+                    policy: n.policy,
+                    expires: n.expires,
+                })
+            }
+            (Some(n), true, false) => Handshake::Invitee(HandshakeInvitee::IntroductionSent {
                 policy: n.policy,
                 expires: n.expires,
             }),
-            None => Handshake::Invitee(HandshakeInvitee::TicketReceived),
+            (Some(n), false, false) => Handshake::Invitee(HandshakeInvitee::InviteReceived {
+                policy: n.policy,
+                expires: n.expires,
+            }),
+            _ => Handshake::Invitee(HandshakeInvitee::TicketReceived),
         }
     }
 
@@ -1409,6 +1490,241 @@ impl Engine {
         self.require_ids(&state, ids)?;
         let secret = self.conv_secret(&state, &ids.conversation_id)?;
         self.mutate_on(state, &secret, ids.conversation_id, vec![payload])
+    }
+
+    fn require_confirming(
+        &self,
+        state: &EngineState,
+        ids: &ConversationRef,
+    ) -> Result<(), EngineError> {
+        match self.conversation_at(state, ids.conversation_id) {
+            Some(Conversation::HandshakeDm(Handshake::Inviter(HandshakeInviter::Confirming {
+                ..
+            })))
+            | Some(Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::Confirming {
+                ..
+            })))
+            | Some(Conversation::HandshakeSync(Handshake::Inviter(
+                HandshakeInviter::Confirming { .. },
+            )))
+            | Some(Conversation::HandshakeSync(Handshake::Invitee(
+                HandshakeInvitee::Confirming { .. },
+            ))) => Ok(()),
+            _ => Err(EngineError::WrongPhase),
+        }
+    }
+
+    fn on_wire_prefs(&self) -> OnWirePrefs {
+        OnWirePrefs {
+            read_receipts: self.defaults.read_receipts(),
+            online_visible: self.defaults.online_visible(),
+            send_typing: self.defaults.send_typing(),
+            disappear_after: self.defaults.disappear_after(),
+            wake: None,
+        }
+    }
+
+    fn identity_keys(
+        &self,
+        state: &EngineState,
+        user_id: &UserId,
+        identity_id: &IdentityId,
+    ) -> Option<(Policy, Vec<u8>, Vec<u8>)> {
+        state.txs.values().find_map(|tx| match &tx.payload {
+            TxPayload::EngineCreateIdentity {
+                user_id: u,
+                identity_id: i,
+                policy,
+                encryption,
+                signing,
+            } if u == user_id && i == identity_id => Some((
+                *policy,
+                encryption.public_bytes().to_vec(),
+                signing.public_bytes().to_vec(),
+            )),
+            _ => None,
+        })
+    }
+
+    fn ensure_device_keys(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        policy: Policy,
+    ) -> Result<(), EngineError> {
+        if state.device_enc.is_none() {
+            state.device_enc = Some(
+                self.suite
+                    .kem()
+                    .generate(policy, &KemSeed::from_pair(rng.random32(), rng.random32()))
+                    .map_err(|_| EngineError::MalformedPayload)?,
+            );
+        }
+        if state.device_sign.is_none() {
+            state.device_sign = Some(
+                self.suite
+                    .sign()
+                    .generate(policy, &SignSeed::from_pair(rng.random32(), rng.random32()))
+                    .map_err(|_| EngineError::MalformedPayload)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn local_calling(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        conversation_id: ConversationId,
+        policy: Policy,
+    ) -> Result<Option<CallingParts>, EngineError> {
+        let cid = *conversation_id.as_bytes();
+        if state.sync_tickets.contains_key(&cid) {
+            #[rustfmt::skip]
+            let Some(name) = state.device_name.clone() else { return Ok(None); };
+            self.ensure_device_keys(state, rng, policy)?;
+            #[rustfmt::skip]
+            let enc = state.device_enc.as_ref().ok_or(EngineError::MalformedPayload)?;
+            #[rustfmt::skip]
+            let sign = state.device_sign.as_ref().ok_or(EngineError::MalformedPayload)?;
+            return Ok(Some((
+                name,
+                None,
+                enc.public_bytes().to_vec(),
+                sign.public_bytes().to_vec(),
+            )));
+        }
+        #[rustfmt::skip]
+        let Some((uid, iid)) = state.owners.get(&cid).copied() else { return Ok(None); };
+        #[rustfmt::skip]
+        let Some(name) = state.names.get(&iid).cloned() else { return Ok(None); };
+        #[rustfmt::skip]
+        let Some((id_policy, enc, sign)) = self.identity_keys(state, &UserId::from_bytes(uid), &IdentityId::from_bytes(iid)) else { return Ok(None); };
+        if id_policy != policy {
+            state
+                .failed
+                .insert(cid, FailedReason::PolicyNotAccepted { policy });
+            return Ok(None);
+        }
+        let pic = state.pics.get(&iid).cloned().flatten();
+        Ok(Some((name, pic, enc, sign)))
+    }
+
+    fn mint_pending_intros(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        let cids: Vec<ConversationId> = handshake_rows(state)
+            .into_iter()
+            .map(|(id, _, _)| ConversationId::from_bytes(id))
+            .collect();
+        let mut persist = Vec::new();
+        for cid in cids {
+            persist.extend(self.try_mint_invitee_intro(state, rng, cid)?);
+            persist.extend(self.try_mint_inviter_intro(state, rng, cid)?);
+        }
+        Ok(persist)
+    }
+
+    fn try_mint_invitee_intro(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        let cid = *conversation_id.as_bytes();
+        if state.failed.contains_key(&cid) || state.inviters.contains(&cid) {
+            return Ok(Vec::new());
+        }
+        if invitee_intro_for(state, conversation_id).is_some() {
+            return Ok(Vec::new());
+        }
+        #[rustfmt::skip]
+        let Some(notice) = notice_for(state, conversation_id).cloned() else { return Ok(Vec::new()); };
+        #[rustfmt::skip]
+        let Some((name, pic, enc, sign)) = self.local_calling(state, rng, conversation_id, notice.policy)? else { return Ok(Vec::new()); };
+        let intake = self
+            .suite
+            .kem()
+            .generate(
+                notice.policy,
+                &KemSeed::from_pair(rng.random32(), rng.random32()),
+            )
+            .map_err(|_| EngineError::MalformedPayload)?;
+        let seed = KemSeed::from_pair(rng.random32(), rng.random32());
+        #[rustfmt::skip]
+        let (_, seed_ct) = self.suite.kem().wrap(notice.policy, &notice.intake_pk, &seed).map_err(|_| EngineError::MalformedPayload)?;
+        let payload = TxPayload::InviteeIntro(TxInviteeIntro {
+            name,
+            profile_pic: pic,
+            send_tag_key: TagKey::from(rng.random32()),
+            eph_send_tag_key: TagKey::from(rng.random32()),
+            encryption_pk: enc,
+            signing_pk: sign,
+            intake_pk: intake.public_bytes().to_vec(),
+            seed_ct,
+            prefs: self.on_wire_prefs(),
+        });
+        let secret = self.conv_secret(state, &conversation_id)?;
+        let (tx_id, _, rec) = self.merge_tx(state, &secret, conversation_id, payload)?;
+        self.post_handshake_packets(state, rng, conversation_id, &secret, Tag::from_bytes(tx_id))?;
+        Ok(vec![rec])
+    }
+
+    fn try_mint_inviter_intro(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<Vec<u8>>, EngineError> {
+        let cid = *conversation_id.as_bytes();
+        if state.failed.contains_key(&cid) || !state.inviters.contains(&cid) {
+            return Ok(Vec::new());
+        }
+        if inviter_intro_for(state, conversation_id).is_some() {
+            return Ok(Vec::new());
+        }
+        #[rustfmt::skip]
+        let Some(invitee) = invitee_intro_for(state, conversation_id).cloned() else { return Ok(Vec::new()); };
+        #[rustfmt::skip]
+        let Some(notice) = notice_for(state, conversation_id).cloned() else { return Ok(Vec::new()); };
+        #[rustfmt::skip]
+        let Some((name, pic, enc, sign)) = self.local_calling(state, rng, conversation_id, notice.policy)? else { return Ok(Vec::new()); };
+        let seed = KemSeed::from_pair(rng.random32(), rng.random32());
+        let (_, seed_ct) = match self
+            .suite
+            .kem()
+            .wrap(notice.policy, &invitee.intake_pk, &seed)
+        {
+            Ok(v) => v,
+            #[rustfmt::skip]
+            Err(_) => { state.failed.insert(cid, FailedReason::IntroVerifyFailed); return Ok(Vec::new()); }
+        };
+        if let Some(ticket) = state
+            .tickets
+            .get(&cid)
+            .or_else(|| state.sync_tickets.get(&cid))
+            .cloned()
+        {
+            state
+                .writes
+                .retain(|w| !ticket.persistents.iter().any(|ch| ch == &w.channel));
+        }
+        let payload = TxPayload::InviterIntro(TxInviterIntro {
+            name,
+            profile_pic: pic,
+            send_tag_key: TagKey::from(rng.random32()),
+            eph_send_tag_key: TagKey::from(rng.random32()),
+            encryption_pk: enc,
+            signing_pk: sign,
+            seed_ct,
+            prefs: self.on_wire_prefs(),
+        });
+        let secret = self.conv_secret(state, &conversation_id)?;
+        let (tx_id, _, rec) = self.merge_tx(state, &secret, conversation_id, payload)?;
+        self.post_handshake_packets(state, rng, conversation_id, &secret, Tag::from_bytes(tx_id))?;
+        Ok(vec![rec])
     }
 
     /// Fold watermark txs into a sealed snapshot.
@@ -1508,6 +1824,39 @@ impl Engine {
                 ),
             ]));
         }
+        let mut failed = Vec::new();
+        for (id, reason) in &state.failed {
+            failed.push(failed_to_json(self.suite.b64u(), id, *reason));
+        }
+        let mut owners = Vec::new();
+        for (id, (uid, iid)) in &state.owners {
+            owners.push(Json::Object(vec![
+                (
+                    "conversation_id".into(),
+                    super::codec::bstr(self.suite.b64u(), id),
+                ),
+                ("user_id".into(), super::codec::bstr(self.suite.b64u(), uid)),
+                (
+                    "identity_id".into(),
+                    super::codec::bstr(self.suite.b64u(), iid),
+                ),
+            ]));
+        }
+        let inviters: Vec<Json> = state
+            .inviters
+            .iter()
+            .map(|id| super::codec::bstr(self.suite.b64u(), id))
+            .collect();
+        let device_enc = state
+            .device_enc
+            .as_ref()
+            .map(|k| keypair_json(self.suite.b64u(), k.public_bytes(), k.secret_bytes()))
+            .unwrap_or(Json::Null);
+        let device_sign = state
+            .device_sign
+            .as_ref()
+            .map(|k| keypair_json(self.suite.b64u(), k.public_bytes(), k.secret_bytes()))
+            .unwrap_or(Json::Null);
         let json = Json::Object(vec![
             ("type".into(), Json::String("v1-engine-snapshot".into())),
             ("next_seq".into(), Json::Number(seq)),
@@ -1522,6 +1871,11 @@ impl Engine {
             ("skipped_mks".into(), Json::Array(skipped)),
             ("frags".into(), Json::Array(frags)),
             ("bins".into(), Json::Array(bins)),
+            ("failed".into(), Json::Array(failed)),
+            ("owners".into(), Json::Array(owners)),
+            ("inviters".into(), Json::Array(inviters)),
+            ("device_enc".into(), device_enc),
+            ("device_sign".into(), device_sign),
         ]);
         let canonical = self.suite.canonical_json().encode(&json);
         (canonical.len() <= PERSIST_MAX_UNCOMPRESSED)
@@ -1573,6 +1927,9 @@ impl Engine {
             .skipped_mks
             .retain(|k, _| k.get(..32) != Some(cid.as_slice()));
         state.frags.retain(|_, f| f.conversation_id != cid);
+        state.failed.remove(&cid);
+        state.owners.remove(&cid);
+        state.inviters.remove(&cid);
         let tag_key = handshake_tag_key(self.suite.hmac(), ticket.secret.as_bytes());
         for ch in &ticket.persistents {
             state.bin_progress.remove(&progress_key(ch, &tag_key));
@@ -1585,7 +1942,9 @@ impl Engine {
     }
 
     /// Ingest a complete durable `list` snapshot. Completes that TimeBin in
-    /// `BinProgress`.
+    /// `BinProgress`. A valid `TxNotice` is `InviteReceived`. A valid intro
+    /// advances IntroductionMinted / Confirming. Unlock and policy failures
+    /// store `FailedReason`.
     pub fn ingest_list(
         &self,
         state: EngineState,
@@ -1692,11 +2051,22 @@ impl Engine {
             .kem()
             .generate(policy, &KemSeed::from_pair(rng.random32(), rng.random32()))
             .map_err(|_| EngineError::MalformedPayload)?;
-        let _ = self
-            .suite
-            .sign()
-            .generate(policy, &SignSeed::from_pair(rng.random32(), rng.random32()))
-            .map_err(|_| EngineError::MalformedPayload)?;
+        if state.device_enc.is_none() {
+            state.device_enc = Some(
+                self.suite
+                    .kem()
+                    .generate(policy, &KemSeed::from_pair(rng.random32(), rng.random32()))
+                    .map_err(|_| EngineError::MalformedPayload)?,
+            );
+        }
+        if state.device_sign.is_none() {
+            state.device_sign = Some(
+                self.suite
+                    .sign()
+                    .generate(policy, &SignSeed::from_pair(rng.random32(), rng.random32()))
+                    .map_err(|_| EngineError::MalformedPayload)?,
+            );
+        }
         let conv_secret = *secret.as_bytes();
         let payload = TxPayload::Notice(TxNotice {
             policy,
@@ -1725,6 +2095,7 @@ impl Engine {
         state
             .sync_tickets
             .insert(*conversation_id.as_bytes(), ticket);
+        state.inviters.insert(*conversation_id.as_bytes());
         state.device_name = Some(name);
         #[rustfmt::skip]
         self.post_handshake_packets(&mut state, rng, conversation_id, &conv_secret, Tag::from_bytes(tx_id))?;
@@ -1773,7 +2144,7 @@ impl Engine {
     pub fn set_device_name(
         &self,
         mut state: EngineState,
-        _rng: &dyn Rng,
+        rng: &dyn Rng,
         name: &str,
     ) -> Result<MutateOk, EngineError> {
         let name = DisplayName::try_from(name).map_err(|_| EngineError::MalformedDisplayName)?;
@@ -1786,6 +2157,8 @@ impl Engine {
         match ok {
             Ok(mut m) => {
                 m.state.device_name = Some(name);
+                let extra = self.mint_pending_intros(&mut m.state, rng)?;
+                m.persist.extend(extra);
                 Ok(m)
             }
             Err(EngineError::NotTicked) => {
@@ -1834,6 +2207,11 @@ impl Engine {
         state.send_chains.retain(|k, _| drop_sync(k));
         state.recv_chains.retain(|k, _| drop_sync(k));
         state.skipped_mks.retain(|k, _| drop_sync(k));
+        for id in &sync_ids {
+            state.failed.remove(id);
+            state.owners.remove(id);
+            state.inviters.remove(id);
+        }
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -1891,23 +2269,44 @@ impl Engine {
         )
     }
 
-    /// Confirm a handshake fingerprint.
+    /// Confirm a handshake fingerprint. Legal on `Confirming`.
     pub fn confirm_established(
         &self,
         state: EngineState,
         _rng: &dyn Rng,
         ids: ConversationRef,
     ) -> Result<MutateOk, EngineError> {
+        self.require_confirming(&state, &ids)?;
+        if state
+            .sync_tickets
+            .contains_key(ids.conversation_id.as_bytes())
+        {
+            let secret = self.conv_secret(&state, &ids.conversation_id)?;
+            return self.mutate_on(
+                state,
+                &secret,
+                ids.conversation_id,
+                vec![TxPayload::Confirm],
+            );
+        }
         self.mint_on(state, &ids, TxPayload::Confirm)
     }
 
-    /// Reject a handshake fingerprint.
+    /// Reject a handshake fingerprint. Legal on `Confirming`.
     pub fn reject_established(
         &self,
         state: EngineState,
         _rng: &dyn Rng,
         ids: ConversationRef,
     ) -> Result<MutateOk, EngineError> {
+        self.require_confirming(&state, &ids)?;
+        if state
+            .sync_tickets
+            .contains_key(ids.conversation_id.as_bytes())
+        {
+            let secret = self.conv_secret(&state, &ids.conversation_id)?;
+            return self.mutate_on(state, &secret, ids.conversation_id, vec![TxPayload::Reject]);
+        }
         self.mint_on(state, &ids, TxPayload::Reject)
     }
 
@@ -2572,6 +2971,54 @@ impl Engine {
         } else if get("bins").is_some() {
             return Err(EngineError::MalformedPersist);
         }
+        if let Some(Json::Array(items)) = get("failed") {
+            for item in items {
+                let (cid, reason) = parse_failed(self.suite.b64u(), item)?;
+                state.failed.insert(cid, reason);
+            }
+        } else if get("failed").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
+        if let Some(Json::Array(items)) = get("owners") {
+            for item in items {
+                let Json::Object(m) = item else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                #[rustfmt::skip]
+                let cid = decode_fold32(self.suite.b64u(), getm("conversation_id").ok_or(EngineError::MalformedPersist)?)?;
+                #[rustfmt::skip]
+                let uid = decode_fold32(self.suite.b64u(), getm("user_id").ok_or(EngineError::MalformedPersist)?)?;
+                #[rustfmt::skip]
+                let iid = decode_fold32(self.suite.b64u(), getm("identity_id").ok_or(EngineError::MalformedPersist)?)?;
+                state.owners.insert(cid, (uid, iid));
+            }
+        } else if get("owners").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
+        if let Some(Json::Array(items)) = get("inviters") {
+            for item in items {
+                state
+                    .inviters
+                    .insert(decode_fold32(self.suite.b64u(), item)?);
+            }
+        } else if get("inviters").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
+        match get("device_enc") {
+            Some(Json::Null) | None => {}
+            Some(v) => {
+                let (pk, sk) = parse_fold_keypair(self.suite.b64u(), v)?;
+                state.device_enc = Some(KeyPair::from_parts(pk, sk));
+            }
+        }
+        match get("device_sign") {
+            Some(Json::Null) | None => {}
+            Some(v) => {
+                let (pk, sk) = parse_fold_keypair(self.suite.b64u(), v)?;
+                state.device_sign = Some(SigningKeyPair::from_parts(pk, sk));
+            }
+        }
         Ok(state)
     }
 
@@ -2629,13 +3076,13 @@ impl Engine {
     fn ingest_known_body(
         &self,
         state: &mut EngineState,
-        _rng: &dyn Rng,
+        rng: &dyn Rng,
         hits: &[HandshakeHit],
         body: &[u8],
     ) -> Result<Vec<Vec<u8>>, EngineError> {
         let now = Self::require_tick(state)?;
         for hit in hits {
-            match self.open_and_merge(state, hit, now, body) {
+            match self.open_and_merge(state, rng, hit, now, body) {
                 Ok(persist) => return Ok(persist),
                 Err(EngineError::UnknownTag) => {}
                 Err(e) => return Err(e),
@@ -2647,10 +3094,20 @@ impl Engine {
     fn open_and_merge(
         &self,
         state: &mut EngineState,
+        rng: &dyn Rng,
         hit: &HandshakeHit,
         now: u64,
         body: &[u8],
     ) -> Result<Vec<Vec<u8>>, EngineError> {
+        if matches!(
+            state.failed.get(&hit.cid),
+            Some(FailedReason::InviteExpired { .. })
+        ) {
+            return Err(EngineError::WrongPhase);
+        }
+        if state.failed.contains_key(&hit.cid) {
+            return Err(EngineError::UnknownTag);
+        }
         let key = chain_key(&ConversationId::from_bytes(hit.cid), &[]);
         let start = join(self.suite.hmac(), &hit.secret, hit.sort, &[])?;
         let mut cached = state.skipped_mks.get(&key).cloned().unwrap_or_default();
@@ -2704,18 +3161,24 @@ impl Engine {
             packed.extend_from_slice(&set.parts[&i]);
         }
         state.frags.remove(&part.tx_id);
-        let canonical = self
+        let canonical = match self
             .suite
             .compress()
             .decompress(&packed, PACKET_MAX_UNCOMPRESSED)
-            .unwrap_or_default();
+        {
+            Ok(c) => c,
+            #[rustfmt::skip]
+            Err(_) => { store_unlock_failed(state, hit.cid); return Ok(Vec::new()); }
+        };
         let json = match self.suite.canonical_json().decode(&canonical) {
             Ok(j) => j,
-            Err(_) => return Ok(Vec::new()),
+            #[rustfmt::skip]
+            Err(_) => { store_unlock_failed(state, hit.cid); return Ok(Vec::new()); }
         };
         let durable = match durable_body_from_json(self.suite.b64u(), &json) {
             Ok(b) => b,
-            Err(()) => return Ok(Vec::new()),
+            #[rustfmt::skip]
+            Err(()) => { store_unlock_failed(state, hit.cid); return Ok(Vec::new()); }
         };
         if *durable.conversation_id.as_bytes() != hit.cid {
             rekey_conversation(state, hit.cid, *durable.conversation_id.as_bytes());
@@ -2726,10 +3189,91 @@ impl Engine {
             }
             return Err(EngineError::Equivocation);
         }
+        let cid = *durable.conversation_id.as_bytes();
+        if let Some(extra) = self.handshake_ingest_gate(state, cid, &durable.payload)? {
+            return Ok(extra);
+        }
         let persist = self.persist_record(state.next_seq, &durable)?;
         state.next_seq = state.next_seq.saturating_add(1);
         state.txs.insert(part.tx_id, durable);
-        Ok(vec![persist])
+        let conversation_id = ConversationId::from_bytes(cid);
+        let mut out = vec![persist];
+        out.extend(self.try_mint_invitee_intro(state, rng, conversation_id)?);
+        out.extend(self.try_mint_inviter_intro(state, rng, conversation_id)?);
+        Ok(out)
+    }
+
+    fn handshake_ingest_gate(
+        &self,
+        state: &mut EngineState,
+        cid: [u8; 32],
+        payload: &TxPayload,
+    ) -> Result<Option<Vec<Vec<u8>>>, EngineError> {
+        let conversation_id = ConversationId::from_bytes(cid);
+        match payload {
+            TxPayload::Notice(n) => {
+                if let Some(existing) = notice_for(state, conversation_id)
+                    && existing != n
+                {
+                    state.failed.insert(cid, FailedReason::NoticeConflict);
+                    return Ok(Some(Vec::new()));
+                }
+                if let Some((uid, iid)) = state.owners.get(&cid).copied()
+                    && let Ok(policy) = self.identity_policy(
+                        state,
+                        &UserId::from_bytes(uid),
+                        &IdentityId::from_bytes(iid),
+                    )
+                    && policy != n.policy
+                {
+                    state
+                        .failed
+                        .insert(cid, FailedReason::PolicyNotAccepted { policy: n.policy });
+                }
+                Ok(None)
+            }
+            TxPayload::InviteeIntro(i) => {
+                if invitee_intro_for(state, conversation_id).is_some() {
+                    state.failed.insert(cid, FailedReason::DuplicateIntro);
+                    return Ok(Some(Vec::new()));
+                }
+                let Some(notice) = notice_for(state, conversation_id) else {
+                    state.failed.insert(cid, FailedReason::IntroVerifyFailed);
+                    return Ok(Some(Vec::new()));
+                };
+                if !intro_keys_ok(
+                    notice.policy,
+                    &i.encryption_pk,
+                    &i.signing_pk,
+                    Some(&i.intake_pk),
+                    &i.seed_ct,
+                ) {
+                    state.failed.insert(cid, FailedReason::IntroVerifyFailed);
+                    return Ok(Some(Vec::new()));
+                }
+                Ok(None)
+            }
+            TxPayload::InviterIntro(i) => {
+                if inviter_intro_for(state, conversation_id).is_some() {
+                    state.failed.insert(cid, FailedReason::DuplicateIntro);
+                    return Ok(Some(Vec::new()));
+                }
+                #[rustfmt::skip]
+                let Some(notice) = notice_for(state, conversation_id) else { state.failed.insert(cid, FailedReason::IntroVerifyFailed); return Ok(Some(Vec::new())); };
+                if !intro_keys_ok(
+                    notice.policy,
+                    &i.encryption_pk,
+                    &i.signing_pk,
+                    None,
+                    &i.seed_ct,
+                ) {
+                    state.failed.insert(cid, FailedReason::IntroVerifyFailed);
+                    return Ok(Some(Vec::new()));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn complete_list_bin(
@@ -2767,6 +3311,59 @@ impl Engine {
             }
         }
     }
+}
+
+fn notice_for(state: &EngineState, conversation_id: ConversationId) -> Option<&TxNotice> {
+    state.txs.values().find_map(|t| match &t.payload {
+        TxPayload::Notice(n) if t.conversation_id == conversation_id => Some(n),
+        _ => None,
+    })
+}
+
+fn invitee_intro_for(
+    state: &EngineState,
+    conversation_id: ConversationId,
+) -> Option<&TxInviteeIntro> {
+    state.txs.values().find_map(|t| match &t.payload {
+        TxPayload::InviteeIntro(i) if t.conversation_id == conversation_id => Some(i),
+        _ => None,
+    })
+}
+
+fn inviter_intro_for(
+    state: &EngineState,
+    conversation_id: ConversationId,
+) -> Option<&TxInviterIntro> {
+    state.txs.values().find_map(|t| match &t.payload {
+        TxPayload::InviterIntro(i) if t.conversation_id == conversation_id => Some(i),
+        _ => None,
+    })
+}
+
+fn intro_keys_ok(
+    policy: Policy,
+    encryption_pk: &[u8],
+    signing_pk: &[u8],
+    intake_pk: Option<&[u8]>,
+    seed_ct: &[u8],
+) -> bool {
+    encryption_pk.len() == kem_pk_len(policy)
+        && signing_pk.len() == sign_pk_len(policy)
+        && seed_ct.len() == kem_ct_len(policy)
+        && intake_pk.is_none_or(|pk| pk.len() == kem_pk_len(policy))
+}
+
+fn store_unlock_failed(state: &mut EngineState, cid: [u8; 32]) {
+    if state.failed.contains_key(&cid) {
+        return;
+    }
+    let conversation_id = ConversationId::from_bytes(cid);
+    let reason = if notice_for(state, conversation_id).is_some() || state.inviters.contains(&cid) {
+        FailedReason::IntroUnlockFailed
+    } else {
+        FailedReason::NoticeUnlockFailed
+    };
+    state.failed.insert(cid, reason);
 }
 
 fn handshake_rows(state: &EngineState) -> Vec<([u8; 32], Ticket, ConversationSort)> {
@@ -2928,6 +3525,15 @@ fn rekey_conversation(state: &mut EngineState, from: [u8; 32], to: [u8; 32]) {
     if let Some(t) = state.sync_tickets.remove(&from) {
         state.sync_tickets.insert(to, t);
     }
+    if let Some(v) = state.failed.remove(&from) {
+        state.failed.insert(to, v);
+    }
+    if let Some(v) = state.owners.remove(&from) {
+        state.owners.insert(to, v);
+    }
+    if state.inviters.remove(&from) {
+        state.inviters.insert(to);
+    }
     rekey_prefix(&mut state.send_chains, from, to);
     rekey_prefix(&mut state.recv_chains, from, to);
     rekey_prefix(&mut state.skipped_mks, from, to);
@@ -2959,6 +3565,105 @@ fn decode_fold32(b64u: &dyn super::Base64Url, value: &Json) -> Result<[u8; 32], 
     decode_fold_bstr(b64u, value)?
         .try_into()
         .map_err(|_| EngineError::MalformedPersist)
+}
+
+fn keypair_json(b64u: &dyn super::Base64Url, pk: &[u8], sk: &[u8]) -> Json {
+    Json::Object(vec![
+        ("pk".into(), super::codec::bstr(b64u, pk)),
+        ("sk".into(), super::codec::bstr(b64u, sk)),
+    ])
+}
+
+fn parse_fold_keypair(
+    b64u: &dyn super::Base64Url,
+    value: &Json,
+) -> Result<(Vec<u8>, Vec<u8>), EngineError> {
+    let Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let get = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+    let pk = decode_fold_bstr(b64u, get("pk").ok_or(EngineError::MalformedPersist)?)?;
+    let sk = decode_fold_bstr(b64u, get("sk").ok_or(EngineError::MalformedPersist)?)?;
+    Ok((pk, sk))
+}
+
+fn failed_to_json(b64u: &dyn super::Base64Url, id: &[u8; 32], reason: FailedReason) -> Json {
+    let mut members = vec![
+        ("conversation_id".into(), super::codec::bstr(b64u, id)),
+        (
+            "reason".into(),
+            Json::String(
+                match reason {
+                    FailedReason::PolicyNotAccepted { .. } => "PolicyNotAccepted",
+                    FailedReason::InviteExpired { .. } => "InviteExpired",
+                    FailedReason::NoticeUnlockFailed => "NoticeUnlockFailed",
+                    FailedReason::NoticeConflict => "NoticeConflict",
+                    FailedReason::IntroUnlockFailed => "IntroUnlockFailed",
+                    FailedReason::IntroVerifyFailed => "IntroVerifyFailed",
+                    FailedReason::DuplicateIntro => "DuplicateIntro",
+                    FailedReason::ConfirmationRejected => "ConfirmationRejected",
+                    FailedReason::Equivocation => "Equivocation",
+                    FailedReason::OfferRejected => "OfferRejected",
+                    FailedReason::Kicked => "Kicked",
+                    FailedReason::Left => "Left",
+                }
+                .into(),
+            ),
+        ),
+    ];
+    match reason {
+        FailedReason::PolicyNotAccepted { policy } => {
+            members.push(("policy".into(), Json::String(policy_str(policy).into())));
+        }
+        FailedReason::InviteExpired { expires } => {
+            members.push(("expires".into(), Json::Number(expires)));
+        }
+        _ => {}
+    }
+    Json::Object(members)
+}
+
+fn parse_failed(
+    b64u: &dyn super::Base64Url,
+    value: &Json,
+) -> Result<([u8; 32], FailedReason), EngineError> {
+    let Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let get = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+    #[rustfmt::skip]
+    let cid = decode_fold32(b64u, get("conversation_id").ok_or(EngineError::MalformedPersist)?)?;
+    let Json::String(reason) = get("reason").ok_or(EngineError::MalformedPersist)? else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let parsed = match reason.as_str() {
+        "PolicyNotAccepted" => {
+            let Json::String(p) = get("policy").ok_or(EngineError::MalformedPersist)? else {
+                return Err(EngineError::MalformedPersist);
+            };
+            FailedReason::PolicyNotAccepted {
+                policy: parse_policy(p).ok_or(EngineError::MalformedPersist)?,
+            }
+        }
+        "InviteExpired" => {
+            let Json::Number(expires) = get("expires").ok_or(EngineError::MalformedPersist)? else {
+                return Err(EngineError::MalformedPersist);
+            };
+            FailedReason::InviteExpired { expires: *expires }
+        }
+        "NoticeUnlockFailed" => FailedReason::NoticeUnlockFailed,
+        "NoticeConflict" => FailedReason::NoticeConflict,
+        "IntroUnlockFailed" => FailedReason::IntroUnlockFailed,
+        "IntroVerifyFailed" => FailedReason::IntroVerifyFailed,
+        "DuplicateIntro" => FailedReason::DuplicateIntro,
+        "ConfirmationRejected" => FailedReason::ConfirmationRejected,
+        "Equivocation" => FailedReason::Equivocation,
+        "OfferRejected" => FailedReason::OfferRejected,
+        "Kicked" => FailedReason::Kicked,
+        "Left" => FailedReason::Left,
+        _ => return Err(EngineError::MalformedPersist),
+    };
+    Ok((cid, parsed))
 }
 
 fn parse_fold_channel(value: &Json) -> Result<DurableChannel, EngineError> {
@@ -3120,12 +3825,18 @@ mod tests {
                 super::HandshakeInviter::NoticePinned { .. }
             ))
         ));
-        engine
-            .confirm_established(acked.state.clone(), &rng, ids)
-            .expect("conf");
-        engine
-            .reject_established(acked.state.clone(), &rng, ids)
-            .expect("rej");
+        assert_eq!(
+            engine
+                .confirm_established(acked.state.clone(), &rng, ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
+        assert_eq!(
+            engine
+                .reject_established(acked.state.clone(), &rng, ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
         engine
             .send_text(acked.state.clone(), &rng, ids, "hi", None)
             .expect("txt");
@@ -3438,29 +4149,18 @@ mod tests {
             identity_id: iid,
             conversation_id: cid,
         };
-        engine
-            .confirm_established(invited.state.clone(), &rng, ids)
-            .expect("c");
-        let confirmed = engine
-            .confirm_established(invited.state.clone(), &rng, ids)
-            .expect("c2");
-        assert!(matches!(
+        assert_eq!(
             engine
-                .get_conversation(&confirmed.state, uid, iid, cid)
-                .expect("q"),
-            super::Conversation::DirectMessage(super::DirectMessageQuery::Established)
-        ));
-        let rejected = engine
-            .reject_established(invited.state.clone(), &rng, ids)
-            .expect("r");
-        assert!(matches!(
+                .confirm_established(invited.state.clone(), &rng, ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
+        assert_eq!(
             engine
-                .get_conversation(&rejected.state, uid, iid, cid)
-                .expect("qf"),
-            super::Conversation::HandshakeDm(super::Handshake::Failed(
-                super::FailedReason::ConfirmationRejected
-            ))
-        ));
+                .reject_established(invited.state.clone(), &rng, ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
         let media = engine
             .send_media(
                 invited.state.clone(),
@@ -3665,12 +4365,12 @@ mod tests {
                 .unwrap_err(),
             EngineError::UnlockFailed
         );
-        engine
-            .confirm_established(invited.state.clone(), &rng, ids)
-            .expect("c3");
-        engine
-            .confirm_established(invited.state.clone(), &rng, ids)
-            .expect("c4");
+        assert_eq!(
+            engine
+                .confirm_established(invited.state.clone(), &rng, ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
         let once = engine
             .send_text(invited.state.clone(), &rng, ids, "hi", None)
             .expect("txt1");
@@ -4490,9 +5190,183 @@ mod tests {
                             "bins".into(),
                             Json::Array(vec![Json::Object(vec![
                                 ("channel".into(), ch),
-                                ("tag_key".into(), Json::String(hex32)),
+                                ("tag_key".into(), Json::String(hex32.clone())),
                                 ("watermark".into(), Json::Number(3)),
                                 ("completed".into(), Json::Array(vec![Json::Bool(true)])),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("failed".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("owners".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("inviters".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("failed".into(), Json::Array(vec![Json::Bool(true)])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("owners".into(), Json::Array(vec![Json::Bool(true)])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "failed".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("reason".into(), Json::String("nope".into())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "failed".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("reason".into(), Json::String("PolicyNotAccepted".into())),
+                                ("policy".into(), Json::String("nope".into())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("device_enc".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "failed".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("reason".into(), Json::Number(1)),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "failed".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("reason".into(), Json::String("InviteExpired".into())),
+                            ])])
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "failed".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("reason".into(), Json::String("PolicyNotAccepted".into())),
                             ])])
                         ),
                     ]),
@@ -4728,7 +5602,7 @@ mod tests {
             ConversationSort, PacketPlain, PacketTxFragLast, PacketTxFragMore, PacketXorAck,
             TICKET_MAX_UNCOMPRESSED,
         };
-        use super::{Conversation, Handshake, HandshakeInvitee, HandshakeInviter};
+        use super::{Conversation, FailedReason, Handshake, HandshakeInvitee, HandshakeInviter};
         use crate::protocol::v1::Tag;
         let mut engine = test_engine();
         let rng = CounterRng::new();
@@ -4954,7 +5828,7 @@ mod tests {
             engine
                 .get_conversation(&skip_first.state, uid, iid, ph2)
                 .expect("ql"),
-            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+            Conversation::HandshakeDm(Handshake::Failed(FailedReason::NoticeUnlockFailed))
         ));
         let xor = PacketPlain::XorAck(PacketXorAck {
             actor_id: Vec::new(),
@@ -4999,9 +5873,15 @@ mod tests {
             &bad_last,
         )
         .expect("sb");
-        engine
+        let bad = engine
             .ingest_packet(skipped.state, &rng, w.channel.clone(), w.tag, &b_bad)
             .expect("bad");
+        assert!(matches!(
+            engine
+                .get_conversation(&bad.state, uid, iid, invitee3.1)
+                .expect("qbad"),
+            Conversation::HandshakeDm(Handshake::Failed(FailedReason::NoticeUnlockFailed))
+        ));
         let (sync_ok, sid) = engine
             .create_sync_invite(
                 invited.state.clone(),
@@ -5300,7 +6180,7 @@ mod tests {
             engine
                 .get_conversation(&cached_second.state, uid, iid, phc)
                 .expect("qc"),
-            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::TicketReceived))
+            Conversation::HandshakeDm(Handshake::Failed(FailedReason::NoticeUnlockFailed))
         ));
         engine
             .tick(cached_second.state, 1_700_000_000 + 172_801)
@@ -5358,17 +6238,12 @@ mod tests {
         engine
             .apply_folded(&engine.fold(drained.state).expect("fdrain").snapshot)
             .expect("afdrain");
-        let rejected = engine
-            .reject_established(sync_ok.state.clone(), &rng, sync_ids)
-            .expect("srej");
-        assert!(matches!(
+        assert_eq!(
             engine
-                .get_conversation(&rejected.state, uid, iid, sid)
-                .expect("srejq"),
-            Conversation::HandshakeSync(Handshake::Failed(
-                super::FailedReason::ConfirmationRejected
-            ))
-        ));
+                .reject_established(sync_ok.state.clone(), &rng, sync_ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
         let dummy_more = PacketPlain::TxFragMore(PacketTxFragMore {
             actor_id: Vec::new(),
             packet_seq: 1,
@@ -5480,5 +6355,951 @@ mod tests {
                 .unwrap_err(),
             EngineError::Locked
         );
+    }
+
+    fn ack_all(engine: &Engine, mut state: EngineState) -> EngineState {
+        loop {
+            let poll = engine.poll(&state).expect("p");
+            if poll.write_durable.is_empty() {
+                return state;
+            }
+            for w in poll.write_durable {
+                state = engine
+                    .write_ack(state, w.channel, w.tag, &w.body)
+                    .expect("ack")
+                    .state;
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_intros_confirming_and_failures() {
+        use super::super::chain::{fragment_body, join, mk, packed_tx, seal_packet, step};
+        use super::super::codec::ticket_from_json;
+        use super::super::payload::{
+            ConversationSort, PacketPlain, PacketTxFragLast, TxInviteeIntro, TxNotice,
+        };
+        use super::{
+            Conversation, ConversationRef, DirectMessageQuery, FailedReason, Handshake,
+            HandshakeInvitee, HandshakeInviter,
+        };
+        use crate::protocol::v1::{DisplayName, OnWirePrefs, Tag, TagKey};
+        let mut engine = test_engine();
+        let rng = CounterRng::new();
+        engine
+            .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+            .expect("wrap");
+        let ticked = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("tick");
+        let (created, uid) = engine.create_user(ticked.state, &rng).expect("user");
+        let (created, iid) = engine
+            .create_identity(created.state, &rng, uid, Policy::Classic)
+            .expect("id");
+        let named = engine
+            .set_display_name(created.state, &rng, uid, iid, "Ada")
+            .expect("name");
+        let (invited, cid) = engine
+            .create_invite(named.state, &rng, uid, iid, 1_800_000_000, None)
+            .expect("inv");
+        let ids = ConversationRef {
+            user_id: uid,
+            identity_id: iid,
+            conversation_id: cid,
+        };
+        let ticket_s = engine.ticket_host_string(&invited.state, &ids).expect("t");
+        let notice_writes: Vec<_> = engine
+            .poll(&invited.state)
+            .expect("p")
+            .write_durable
+            .into_iter()
+            .map(|w| (w.channel, w.tag, w.body))
+            .collect();
+        let mut pending_inviter = invited.state.clone();
+        let inviter = ack_all(&engine, invited.state);
+        assert!(matches!(
+            engine.get_conversation(&inviter, uid, iid, cid).expect("q"),
+            Conversation::HandshakeDm(Handshake::Inviter(HandshakeInviter::NoticePinned { .. }))
+        ));
+        let ie_tick = engine.tick(EngineState::new(), 1_700_000_000).expect("it");
+        let (ie_user, ie_uid) = engine.create_user(ie_tick.state, &rng).expect("iu");
+        let (ie_id, ie_iid) = engine
+            .create_identity(ie_user.state, &rng, ie_uid, Policy::Classic)
+            .expect("ii");
+        let ie_named = engine
+            .set_display_name(ie_id.state, &rng, ie_uid, ie_iid, "Bob")
+            .expect("in");
+        let (received, ie_cid) = engine
+            .receive_ticket(ie_named.state, &rng, ie_uid, ie_iid, &ticket_s)
+            .expect("recv");
+        let mut ticket_recv = received.state.clone();
+        let (ch, tag, _) = notice_writes[0].clone();
+        let bodies: Vec<Vec<u8>> = notice_writes.iter().map(|w| w.2.clone()).collect();
+        let minted = engine
+            .ingest_list(received.state, &rng, ch.clone(), tag, &bodies)
+            .expect("ing");
+        assert!(matches!(
+            engine
+                .get_conversation(&minted.state, ie_uid, ie_iid, cid)
+                .expect("ir"),
+            Conversation::HandshakeDm(Handshake::Invitee(
+                HandshakeInvitee::IntroductionMinted { .. }
+            ))
+        ));
+        let intro_writes: Vec<_> = engine
+            .poll(&minted.state)
+            .expect("ip")
+            .write_durable
+            .into_iter()
+            .map(|w| (w.channel, w.tag, w.body))
+            .collect();
+        let sent = ack_all(&engine, minted.state);
+        assert!(matches!(
+            engine
+                .get_conversation(&sent, ie_uid, ie_iid, cid)
+                .expect("is"),
+            Conversation::HandshakeDm(Handshake::Invitee(
+                HandshakeInvitee::IntroductionSent { .. }
+            ))
+        ));
+        let intro_bodies: Vec<Vec<u8>> = intro_writes.iter().map(|w| w.2.clone()).collect();
+        let pinned = inviter.clone();
+        let inv_minted = engine
+            .ingest_list(
+                inviter,
+                &rng,
+                intro_writes[0].0.clone(),
+                intro_writes[0].1,
+                &intro_bodies,
+            )
+            .expect("iing");
+        assert!(matches!(
+            engine
+                .get_conversation(&inv_minted.state, uid, iid, cid)
+                .expect("im"),
+            Conversation::HandshakeDm(Handshake::Inviter(
+                HandshakeInviter::IntroductionMinted { .. }
+            ))
+        ));
+        let inv_intro_writes: Vec<_> = engine
+            .poll(&inv_minted.state)
+            .expect("iip")
+            .write_durable
+            .into_iter()
+            .map(|w| (w.channel, w.tag, w.body))
+            .collect();
+        let inv_conf = ack_all(&engine, inv_minted.state);
+        assert!(matches!(
+            engine
+                .get_conversation(&inv_conf, uid, iid, cid)
+                .expect("ic"),
+            Conversation::HandshakeDm(Handshake::Inviter(HandshakeInviter::Confirming {
+                confirmation_digest: ref d,
+                ..
+            })) if d.is_empty()
+        ));
+        let ie_conf = engine
+            .ingest_list(
+                sent,
+                &rng,
+                inv_intro_writes[0].0.clone(),
+                inv_intro_writes[0].1,
+                &inv_intro_writes
+                    .iter()
+                    .map(|w| w.2.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("ieing");
+        assert!(matches!(
+            engine
+                .get_conversation(&ie_conf.state, ie_uid, ie_iid, cid)
+                .expect("iec"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::Confirming {
+                confirmation_digest: ref d,
+                ..
+            })) if d.is_empty()
+        ));
+        let ie_ids = ConversationRef {
+            user_id: ie_uid,
+            identity_id: ie_iid,
+            conversation_id: cid,
+        };
+        let rejected = engine
+            .reject_established(ie_conf.state.clone(), &rng, ie_ids)
+            .expect("rej");
+        assert!(matches!(
+            engine
+                .get_conversation(&rejected.state, ie_uid, ie_iid, cid)
+                .expect("rejq"),
+            Conversation::HandshakeDm(Handshake::Failed(FailedReason::ConfirmationRejected))
+        ));
+        let confirmed = engine
+            .confirm_established(inv_conf.clone(), &rng, ids)
+            .expect("conf");
+        assert!(matches!(
+            engine
+                .get_conversation(&confirmed.state, uid, iid, cid)
+                .expect("est"),
+            Conversation::DirectMessage(DirectMessageQuery::Established)
+        ));
+        let expired = engine.tick(inv_conf.clone(), 1_900_000_000).expect("exp");
+        assert!(matches!(
+            engine
+                .get_conversation(&expired.state, uid, iid, cid)
+                .expect("exq"),
+            Conversation::HandshakeDm(Handshake::Failed(FailedReason::InviteExpired { .. }))
+        ));
+        assert_eq!(
+            engine
+                .confirm_established(expired.state.clone(), &rng, ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
+        let epoll = engine.poll(&expired.state).expect("ep");
+        assert_eq!(
+            engine
+                .ingest_packet(
+                    expired.state,
+                    &rng,
+                    epoll.list[0].channel.clone(),
+                    epoll.list[0].tag,
+                    &bodies[0]
+                )
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
+
+        let delayed = engine.tick(EngineState::new(), 1_700_000_000).expect("dt");
+        let (du, duid) = engine.create_user(delayed.state, &rng).expect("du");
+        let (di, diid) = engine
+            .create_identity(du.state, &rng, duid, Policy::Classic)
+            .expect("di");
+        let (drecv, _dcid) = engine
+            .receive_ticket(di.state, &rng, duid, diid, &ticket_s)
+            .expect("drecv");
+        let blocked = engine.poll(&drecv.state).expect("blk");
+        assert!(blocked.blocked.iter().any(|b| b.identity_id == diid));
+        let got_notice = engine
+            .ingest_list(drecv.state, &rng, ch.clone(), tag, &bodies)
+            .expect("dn");
+        assert!(matches!(
+            engine
+                .get_conversation(&got_notice.state, duid, diid, cid)
+                .expect("dnr"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::InviteReceived { .. }))
+        ));
+        let named_ie = engine
+            .set_display_name(got_notice.state, &rng, duid, diid, "Cyd")
+            .expect("setn");
+        assert!(matches!(
+            engine
+                .get_conversation(&named_ie.state, duid, diid, cid)
+                .expect("dnm"),
+            Conversation::HandshakeDm(Handshake::Invitee(
+                HandshakeInvitee::IntroductionMinted { .. }
+            ))
+        ));
+
+        let mismatch_tick = engine.tick(EngineState::new(), 1_700_000_000).expect("mt");
+        let (mu, muid) = engine.create_user(mismatch_tick.state, &rng).expect("mu");
+        let (mi, miid) = engine
+            .create_identity(mu.state, &rng, muid, Policy::Hybrid)
+            .expect("mi");
+        let mn = engine
+            .set_display_name(mi.state, &rng, muid, miid, "Eve")
+            .expect("mn");
+        let (mrecv, mcid) = engine
+            .receive_ticket(mn.state, &rng, muid, miid, &ticket_s)
+            .expect("mrecv");
+        let mut policy_mint = mrecv.state.clone();
+        let mfail = engine
+            .ingest_list(mrecv.state, &rng, ch.clone(), tag, &bodies)
+            .expect("ming");
+        assert!(matches!(
+            engine
+                .get_conversation(&mfail.state, muid, miid, cid)
+                .expect("mfq"),
+            Conversation::HandshakeDm(Handshake::Failed(FailedReason::PolicyNotAccepted { .. }))
+        ));
+
+        let mut folded_fail = named_ie.state.clone();
+        for reason in [
+            FailedReason::PolicyNotAccepted {
+                policy: Policy::Hybrid,
+            },
+            FailedReason::InviteExpired { expires: 3 },
+            FailedReason::NoticeUnlockFailed,
+            FailedReason::NoticeConflict,
+            FailedReason::IntroUnlockFailed,
+            FailedReason::IntroVerifyFailed,
+            FailedReason::DuplicateIntro,
+            FailedReason::ConfirmationRejected,
+            FailedReason::Equivocation,
+            FailedReason::OfferRejected,
+            FailedReason::Kicked,
+            FailedReason::Left,
+        ] {
+            folded_fail.failed.insert(*cid.as_bytes(), reason);
+            let snap = engine.fold(folded_fail.clone()).expect("ff");
+            let restored = engine.apply_folded(&snap.snapshot).expect("afr");
+            assert_eq!(restored.failed.get(cid.as_bytes()), Some(&reason));
+        }
+
+        let packed = engine.suite.b64u().decode(&ticket_s).expect("dec");
+        let canonical = engine
+            .suite
+            .compress()
+            .decompress(&packed, super::super::payload::TICKET_MAX_UNCOMPRESSED)
+            .expect("z");
+        let json = engine.suite.canonical_json().decode(&canonical).expect("j");
+        let ticket = ticket_from_json(engine.suite.b64u(), &json).expect("tk");
+        let other_notice = TxPayload::Notice(TxNotice {
+            policy: Policy::Classic,
+            intake_pk: vec![0; 32],
+            persistents: ticket.persistents.clone(),
+            ephemerals: Vec::new(),
+            expires: 1_800_000_001,
+        });
+        policy_mint.txs.insert(
+            [0x22; 32],
+            DurableBody {
+                conversation_id: mcid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Notice(TxNotice {
+                    policy: Policy::Classic,
+                    intake_pk: vec![0; 32],
+                    persistents: ticket.persistents.clone(),
+                    ephemerals: Vec::new(),
+                    expires: 1_800_000_000,
+                }),
+            },
+        );
+        engine
+            .try_mint_invitee_intro(&mut policy_mint, &rng, mcid)
+            .expect("pm");
+        assert_eq!(
+            policy_mint.failed.get(mcid.as_bytes()),
+            Some(&FailedReason::PolicyNotAccepted {
+                policy: Policy::Classic
+            })
+        );
+        let mut clash_state = named_ie.state.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut clash_state, *cid.as_bytes(), &other_notice)
+            .expect("gate");
+        assert!(gated.is_some());
+        assert_eq!(
+            clash_state.failed.get(cid.as_bytes()),
+            Some(&FailedReason::NoticeConflict)
+        );
+        let bad_intro = TxPayload::InviteeIntro(TxInviteeIntro {
+            name: DisplayName::try_from("X").expect("dn"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([1; 32]),
+            eph_send_tag_key: TagKey::from_bytes([2; 32]),
+            encryption_pk: vec![1],
+            signing_pk: vec![2],
+            intake_pk: vec![3],
+            seed_ct: vec![4],
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut verify_state = pinned.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut verify_state, *cid.as_bytes(), &bad_intro)
+            .expect("g2");
+        assert!(gated.is_some());
+        assert_eq!(
+            verify_state.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        let mut dup_state = named_ie.state.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut dup_state, *cid.as_bytes(), &bad_intro)
+            .expect("g3");
+        assert!(gated.is_some());
+        assert_eq!(
+            dup_state.failed.get(cid.as_bytes()),
+            Some(&FailedReason::DuplicateIntro)
+        );
+        let no_notice = TxPayload::InviterIntro(super::super::payload::TxInviterIntro {
+            name: DisplayName::try_from("Y").expect("dn2"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([3; 32]),
+            eph_send_tag_key: TagKey::from_bytes([4; 32]),
+            encryption_pk: vec![1; 32],
+            signing_pk: vec![1; 32],
+            seed_ct: vec![1; 32],
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut empty_ticket = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("et")
+            .state;
+        empty_ticket.tickets.insert(*cid.as_bytes(), ticket.clone());
+        let gated = engine
+            .handshake_ingest_gate(&mut empty_ticket, *cid.as_bytes(), &no_notice)
+            .expect("g4");
+        assert!(gated.is_some());
+        assert_eq!(
+            empty_ticket.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        let mut unlock_inviter = pinned.clone();
+        super::store_unlock_failed(&mut unlock_inviter, *cid.as_bytes());
+        assert_eq!(
+            unlock_inviter.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroUnlockFailed)
+        );
+        super::store_unlock_failed(&mut unlock_inviter, *cid.as_bytes());
+        let mut unlock_invitee = EngineState::new();
+        super::store_unlock_failed(&mut unlock_invitee, *cid.as_bytes());
+        assert_eq!(
+            unlock_invitee.failed.get(cid.as_bytes()),
+            Some(&FailedReason::NoticeUnlockFailed)
+        );
+        let mut both_intros = ie_conf.state.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut both_intros, *cid.as_bytes(), &no_notice)
+            .expect("g5");
+        assert!(gated.is_some());
+        assert_eq!(
+            both_intros.failed.get(cid.as_bytes()),
+            Some(&FailedReason::DuplicateIntro)
+        );
+        let (sync_ok, sid) = engine
+            .create_sync_invite(
+                confirmed.state,
+                &rng,
+                Policy::Classic,
+                1_900_000_000,
+                "phone",
+                None,
+            )
+            .expect("sync");
+        let snap = engine.fold(sync_ok.state.clone()).expect("sfold");
+        let restored = engine.apply_folded(&snap.snapshot).expect("saf");
+        assert!(restored.device_enc.is_some());
+        assert!(restored.inviters.contains(sid.as_bytes()));
+        let st = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("st")
+            .state;
+        let (srecv, _) = engine
+            .receive_sync_ticket(st, &rng, &ticket_s)
+            .expect("srecv");
+        let spoll = engine.poll(&srecv.state).expect("sp");
+        assert!(
+            spoll
+                .blocked
+                .iter()
+                .any(|b| b.user_id.as_bytes() == &[0; 32])
+        );
+        let ie_no_notice = TxPayload::InviteeIntro(TxInviteeIntro {
+            name: DisplayName::try_from("N").expect("dnn"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([8; 32]),
+            eph_send_tag_key: TagKey::from_bytes([9; 32]),
+            encryption_pk: vec![1; 32],
+            signing_pk: vec![1; 32],
+            intake_pk: vec![1; 32],
+            seed_ct: vec![1; 32],
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut empty_ie = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("et2")
+            .state;
+        empty_ie.tickets.insert(*cid.as_bytes(), ticket.clone());
+        let gated = engine
+            .handshake_ingest_gate(&mut empty_ie, *cid.as_bytes(), &ie_no_notice)
+            .expect("g6");
+        assert!(gated.is_some());
+        assert_eq!(
+            empty_ie.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        let bad_inviter_keys = TxPayload::InviterIntro(super::super::payload::TxInviterIntro {
+            name: DisplayName::try_from("K").expect("dnk"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([10; 32]),
+            eph_send_tag_key: TagKey::from_bytes([11; 32]),
+            encryption_pk: vec![1],
+            signing_pk: vec![1],
+            seed_ct: vec![1],
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut verify_inv = pinned.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut verify_inv, *cid.as_bytes(), &bad_inviter_keys)
+            .expect("g7");
+        assert!(gated.is_some());
+        assert_eq!(
+            verify_inv.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        let mut wrap_fail = pinned.clone();
+        wrap_fail.txs.insert(
+            [0x11; 32],
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::InviteeIntro(TxInviteeIntro {
+                    name: DisplayName::try_from("W").expect("dnw"),
+                    profile_pic: None,
+                    send_tag_key: TagKey::from_bytes([12; 32]),
+                    eph_send_tag_key: TagKey::from_bytes([13; 32]),
+                    encryption_pk: vec![1; 32],
+                    signing_pk: vec![1; 32],
+                    intake_pk: Vec::new(),
+                    seed_ct: vec![1; 32],
+                    prefs: OnWirePrefs {
+                        read_receipts: true,
+                        online_visible: true,
+                        send_typing: true,
+                        disappear_after: None,
+                        wake: None,
+                    },
+                }),
+            },
+        );
+        let extra = engine
+            .try_mint_inviter_intro(&mut wrap_fail, &rng, cid)
+            .expect("wrapf");
+        assert!(extra.is_empty());
+        assert_eq!(
+            wrap_fail.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        let mut no_ticket = pinned.clone();
+        no_ticket.tickets.remove(cid.as_bytes());
+        no_ticket.sync_tickets.remove(cid.as_bytes());
+        no_ticket.txs.insert(
+            [0x33; 32],
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::InviteeIntro(TxInviteeIntro {
+                    name: DisplayName::try_from("T").expect("dnt"),
+                    profile_pic: None,
+                    send_tag_key: TagKey::from_bytes([14; 32]),
+                    eph_send_tag_key: TagKey::from_bytes([15; 32]),
+                    encryption_pk: vec![1; 32],
+                    signing_pk: vec![1; 32],
+                    intake_pk: vec![1; 32],
+                    seed_ct: vec![1; 32],
+                    prefs: OnWirePrefs {
+                        read_receipts: true,
+                        online_visible: true,
+                        send_typing: true,
+                        disappear_after: None,
+                        wake: None,
+                    },
+                }),
+            },
+        );
+        assert_eq!(
+            engine
+                .try_mint_inviter_intro(&mut no_ticket, &rng, cid)
+                .unwrap_err(),
+            EngineError::UnknownIds
+        );
+        pending_inviter.txs.insert(
+            [0x34; 32],
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::InviteeIntro(TxInviteeIntro {
+                    name: DisplayName::try_from("P").expect("dnp"),
+                    profile_pic: None,
+                    send_tag_key: TagKey::from_bytes([16; 32]),
+                    eph_send_tag_key: TagKey::from_bytes([17; 32]),
+                    encryption_pk: vec![1; 32],
+                    signing_pk: vec![1; 32],
+                    intake_pk: vec![1; 32],
+                    seed_ct: vec![1; 32],
+                    prefs: OnWirePrefs {
+                        read_receipts: true,
+                        online_visible: true,
+                        send_typing: true,
+                        disappear_after: None,
+                        wake: None,
+                    },
+                }),
+            },
+        );
+        engine
+            .try_mint_inviter_intro(&mut pending_inviter, &rng, cid)
+            .expect("pw");
+        engine
+            .try_mint_inviter_intro(&mut pinned.clone(), &rng, cid)
+            .expect("noie");
+        engine
+            .try_mint_invitee_intro(&mut ticket_recv, &rng, ie_cid)
+            .expect("nonotice");
+        let mpoll = engine.poll(&mfail.state).expect("mp");
+        let again = engine
+            .ingest_packet(
+                mfail.state,
+                &rng,
+                mpoll.list[0].channel.clone(),
+                mpoll.list[0].tag,
+                &bodies[0],
+            )
+            .expect("other-fail");
+        assert!(again.persist.is_empty());
+        let cid_j = super::super::codec::bstr(engine.suite.b64u(), cid.as_bytes());
+        assert_eq!(
+            super::parse_failed(
+                engine.suite.b64u(),
+                &Json::Object(vec![
+                    ("conversation_id".into(), cid_j.clone()),
+                    ("reason".into(), Json::String("PolicyNotAccepted".into())),
+                    ("policy".into(), Json::Number(1)),
+                ]),
+            )
+            .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            super::parse_failed(
+                engine.suite.b64u(),
+                &Json::Object(vec![
+                    ("conversation_id".into(), cid_j),
+                    ("reason".into(), Json::String("InviteExpired".into())),
+                    ("expires".into(), Json::String("x".into())),
+                ]),
+            )
+            .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        let mut rk = EngineState::new();
+        rk.failed.insert([1; 32], FailedReason::NoticeUnlockFailed);
+        rk.inviters.insert([1; 32]);
+        rk.skipped_mks.insert(
+            [1; 32].to_vec(),
+            vec![super::super::chain::CachedMk {
+                mk: [2; 32],
+                expires_at: 9,
+            }],
+        );
+        rk.skipped_mks.insert(
+            [9; 32].to_vec(),
+            vec![super::super::chain::CachedMk {
+                mk: [3; 32],
+                expires_at: 9,
+            }],
+        );
+        rk.frags.insert(
+            [4; 32],
+            super::FragSet {
+                conversation_id: [9; 32],
+                parts: Default::default(),
+                last_i: None,
+            },
+        );
+        let dummy = super::super::chain::SendChain {
+            root: [0; 32],
+            c: [0; 32],
+            epoch: 0,
+            packet_seq: 0,
+        };
+        rk.send_chains.insert([1; 32].to_vec(), dummy.clone());
+        rk.send_chains.insert([8; 32].to_vec(), dummy.clone());
+        rk.recv_chains.insert([1; 32].to_vec(), dummy.clone());
+        rk.recv_chains.insert([8; 32].to_vec(), dummy);
+        super::rekey_conversation(&mut rk, [1; 32], [2; 32]);
+        assert_eq!(
+            rk.failed.get(&[2; 32]),
+            Some(&FailedReason::NoticeUnlockFailed)
+        );
+        assert!(rk.inviters.contains(&[2; 32]));
+        engine
+            .handshake_ingest_gate(&mut pinned.clone(), *cid.as_bytes(), &TxPayload::Confirm)
+            .expect("g8");
+        engine
+            .try_mint_inviter_intro(&mut inv_conf.clone(), &rng, cid)
+            .expect("hasintro");
+        let secret = *ticket.secret.as_bytes();
+        let key = super::super::chain::chain_key(&cid, &[]);
+        let mut chain = named_ie.state.recv_chains.get(&key).cloned().expect("rc");
+        let clash_body = DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: other_notice,
+        };
+        let packed_clash = packed_tx(&engine.suite, &clash_body);
+        let pkts = fragment_body(
+            &engine.suite,
+            &packed_clash,
+            Tag::from_bytes([0x44; 32]),
+            Tag::from_bytes([0; 32]),
+            chain.packet_seq,
+            &[],
+        )
+        .expect("fr");
+        let mut clash_ing = named_ie.state.clone();
+        for pkt in pkts {
+            let sealed = seal_packet(&engine.suite, &rng, &mk(engine.suite.hmac(), &chain), &pkt)
+                .expect("sl");
+            clash_ing = engine
+                .ingest_packet(clash_ing, &rng, ch.clone(), tag, &sealed)
+                .expect("cling")
+                .state;
+            chain = step(engine.suite.hmac(), &chain);
+        }
+        assert_eq!(
+            clash_ing.failed.get(cid.as_bytes()),
+            Some(&FailedReason::NoticeConflict)
+        );
+        let codec_chain = join(
+            engine.suite.hmac(),
+            &secret,
+            ConversationSort::HandshakeDm,
+            &[],
+        )
+        .expect("jnc");
+        let b_codec = seal_packet(
+            &engine.suite,
+            &rng,
+            &mk(engine.suite.hmac(), &codec_chain),
+            &PacketPlain::TxFragLast(PacketTxFragLast {
+                actor_id: Vec::new(),
+                packet_seq: 0,
+                tx_id: Tag::from_bytes([0x55; 32]),
+                frag_i: 0,
+                frag: vec![0xfe, 0xfd, 1],
+                set_xor: Tag::from_bytes([0; 32]),
+            }),
+        )
+        .expect("scodec");
+        let (recv_codec, _) = engine
+            .receive_ticket(
+                engine
+                    .tick(EngineState::new(), 1_700_000_000)
+                    .expect("tco")
+                    .state,
+                &rng,
+                uid,
+                iid,
+                &ticket_s,
+            )
+            .expect("rco");
+        engine
+            .ingest_packet(recv_codec.state, &rng, ch, tag, &b_codec)
+            .expect("ico");
+        engine.lock();
+    }
+
+    #[test]
+    fn handshake_sync_intros() {
+        use super::{
+            Conversation, ConversationRef, FailedReason, Handshake, HandshakeInvitee,
+            HandshakeInviter, SynchronizationQuery,
+        };
+        let mut engine = test_engine();
+        let rng = CounterRng::new();
+        engine
+            .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+            .expect("wrap");
+        let ticked = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("tick");
+        let (invited, sid) = engine
+            .create_sync_invite(
+                ticked.state,
+                &rng,
+                Policy::Classic,
+                1_800_000_000,
+                "phone",
+                None,
+            )
+            .expect("sinv");
+        let zeros = UserId::from_bytes([0; 32]);
+        let zid = IdentityId::from_bytes([0; 32]);
+        let ids = ConversationRef {
+            user_id: zeros,
+            identity_id: zid,
+            conversation_id: sid,
+        };
+        let ticket_s = engine.ticket_host_string(&invited.state, &ids).expect("t");
+        let notice_writes: Vec<_> = engine
+            .poll(&invited.state)
+            .expect("p")
+            .write_durable
+            .into_iter()
+            .map(|w| (w.channel, w.tag, w.body))
+            .collect();
+        let inviter = ack_all(&engine, invited.state);
+        let ie_tick = engine
+            .tick(EngineState::new(), 1_700_000_000)
+            .expect("it")
+            .state;
+        let (received, _) = engine
+            .receive_sync_ticket(ie_tick, &rng, &ticket_s)
+            .expect("recv");
+        let named_ie = engine
+            .set_device_name(received.state, &rng, "tablet")
+            .expect("dn");
+        let bodies: Vec<Vec<u8>> = notice_writes.iter().map(|w| w.2.clone()).collect();
+        let minted = engine
+            .ingest_list(
+                named_ie.state,
+                &rng,
+                notice_writes[0].0.clone(),
+                notice_writes[0].1,
+                &bodies,
+            )
+            .expect("ing");
+        assert!(matches!(
+            engine
+                .get_conversation(&minted.state, zeros, zid, sid)
+                .expect("ir"),
+            Conversation::HandshakeSync(Handshake::Invitee(
+                HandshakeInvitee::IntroductionMinted { .. }
+            ))
+        ));
+        let intro_writes: Vec<_> = engine
+            .poll(&minted.state)
+            .expect("ip")
+            .write_durable
+            .into_iter()
+            .map(|w| (w.channel, w.tag, w.body))
+            .collect();
+        let sent = ack_all(&engine, minted.state);
+        assert!(matches!(
+            engine.get_conversation(&sent, zeros, zid, sid).expect("is"),
+            Conversation::HandshakeSync(Handshake::Invitee(
+                HandshakeInvitee::IntroductionSent { .. }
+            ))
+        ));
+        let intro_bodies: Vec<Vec<u8>> = intro_writes.iter().map(|w| w.2.clone()).collect();
+        let inv_minted = engine
+            .ingest_list(
+                inviter,
+                &rng,
+                intro_writes[0].0.clone(),
+                intro_writes[0].1,
+                &intro_bodies,
+            )
+            .expect("iing");
+        assert!(matches!(
+            engine
+                .get_conversation(&inv_minted.state, zeros, zid, sid)
+                .expect("im"),
+            Conversation::HandshakeSync(Handshake::Inviter(
+                HandshakeInviter::IntroductionMinted { .. }
+            ))
+        ));
+        let inv_intro_writes: Vec<_> = engine
+            .poll(&inv_minted.state)
+            .expect("iip")
+            .write_durable
+            .into_iter()
+            .map(|w| (w.channel, w.tag, w.body))
+            .collect();
+        let inv_conf = ack_all(&engine, inv_minted.state);
+        assert!(matches!(
+            engine
+                .get_conversation(&inv_conf, zeros, zid, sid)
+                .expect("ic"),
+            Conversation::HandshakeSync(Handshake::Inviter(HandshakeInviter::Confirming {
+                confirmation_digest: ref d,
+                ..
+            })) if d.is_empty()
+        ));
+        let ie_conf = engine
+            .ingest_list(
+                sent,
+                &rng,
+                inv_intro_writes[0].0.clone(),
+                inv_intro_writes[0].1,
+                &inv_intro_writes
+                    .iter()
+                    .map(|w| w.2.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("ieing");
+        assert!(matches!(
+            engine
+                .get_conversation(&ie_conf.state, zeros, zid, sid)
+                .expect("iec"),
+            Conversation::HandshakeSync(Handshake::Invitee(HandshakeInvitee::Confirming {
+                confirmation_digest: ref d,
+                ..
+            })) if d.is_empty()
+        ));
+        let rejected = engine
+            .reject_established(inv_conf.clone(), &rng, ids)
+            .expect("rej");
+        assert!(matches!(
+            engine
+                .get_conversation(&rejected.state, zeros, zid, sid)
+                .expect("rejq"),
+            Conversation::HandshakeSync(Handshake::Failed(FailedReason::ConfirmationRejected))
+        ));
+        let confirmed = engine
+            .confirm_established(ie_conf.state, &rng, ids)
+            .expect("conf");
+        assert!(matches!(
+            engine
+                .get_conversation(&confirmed.state, zeros, zid, sid)
+                .expect("est"),
+            Conversation::Synchronization(SynchronizationQuery::SyncEstablished)
+        ));
+        let expired = engine.tick(inv_conf, 1_900_000_000).expect("exp");
+        assert!(matches!(
+            engine
+                .get_conversation(&expired.state, zeros, zid, sid)
+                .expect("exq"),
+            Conversation::HandshakeSync(Handshake::Failed(FailedReason::InviteExpired { .. }))
+        ));
+        let _ = format!("{engine:?}");
+        let _ = confirmed.persist();
+        let _ = confirmed.pings();
+        let _ = confirmed.state.tx_count();
+        let _ = engine.defaults();
+        let snap = engine.fold(expired.state.clone()).expect("foldp");
+        let _ = snap.persist();
+        let _ = snap.pings();
+        engine.lock();
     }
 }

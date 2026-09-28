@@ -107,7 +107,13 @@ sealed 512-byte `PacketTxFrag` bodies on the handshake sending chain.
 `ingest_list` / `ingest_packet` open those bodies with skip-ahead `mk`,
 reassemble fragments, and merge `DurableBody`. A full durable list completes
 that TimeBin in `BinProgress`. Empty invite-tag snapshot leaves Invitee
-`TicketReceived`; a valid `TxNotice` is `InviteReceived`. Heal, live-path
+`TicketReceived`; a valid `TxNotice` is `InviteReceived`. A valid notice
+plus `DisplayName` mints `TxInviteeIntro`. Inviter ingest of that intro mints
+`TxInviterIntro` and consumes the ticket. `writeAck` of the intro set is
+Inviter `Confirming` / Invitee `IntroductionSent`. Invitee ingest of inviter
+intro is `Confirming`. Policy mismatch, unlock failure, Notice conflict, intro
+unlock/verify failure, and duplicate intro store `FailedReason` overlays.
+`tick` past `expires` pre-confirm stores `InviteExpired`. Heal, live-path
 XOR-acks, confirmation digest bytes, and spawning a child DM secret from
 intros wait on later slices; `confirmation_digest` is an empty string until
 that slice.
