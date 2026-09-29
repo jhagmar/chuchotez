@@ -29,6 +29,10 @@ and consumes the ticket. `writeAck` of the intro set is Inviter `Confirming`
 / Invitee `IntroductionSent`. Invitee ingest of inviter intro is `Confirming`.
 Policy mismatch, unlock failure, Notice conflict, intro unlock/verify
 failure, and duplicate intro store `FailedReason` overlays. `tick` past
-`expires` pre-confirm stores `InviteExpired`. `confirmation_digest` is an
-empty string. Group invites use an
+`expires` pre-confirm stores `InviteExpired`. `confirmation_digest` is
+`text(fingerprint)`. `confirmEstablished` posts `TxConfirm` and inserts a
+child DM or Sync whose `conversation_id` is
+`mac(spawn_secret, "chuchotez/1/spawn-conversation-id")` and whose secret is
+`spawn_secret`. `rejectEstablished` stores `ConfirmationRejected`. Handshake
+and spawned DM are two `listConversations` rows. Group invites use an
 Established DM and have no Ticket, InviteTag, or intake KEM.

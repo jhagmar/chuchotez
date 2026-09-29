@@ -113,10 +113,10 @@ plus `DisplayName` mints `TxInviteeIntro`. Inviter ingest of that intro mints
 Inviter `Confirming` / Invitee `IntroductionSent`. Invitee ingest of inviter
 intro is `Confirming`. Policy mismatch, unlock failure, Notice conflict, intro
 unlock/verify failure, and duplicate intro store `FailedReason` overlays.
-`tick` past `expires` pre-confirm stores `InviteExpired`. Heal, live-path
-XOR-acks, confirmation digest bytes, and spawning a child DM secret from
-intros wait on later slices; `confirmation_digest` is an empty string until
-that slice.
+`tick` past `expires` pre-confirm stores `InviteExpired`.
+`confirmation_digest` is `text(fingerprint)`. `confirmEstablished` inserts a
+child DM or Sync conversation. Heal, live-path XOR-acks, and group mint wait
+on later slices.
 
 `std_suite` ships HMAC-SHA-256 over `libcrux-hmac` (`LibcruxHmac`), raw
 Deflate over `flate2` (`miniz_oxide`, `Compression::best()`), unpadded
@@ -150,7 +150,6 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 
 - Heal half-xor / want / have.
 - Live path (ephemeral first, persistent after 3 ticked seconds).
-- Confirmation digest and child DM / Sync spawn from intros.
 - `create_group` from Established DMs (member cap 32, parallel `TxGroupInvite`).
 - Cover traffic.
 
