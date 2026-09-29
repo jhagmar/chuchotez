@@ -401,6 +401,12 @@ impl Kem for EchoKem {
     }
 
     fn unwrap(&self, _policy: Policy, _sk: &[u8], kem_ct: &[u8]) -> Result<Vec<u8>, KemError> {
+        if kem_ct.len() >= 2 && kem_ct[0] == 0xee && kem_ct[1] == 0xfd {
+            return Err(KemError::Wrap);
+        }
+        if kem_ct.len() >= 2 && kem_ct[0] == 0xee && kem_ct[1] == 0xfe {
+            return Ok(vec![0u8; 31]);
+        }
         let mut shared = vec![0u8; 32];
         let n = 32.min(kem_ct.len());
         shared[..n].copy_from_slice(&kem_ct[..n]);

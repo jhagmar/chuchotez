@@ -5,11 +5,11 @@ use super::chain::{
     open_skip_ahead, packed_tx, seal_packet, set_xor_for, step,
 };
 use super::codec::{
-    durable_body_from_json, durable_body_to_json, durable_json, ticket_from_json, ticket_to_json,
-    vault_header_to_json,
+    durable_body_from_json, durable_body_to_json, durable_json, payload_to_json, ticket_from_json,
+    ticket_to_json, vault_header_to_json,
 };
 use super::hmac::{HmacSha256, HmacSha256Key, expand};
-use super::kem::{KeyPair, kem_ct_len, kem_pk_len};
+use super::kem::{KEM_SHARED_LEN, KeyPair, kem_ct_len, kem_pk_len};
 use super::payload::{
     BIN_WINDOW, ConversationSort, DurableBody, Hlc, PACKET_MAX_UNCOMPRESSED, PACKET_NONCE_LEN,
     PERSIST_MAX_UNCOMPRESSED, PacketPlain, TICKET_MAX_UNCOMPRESSED, Ticket, TxEdit, TxInviteeIntro,
@@ -31,6 +31,11 @@ const PERSIST_VERSION: u32 = 1;
 
 /// Folded snapshot format version.
 const FOLD_VERSION: u32 = 2;
+
+const SPAWN_SECRET_INFO: &[u8] = b"chuchotez/1/spawn-secret";
+const SPAWN_CONVERSATION_ID_INFO: &[u8] = b"chuchotez/1/spawn-conversation-id";
+const HANDSHAKE_DM_ESTABLISHED_INFO: &[u8] = b"chuchotez/1/handshake-dm-established";
+const HANDSHAKE_SYNC_ESTABLISHED_INFO: &[u8] = b"chuchotez/1/handshake-sync-established";
 
 /// Conversation ids, user ids, identity ids.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -415,6 +420,12 @@ pub struct EngineState {
     failed: BTreeMap<[u8; 32], FailedReason>,
     owners: BTreeMap<[u8; 32], ([u8; 32], [u8; 32])>,
     inviters: BTreeSet<[u8; 32]>,
+    intake: BTreeMap<[u8; 32], KeyPair>,
+    shared_inviter: BTreeMap<[u8; 32], [u8; 32]>,
+    shared_invitee: BTreeMap<[u8; 32], [u8; 32]>,
+    children: BTreeMap<[u8; 32], [u8; 32]>,
+    child_secrets: BTreeMap<[u8; 32], [u8; 32]>,
+    child_sync: BTreeSet<[u8; 32]>,
     device_enc: Option<KeyPair>,
     device_sign: Option<SigningKeyPair>,
 }
@@ -1209,6 +1220,7 @@ impl Engine {
         state.next_seq = state.next_seq.saturating_add(1);
         state.txs.insert(tx_id, body);
         state.tickets.insert(*conversation_id.as_bytes(), ticket);
+        state.intake.insert(*conversation_id.as_bytes(), intake);
         state.owners.insert(
             *conversation_id.as_bytes(),
             (*user_id.as_bytes(), *identity_id.as_bytes()),
@@ -1339,6 +1351,7 @@ impl Engine {
             .tickets
             .keys()
             .chain(state.sync_tickets.keys())
+            .chain(state.child_secrets.keys())
             .filter_map(|id| {
                 let conversation_id = ConversationId::from_bytes(*id);
                 self.conversation_at(state, conversation_id)
@@ -1355,13 +1368,18 @@ impl Engine {
         state: &EngineState,
         conversation_id: ConversationId,
     ) -> Option<Conversation> {
+        if state.child_secrets.contains_key(conversation_id.as_bytes()) {
+            if state.child_sync.contains(conversation_id.as_bytes()) {
+                return Some(Conversation::Synchronization(
+                    SynchronizationQuery::SyncEstablished,
+                ));
+            }
+            return Some(Conversation::DirectMessage(DirectMessageQuery::Established));
+        }
         if let Some(ticket) = state.tickets.get(conversation_id.as_bytes()) {
             if let Some(reason) = state.failed.get(conversation_id.as_bytes()) {
                 return Some(Conversation::HandshakeDm(Handshake::Failed(*reason)));
             }
-            let has_confirm = state.txs.values().any(|t| {
-                matches!(t.payload, TxPayload::Confirm) && t.conversation_id == conversation_id
-            });
             let has_reject = state.txs.values().any(|t| {
                 matches!(t.payload, TxPayload::Reject) && t.conversation_id == conversation_id
             });
@@ -1369,9 +1387,6 @@ impl Engine {
                 return Some(Conversation::HandshakeDm(Handshake::Failed(
                     FailedReason::ConfirmationRejected,
                 )));
-            }
-            if has_confirm {
-                return Some(Conversation::DirectMessage(DirectMessageQuery::Established));
             }
             return Some(Conversation::HandshakeDm(self.handshake_at(
                 state,
@@ -1383,9 +1398,6 @@ impl Engine {
             if let Some(reason) = state.failed.get(conversation_id.as_bytes()) {
                 return Some(Conversation::HandshakeSync(Handshake::Failed(*reason)));
             }
-            let has_confirm = state.txs.values().any(|t| {
-                matches!(t.payload, TxPayload::Confirm) && t.conversation_id == conversation_id
-            });
             let has_reject = state.txs.values().any(|t| {
                 matches!(t.payload, TxPayload::Reject) && t.conversation_id == conversation_id
             });
@@ -1393,11 +1405,6 @@ impl Engine {
                 return Some(Conversation::HandshakeSync(Handshake::Failed(
                     FailedReason::ConfirmationRejected,
                 )));
-            }
-            if has_confirm {
-                return Some(Conversation::Synchronization(
-                    SynchronizationQuery::SyncEstablished,
-                ));
             }
             return Some(Conversation::HandshakeSync(self.handshake_at(
                 state,
@@ -1422,7 +1429,10 @@ impl Engine {
         let invitee_intro = invitee_intro_for(state, conversation_id).is_some();
         let inviter_intro = inviter_intro_for(state, conversation_id).is_some();
         let is_inviter = state.inviters.contains(conversation_id.as_bytes());
-        let digest = String::new();
+        let digest = self
+            .try_fingerprint(state, conversation_id)
+            .map(|(d, _)| d)
+            .unwrap_or_default();
         if is_inviter {
             let expires = ticket.expires;
             if inviter_intro {
@@ -1473,7 +1483,101 @@ impl Engine {
             .get(conversation_id.as_bytes())
             .or_else(|| state.sync_tickets.get(conversation_id.as_bytes()))
             .map(|t| *t.secret.as_bytes())
+            .or_else(|| state.child_secrets.get(conversation_id.as_bytes()).copied())
             .ok_or(EngineError::UnknownIds)
+    }
+
+    fn try_fingerprint(
+        &self,
+        state: &EngineState,
+        conversation_id: ConversationId,
+    ) -> Option<(String, [u8; 32])> {
+        let cid = conversation_id.as_bytes();
+        let ticket = state
+            .tickets
+            .get(cid)
+            .or_else(|| state.sync_tickets.get(cid))?;
+        let inviter = inviter_intro_for(state, conversation_id)?;
+        let invitee = invitee_intro_for(state, conversation_id)?;
+        let shared_inviter = state.shared_inviter.get(cid)?;
+        let shared_invitee = state.shared_invitee.get(cid)?;
+        let hmac = self.suite.hmac();
+        let key = HmacSha256Key::from_bytes(*ticket.secret.as_bytes());
+        let mut spawn_data = SPAWN_SECRET_INFO.to_vec();
+        spawn_data.extend(sort32(shared_inviter, shared_invitee));
+        let spawn_secret = hmac.mac(&key, &spawn_data).into_bytes();
+        let label = if state.sync_tickets.contains_key(cid) {
+            HANDSHAKE_SYNC_ESTABLISHED_INFO
+        } else {
+            HANDSHAKE_DM_ESTABLISHED_INFO
+        };
+        let fp_key = expand(hmac, &key, label);
+        let (lo, hi) = if inviter.signing_pk <= invitee.signing_pk {
+            (
+                TxPayload::InviterIntro(inviter.clone()),
+                TxPayload::InviteeIntro(invitee.clone()),
+            )
+        } else {
+            (
+                TxPayload::InviteeIntro(invitee.clone()),
+                TxPayload::InviterIntro(inviter.clone()),
+            )
+        };
+        let mut data = self
+            .suite
+            .canonical_json()
+            .encode(&payload_to_json(self.suite.b64u(), &lo));
+        data.extend(
+            self.suite
+                .canonical_json()
+                .encode(&payload_to_json(self.suite.b64u(), &hi)),
+        );
+        data.extend_from_slice(&spawn_secret);
+        let fingerprint = hmac
+            .mac(&HmacSha256Key::from_bytes(*fp_key.as_bytes()), &data)
+            .into_bytes();
+        Some((self.suite.b64u().encode(&fingerprint), spawn_secret))
+    }
+
+    fn unwrap_shared(&self, policy: Policy, sk: &[u8], ct: &[u8]) -> Result<[u8; 32], ()> {
+        let shared = self.suite.kem().unwrap(policy, sk, ct).map_err(|_| ())?;
+        if shared.len() != KEM_SHARED_LEN {
+            return Err(());
+        }
+        let mut out = [0u8; KEM_SHARED_LEN];
+        out.copy_from_slice(&shared);
+        Ok(out)
+    }
+
+    fn spawn_child(
+        &self,
+        state: &mut EngineState,
+        handshake: ConversationId,
+    ) -> Result<(), EngineError> {
+        let cid = *handshake.as_bytes();
+        if state.children.contains_key(&cid) {
+            return Ok(());
+        }
+        let Some((_, spawn_secret)) = self.try_fingerprint(state, handshake) else {
+            return Err(EngineError::MalformedPayload);
+        };
+        let child = self
+            .suite
+            .hmac()
+            .mac(
+                &HmacSha256Key::from_bytes(spawn_secret),
+                SPAWN_CONVERSATION_ID_INFO,
+            )
+            .into_bytes();
+        state.children.insert(cid, child);
+        state.child_secrets.insert(child, spawn_secret);
+        if state.sync_tickets.contains_key(&cid) {
+            state.child_sync.insert(child);
+        }
+        if let Some(owners) = state.owners.get(&cid).copied() {
+            state.owners.insert(child, owners);
+        }
+        Ok(())
     }
 
     fn require_ids(&self, state: &EngineState, ids: &ConversationRef) -> Result<(), EngineError> {
@@ -1509,7 +1613,17 @@ impl Engine {
             )))
             | Some(Conversation::HandshakeSync(Handshake::Invitee(
                 HandshakeInvitee::Confirming { .. },
-            ))) => Ok(()),
+            ))) => {
+                let decided = state.txs.values().any(|t| {
+                    matches!(t.payload, TxPayload::Confirm | TxPayload::Reject)
+                        && t.conversation_id == ids.conversation_id
+                });
+                if decided {
+                    Err(EngineError::WrongPhase)
+                } else {
+                    Ok(())
+                }
+            }
             _ => Err(EngineError::WrongPhase),
         }
     }
@@ -1654,7 +1768,8 @@ impl Engine {
             .map_err(|_| EngineError::MalformedPayload)?;
         let seed = KemSeed::from_pair(rng.random32(), rng.random32());
         #[rustfmt::skip]
-        let (_, seed_ct) = self.suite.kem().wrap(notice.policy, &notice.intake_pk, &seed).map_err(|_| EngineError::MalformedPayload)?;
+        let (shared, seed_ct) = self.suite.kem().wrap(notice.policy, &notice.intake_pk, &seed).map_err(|_| EngineError::MalformedPayload)?;
+        state.shared_inviter.insert(cid, take_shared32(shared));
         let payload = TxPayload::InviteeIntro(TxInviteeIntro {
             name,
             profile_pic: pic,
@@ -1666,6 +1781,7 @@ impl Engine {
             seed_ct,
             prefs: self.on_wire_prefs(),
         });
+        state.intake.insert(cid, intake);
         let secret = self.conv_secret(state, &conversation_id)?;
         let (tx_id, _, rec) = self.merge_tx(state, &secret, conversation_id, payload)?;
         self.post_handshake_packets(state, rng, conversation_id, &secret, Tag::from_bytes(tx_id))?;
@@ -1692,15 +1808,16 @@ impl Engine {
         #[rustfmt::skip]
         let Some((name, pic, enc, sign)) = self.local_calling(state, rng, conversation_id, notice.policy)? else { return Ok(Vec::new()); };
         let seed = KemSeed::from_pair(rng.random32(), rng.random32());
-        let (_, seed_ct) = match self
-            .suite
-            .kem()
-            .wrap(notice.policy, &invitee.intake_pk, &seed)
-        {
+        let (shared, seed_ct) = match self.suite.kem().wrap(
+            notice.policy,
+            &invitee.intake_pk,
+            &seed,
+        ) {
             Ok(v) => v,
             #[rustfmt::skip]
             Err(_) => { state.failed.insert(cid, FailedReason::IntroVerifyFailed); return Ok(Vec::new()); }
         };
+        state.shared_invitee.insert(cid, take_shared32(shared));
         if let Some(ticket) = state
             .tickets
             .get(&cid)
@@ -1847,6 +1964,72 @@ impl Engine {
             .iter()
             .map(|id| super::codec::bstr(self.suite.b64u(), id))
             .collect();
+        let mut intake = Vec::new();
+        for (id, kp) in &state.intake {
+            intake.push(Json::Object(vec![
+                (
+                    "conversation_id".into(),
+                    super::codec::bstr(self.suite.b64u(), id),
+                ),
+                (
+                    "pk".into(),
+                    super::codec::bstr(self.suite.b64u(), kp.public_bytes()),
+                ),
+                (
+                    "sk".into(),
+                    super::codec::bstr(self.suite.b64u(), kp.secret_bytes()),
+                ),
+            ]));
+        }
+        let mut shared_inviter = Vec::new();
+        for (id, shared) in &state.shared_inviter {
+            shared_inviter.push(Json::Object(vec![
+                (
+                    "conversation_id".into(),
+                    super::codec::bstr(self.suite.b64u(), id),
+                ),
+                (
+                    "shared".into(),
+                    super::codec::bstr(self.suite.b64u(), shared),
+                ),
+            ]));
+        }
+        let mut shared_invitee = Vec::new();
+        for (id, shared) in &state.shared_invitee {
+            shared_invitee.push(Json::Object(vec![
+                (
+                    "conversation_id".into(),
+                    super::codec::bstr(self.suite.b64u(), id),
+                ),
+                (
+                    "shared".into(),
+                    super::codec::bstr(self.suite.b64u(), shared),
+                ),
+            ]));
+        }
+        let mut established = Vec::new();
+        for (child, secret) in &state.child_secrets {
+            let handshake = state
+                .children
+                .iter()
+                .find_map(|(h, c)| (*c == *child).then_some(*h))
+                .unwrap_or(*child);
+            established.push(Json::Object(vec![
+                (
+                    "conversation_id".into(),
+                    super::codec::bstr(self.suite.b64u(), child),
+                ),
+                (
+                    "handshake_id".into(),
+                    super::codec::bstr(self.suite.b64u(), &handshake),
+                ),
+                (
+                    "secret".into(),
+                    super::codec::bstr(self.suite.b64u(), secret),
+                ),
+                ("sync".into(), Json::Bool(state.child_sync.contains(child))),
+            ]));
+        }
         let device_enc = state
             .device_enc
             .as_ref()
@@ -1874,6 +2057,10 @@ impl Engine {
             ("failed".into(), Json::Array(failed)),
             ("owners".into(), Json::Array(owners)),
             ("inviters".into(), Json::Array(inviters)),
+            ("intake".into(), Json::Array(intake)),
+            ("shared_inviter".into(), Json::Array(shared_inviter)),
+            ("shared_invitee".into(), Json::Array(shared_invitee)),
+            ("established".into(), Json::Array(established)),
             ("device_enc".into(), device_enc),
             ("device_sign".into(), device_sign),
         ]);
@@ -1907,8 +2094,22 @@ impl Engine {
         mut state: EngineState,
         ids: ConversationRef,
     ) -> Result<MutateOk, EngineError> {
-        self.require_ids(&state, &ids)?;
         let cid = *ids.conversation_id.as_bytes();
+        if state.child_secrets.contains_key(&cid) {
+            if !state.child_sync.contains(&cid) {
+                self.require_ids(&state, &ids)?;
+            }
+            state.child_secrets.remove(&cid);
+            state.child_sync.remove(&cid);
+            state.owners.remove(&cid);
+            state.children.retain(|_, v| *v != cid);
+            return Ok(MutateOk {
+                state,
+                persist: Vec::new(),
+                pings: Vec::new(),
+            });
+        }
+        self.require_ids(&state, &ids)?;
         let ticket = state
             .tickets
             .get(&cid)
@@ -1930,6 +2131,10 @@ impl Engine {
         state.failed.remove(&cid);
         state.owners.remove(&cid);
         state.inviters.remove(&cid);
+        state.intake.remove(&cid);
+        state.shared_inviter.remove(&cid);
+        state.shared_invitee.remove(&cid);
+        state.children.remove(&cid);
         let tag_key = handshake_tag_key(self.suite.hmac(), ticket.secret.as_bytes());
         for ch in &ticket.persistents {
             state.bin_progress.remove(&progress_key(ch, &tag_key));
@@ -2095,6 +2300,7 @@ impl Engine {
         state
             .sync_tickets
             .insert(*conversation_id.as_bytes(), ticket);
+        state.intake.insert(*conversation_id.as_bytes(), intake);
         state.inviters.insert(*conversation_id.as_bytes());
         state.device_name = Some(name);
         #[rustfmt::skip]
@@ -2208,9 +2414,17 @@ impl Engine {
         state.recv_chains.retain(|k, _| drop_sync(k));
         state.skipped_mks.retain(|k, _| drop_sync(k));
         for id in &sync_ids {
+            if let Some(child) = state.children.remove(id) {
+                state.child_secrets.remove(&child);
+                state.child_sync.remove(&child);
+                state.owners.remove(&child);
+            }
             state.failed.remove(id);
             state.owners.remove(id);
             state.inviters.remove(id);
+            state.intake.remove(id);
+            state.shared_inviter.remove(id);
+            state.shared_invitee.remove(id);
         }
         Ok(MutateOk {
             state,
@@ -2282,14 +2496,15 @@ impl Engine {
             .contains_key(ids.conversation_id.as_bytes())
         {
             let secret = self.conv_secret(&state, &ids.conversation_id)?;
-            return self.mutate_on(
-                state,
-                &secret,
-                ids.conversation_id,
-                vec![TxPayload::Confirm],
-            );
+            #[rustfmt::skip]
+            let mut ok = self.mutate_on(state, &secret, ids.conversation_id, vec![TxPayload::Confirm])?;
+            #[rustfmt::skip]
+            self.spawn_child(&mut ok.state, ids.conversation_id)?;
+            return Ok(ok);
         }
-        self.mint_on(state, &ids, TxPayload::Confirm)
+        let mut ok = self.mint_on(state, &ids, TxPayload::Confirm)?;
+        self.spawn_child(&mut ok.state, ids.conversation_id)?;
+        Ok(ok)
     }
 
     /// Reject a handshake fingerprint. Legal on `Confirming`.
@@ -2621,14 +2836,16 @@ impl Engine {
             .ok_or(EngineError::UnknownIds)
     }
 
-    /// Confirmation digest as hex.
+    /// Confirmation digest as `text(fingerprint)`.
     pub fn confirmation_digest(
         &self,
         state: &EngineState,
         ids: &ConversationRef,
     ) -> Result<String, EngineError> {
         self.conv_secret(state, &ids.conversation_id)?;
-        Ok(String::new())
+        self.try_fingerprint(state, ids.conversation_id)
+            .map(|(digest, _)| digest)
+            .ok_or(EngineError::WrongPhase)
     }
 
     /// Ack a posted write.
@@ -2706,7 +2923,12 @@ impl Engine {
         {
             return Err(EngineError::Equivocation);
         }
+        let is_confirm = matches!(body.payload, TxPayload::Confirm);
+        let conversation_id = body.conversation_id;
         state.txs.insert(tx_id, body);
+        if is_confirm {
+            let _ = self.spawn_child(&mut state, conversation_id);
+        }
         let seq = u64::from_be_bytes(
             nonce_bytes[4..]
                 .try_into()
@@ -3005,6 +3227,59 @@ impl Engine {
         } else if get("inviters").is_some() {
             return Err(EngineError::MalformedPersist);
         }
+        if let Some(Json::Array(items)) = get("intake") {
+            for item in items {
+                let Json::Object(m) = item else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                #[rustfmt::skip]
+                let cid = decode_fold32(self.suite.b64u(), getm("conversation_id").ok_or(EngineError::MalformedPersist)?)?;
+                #[rustfmt::skip]
+                let pk = decode_fold_bstr(self.suite.b64u(), getm("pk").ok_or(EngineError::MalformedPersist)?)?;
+                #[rustfmt::skip]
+                let sk = decode_fold_bstr(self.suite.b64u(), getm("sk").ok_or(EngineError::MalformedPersist)?)?;
+                state.intake.insert(cid, KeyPair::from_parts(pk, sk));
+            }
+        } else if get("intake").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
+        parse_fold_shared_map(
+            self.suite.b64u(),
+            get("shared_inviter"),
+            &mut state.shared_inviter,
+        )?;
+        parse_fold_shared_map(
+            self.suite.b64u(),
+            get("shared_invitee"),
+            &mut state.shared_invitee,
+        )?;
+        if let Some(Json::Array(items)) = get("established") {
+            for item in items {
+                let Json::Object(m) = item else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                #[rustfmt::skip]
+                let child = decode_fold32(self.suite.b64u(), getm("conversation_id").ok_or(EngineError::MalformedPersist)?)?;
+                #[rustfmt::skip]
+                let handshake = decode_fold32(self.suite.b64u(), getm("handshake_id").ok_or(EngineError::MalformedPersist)?)?;
+                #[rustfmt::skip]
+                let secret = decode_fold32(self.suite.b64u(), getm("secret").ok_or(EngineError::MalformedPersist)?)?;
+                let sync = match getm("sync") {
+                    Some(Json::Bool(b)) => *b,
+                    None => false,
+                    _ => return Err(EngineError::MalformedPersist),
+                };
+                state.child_secrets.insert(child, secret);
+                state.children.insert(handshake, child);
+                if sync {
+                    state.child_sync.insert(child);
+                }
+            }
+        } else if get("established").is_some() {
+            return Err(EngineError::MalformedPersist);
+        }
         match get("device_enc") {
             Some(Json::Null) | None => {}
             Some(v) => {
@@ -3251,6 +3526,21 @@ impl Engine {
                     state.failed.insert(cid, FailedReason::IntroVerifyFailed);
                     return Ok(Some(Vec::new()));
                 }
+                let policy = notice.policy;
+                if state.inviters.contains(&cid) {
+                    let sk = state.intake.get(&cid).map(|k| k.secret_bytes().to_vec());
+                    if let Some(sk) = sk {
+                        match self.unwrap_shared(policy, &sk, &i.seed_ct) {
+                            Ok(s) => {
+                                state.shared_inviter.insert(cid, s);
+                            }
+                            Err(()) => {
+                                state.failed.insert(cid, FailedReason::IntroVerifyFailed);
+                                return Ok(Some(Vec::new()));
+                            }
+                        }
+                    }
+                }
                 Ok(None)
             }
             TxPayload::InviterIntro(i) => {
@@ -3269,6 +3559,21 @@ impl Engine {
                 ) {
                     state.failed.insert(cid, FailedReason::IntroVerifyFailed);
                     return Ok(Some(Vec::new()));
+                }
+                let policy = notice.policy;
+                if !state.inviters.contains(&cid) {
+                    let sk = state.intake.get(&cid).map(|k| k.secret_bytes().to_vec());
+                    if let Some(sk) = sk {
+                        match self.unwrap_shared(policy, &sk, &i.seed_ct) {
+                            Ok(s) => {
+                                state.shared_invitee.insert(cid, s);
+                            }
+                            Err(()) => {
+                                state.failed.insert(cid, FailedReason::IntroVerifyFailed);
+                                return Ok(Some(Vec::new()));
+                            }
+                        }
+                    }
                 }
                 Ok(None)
             }
@@ -3534,6 +3839,12 @@ fn rekey_conversation(state: &mut EngineState, from: [u8; 32], to: [u8; 32]) {
     if state.inviters.remove(&from) {
         state.inviters.insert(to);
     }
+    rekey_id_map(&mut state.intake, from, to);
+    rekey_id_map(&mut state.shared_inviter, from, to);
+    rekey_id_map(&mut state.shared_invitee, from, to);
+    rekey_id_map(&mut state.children, from, to);
+    rekey_id_map(&mut state.child_secrets, from, to);
+    rekey_id_set(&mut state.child_sync, from, to);
     rekey_prefix(&mut state.send_chains, from, to);
     rekey_prefix(&mut state.recv_chains, from, to);
     rekey_prefix(&mut state.skipped_mks, from, to);
@@ -3565,6 +3876,62 @@ fn decode_fold32(b64u: &dyn super::Base64Url, value: &Json) -> Result<[u8; 32], 
     decode_fold_bstr(b64u, value)?
         .try_into()
         .map_err(|_| EngineError::MalformedPersist)
+}
+
+fn parse_fold_shared_map(
+    b64u: &dyn super::Base64Url,
+    value: Option<&Json>,
+    out: &mut BTreeMap<[u8; 32], [u8; 32]>,
+) -> Result<(), EngineError> {
+    match value {
+        Some(Json::Array(items)) => {
+            for item in items {
+                let Json::Object(m) = item else {
+                    return Err(EngineError::MalformedPersist);
+                };
+                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+                #[rustfmt::skip]
+                let cid = decode_fold32(b64u, getm("conversation_id").ok_or(EngineError::MalformedPersist)?)?;
+                #[rustfmt::skip]
+                let shared = decode_fold32(b64u, getm("shared").ok_or(EngineError::MalformedPersist)?)?;
+                out.insert(cid, shared);
+            }
+            Ok(())
+        }
+        None => Ok(()),
+        Some(_) => Err(EngineError::MalformedPersist),
+    }
+}
+
+fn sort32(a: &[u8; 32], b: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    if a <= b {
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+    } else {
+        out.extend_from_slice(b);
+        out.extend_from_slice(a);
+    }
+    out
+}
+
+fn take_shared32(shared: Vec<u8>) -> [u8; KEM_SHARED_LEN] {
+    let mut out = [0u8; KEM_SHARED_LEN];
+    let n = shared.len().min(KEM_SHARED_LEN);
+    out[..n].copy_from_slice(&shared[..n]);
+    out
+}
+
+fn rekey_id_map<V>(map: &mut BTreeMap<[u8; 32], V>, from: [u8; 32], to: [u8; 32]) {
+    if let Some(v) = map.remove(&from) {
+        map.insert(to, v);
+    }
+}
+
+fn rekey_id_set(set: &mut BTreeSet<[u8; 32]>, from: [u8; 32], to: [u8; 32]) {
+    if set.remove(&from) {
+        set.insert(to);
+    }
 }
 
 fn keypair_json(b64u: &dyn super::Base64Url, pk: &[u8], sk: &[u8]) -> Json {
@@ -3949,7 +4316,7 @@ mod tests {
                 .unwrap_err(),
             EngineError::WrongPhase
         );
-        let _ = engine.confirmation_digest(&acked.state, &ids).expect("cd");
+        let _ = engine.confirmation_digest(&acked.state, &ids).unwrap_err();
         engine
             .delete_conversation(acked.state.clone(), ids)
             .expect("dc");
@@ -5246,6 +5613,154 @@ mod tests {
                     &engine,
                     Json::Object(vec![
                         ("next_seq".into(), Json::Number(1)),
+                        ("intake".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("shared_inviter".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("established".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("shared_invitee".into(), Json::Bool(true)),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        engine
+            .apply_folded(&seal_fold(
+                &engine,
+                Json::Object(vec![
+                    ("next_seq".into(), Json::Number(1)),
+                    (
+                        "established".into(),
+                        Json::Array(vec![Json::Object(vec![
+                            ("conversation_id".into(), Json::String(hex32.clone())),
+                            ("handshake_id".into(), Json::String(hex32.clone())),
+                            ("secret".into(), Json::String(hex32.clone())),
+                        ])]),
+                    ),
+                ]),
+                0,
+            ))
+            .expect("estok");
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "established".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("secret".into(), Json::String(hex32.clone())),
+                            ])]),
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        (
+                            "established".into(),
+                            Json::Array(vec![Json::Object(vec![
+                                ("conversation_id".into(), Json::String(hex32.clone())),
+                                ("handshake_id".into(), Json::String(hex32.clone())),
+                                ("secret".into(), Json::String(hex32.clone())),
+                                ("sync".into(), Json::String("x".into())),
+                            ])]),
+                        ),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("established".into(), Json::Array(vec![Json::Bool(true)])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("shared_inviter".into(), Json::Array(vec![Json::Bool(true)])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
+                        ("intake".into(), Json::Array(vec![Json::Bool(true)])),
+                    ]),
+                    0
+                ))
+                .unwrap_err(),
+            EngineError::MalformedPersist
+        );
+        assert_eq!(
+            engine
+                .apply_folded(&seal_fold(
+                    &engine,
+                    Json::Object(vec![
+                        ("next_seq".into(), Json::Number(1)),
                         ("failed".into(), Json::Array(vec![Json::Bool(true)])),
                     ]),
                     0
@@ -6284,6 +6799,24 @@ mod tests {
                 last_i: None,
             },
         );
+        with_frag_state.intake.insert(
+            *ph_rk.as_bytes(),
+            crate::protocol::v1::KeyPair::from_parts(vec![1], vec![2]),
+        );
+        with_frag_state
+            .shared_inviter
+            .insert(*ph_rk.as_bytes(), [3; 32]);
+        with_frag_state
+            .shared_invitee
+            .insert(*ph_rk.as_bytes(), [4; 32]);
+        with_frag_state.children.insert(*ph_rk.as_bytes(), [5; 32]);
+        with_frag_state
+            .child_secrets
+            .insert(*ph_rk.as_bytes(), [6; 32]);
+        with_frag_state.child_sync.insert(*ph_rk.as_bytes());
+        let _ = super::sort32(&[0; 32], &[1; 32]);
+        let _ = super::sort32(&[1; 32], &[0; 32]);
+        let _ = super::take_shared32(vec![1]);
         with_frag_state.skipped_mks.insert(
             ph_rk.as_bytes().to_vec(),
             vec![super::super::chain::CachedMk {
@@ -6454,6 +6987,7 @@ mod tests {
             .map(|w| (w.channel, w.tag, w.body))
             .collect();
         let sent = ack_all(&engine, minted.state);
+        let sent_gate = sent.clone();
         assert!(matches!(
             engine
                 .get_conversation(&sent, ie_uid, ie_iid, cid)
@@ -6496,8 +7030,18 @@ mod tests {
             Conversation::HandshakeDm(Handshake::Inviter(HandshakeInviter::Confirming {
                 confirmation_digest: ref d,
                 ..
-            })) if d.is_empty()
+            })) if !d.is_empty()
         ));
+        let inv_digest = engine.confirmation_digest(&inv_conf, &ids).expect("invcd");
+        let mut swapped = inv_conf.clone();
+        for tx in swapped.txs.values_mut() {
+            match &mut tx.payload {
+                TxPayload::InviterIntro(i) => i.signing_pk = vec![0xff; i.signing_pk.len()],
+                TxPayload::InviteeIntro(i) => i.signing_pk = vec![0x00; i.signing_pk.len()],
+                _ => {}
+            }
+        }
+        let _ = engine.confirmation_digest(&swapped, &ids).expect("swap");
         let ie_conf = engine
             .ingest_list(
                 sent,
@@ -6517,13 +7061,46 @@ mod tests {
             Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::Confirming {
                 confirmation_digest: ref d,
                 ..
-            })) if d.is_empty()
+            })) if d == &inv_digest
         ));
         let ie_ids = ConversationRef {
             user_id: ie_uid,
             identity_id: ie_iid,
             conversation_id: cid,
         };
+        let confirmed_ie = engine
+            .confirm_established(ie_conf.state.clone(), &rng, ie_ids)
+            .expect("ieconf");
+        let rows_ie = engine
+            .list_conversations(&confirmed_ie.state, ie_uid, ie_iid)
+            .expect("ielist");
+        assert_eq!(rows_ie.len(), 2);
+        let child_ie = rows_ie
+            .iter()
+            .find_map(|r| match r.conversation {
+                Conversation::DirectMessage(DirectMessageQuery::Established) => {
+                    Some(r.conversation_id)
+                }
+                _ => None,
+            })
+            .expect("iechild");
+        assert!(matches!(
+            engine
+                .get_conversation(&confirmed_ie.state, ie_uid, ie_iid, cid)
+                .expect("ieh"),
+            Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::Confirming { .. }))
+        ));
+        assert_eq!(
+            engine
+                .confirm_established(confirmed_ie.state.clone(), &rng, ie_ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
+        let mut child_ids = ie_ids;
+        child_ids.conversation_id = child_ie;
+        engine
+            .delete_conversation(confirmed_ie.state.clone(), child_ids)
+            .expect("delchild");
         let rejected = engine
             .reject_established(ie_conf.state.clone(), &rng, ie_ids)
             .expect("rej");
@@ -6540,8 +7117,56 @@ mod tests {
             engine
                 .get_conversation(&confirmed.state, uid, iid, cid)
                 .expect("est"),
+            Conversation::HandshakeDm(Handshake::Inviter(HandshakeInviter::Confirming { .. }))
+        ));
+        let rows = engine
+            .list_conversations(&confirmed.state, uid, iid)
+            .expect("list");
+        assert_eq!(rows.len(), 2);
+        let child = rows
+            .iter()
+            .find_map(|r| match r.conversation {
+                Conversation::DirectMessage(DirectMessageQuery::Established) => {
+                    Some(r.conversation_id)
+                }
+                _ => None,
+            })
+            .expect("child");
+        assert_eq!(child, child_ie);
+        assert!(matches!(
+            engine
+                .get_conversation(&confirmed.state, uid, iid, child)
+                .expect("chq"),
             Conversation::DirectMessage(DirectMessageQuery::Established)
         ));
+        assert_eq!(
+            engine
+                .confirm_established(confirmed.state.clone(), &rng, ids)
+                .unwrap_err(),
+            EngineError::WrongPhase
+        );
+        let snap_c = engine.fold(confirmed.state.clone()).expect("cfold");
+        let restored_c = engine.apply_folded(&snap_c.snapshot).expect("caf");
+        assert!(matches!(
+            engine
+                .get_conversation(&restored_c, uid, iid, child)
+                .expect("chf"),
+            Conversation::DirectMessage(DirectMessageQuery::Established)
+        ));
+        let mut no_map = confirmed.state.clone();
+        no_map.children.clear();
+        let _ = engine.fold(no_map).expect("nfold");
+        let persist = confirmed.persist()[0].clone();
+        let applied = engine.apply(inv_conf.clone(), &persist).expect("applyc");
+        assert!(applied.child_secrets.contains_key(child.as_bytes()));
+        let _ = engine.apply(applied, &persist).expect("applyc2");
+        let mut missing = inv_conf.clone();
+        missing.shared_inviter.clear();
+        missing.shared_invitee.clear();
+        assert_eq!(
+            engine.confirm_established(missing, &rng, ids).unwrap_err(),
+            EngineError::MalformedPayload
+        );
         let expired = engine.tick(inv_conf.clone(), 1_900_000_000).expect("exp");
         assert!(matches!(
             engine
@@ -6588,6 +7213,7 @@ mod tests {
                 .expect("dnr"),
             Conversation::HandshakeDm(Handshake::Invitee(HandshakeInvitee::InviteReceived { .. }))
         ));
+        let invitee_notice = got_notice.state.clone();
         let named_ie = engine
             .set_display_name(got_notice.state, &rng, duid, diid, "Cyd")
             .expect("setn");
@@ -6721,6 +7347,143 @@ mod tests {
             verify_state.failed.get(cid.as_bytes()),
             Some(&FailedReason::IntroVerifyFailed)
         );
+        let mut unwrap_ct = vec![0u8; 32];
+        unwrap_ct[0] = 0xee;
+        unwrap_ct[1] = 0xfd;
+        let unwrap_fail = TxPayload::InviteeIntro(TxInviteeIntro {
+            name: DisplayName::try_from("X").expect("dnu"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([1; 32]),
+            eph_send_tag_key: TagKey::from_bytes([2; 32]),
+            encryption_pk: vec![1; 32],
+            signing_pk: vec![1; 32],
+            intake_pk: vec![1; 32],
+            seed_ct: unwrap_ct.clone(),
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut unwrap_state = pinned.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut unwrap_state, *cid.as_bytes(), &unwrap_fail)
+            .expect("gu");
+        assert!(gated.is_some());
+        assert_eq!(
+            unwrap_state.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        unwrap_ct[1] = 0xfe;
+        let short_shared = TxPayload::InviteeIntro(TxInviteeIntro {
+            name: DisplayName::try_from("X").expect("dns"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([1; 32]),
+            eph_send_tag_key: TagKey::from_bytes([2; 32]),
+            encryption_pk: vec![1; 32],
+            signing_pk: vec![1; 32],
+            intake_pk: vec![1; 32],
+            seed_ct: unwrap_ct.clone(),
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut short_state = pinned.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut short_state, *cid.as_bytes(), &short_shared)
+            .expect("gs");
+        assert!(gated.is_some());
+        assert_eq!(
+            short_state.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        unwrap_ct[1] = 0xfd;
+        let inviter_unwrap = TxPayload::InviterIntro(super::super::payload::TxInviterIntro {
+            name: DisplayName::try_from("Y").expect("dnv"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([3; 32]),
+            eph_send_tag_key: TagKey::from_bytes([4; 32]),
+            encryption_pk: vec![1; 32],
+            signing_pk: vec![1; 32],
+            seed_ct: unwrap_ct,
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut ie_unwrap = sent_gate.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut ie_unwrap, *cid.as_bytes(), &inviter_unwrap)
+            .expect("giv");
+        assert!(gated.is_some());
+        assert_eq!(
+            ie_unwrap.failed.get(cid.as_bytes()),
+            Some(&FailedReason::IntroVerifyFailed)
+        );
+        let ok_invitee = TxPayload::InviteeIntro(TxInviteeIntro {
+            name: DisplayName::try_from("X").expect("dnx"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([1; 32]),
+            eph_send_tag_key: TagKey::from_bytes([2; 32]),
+            encryption_pk: vec![1; 32],
+            signing_pk: vec![1; 32],
+            intake_pk: vec![1; 32],
+            seed_ct: vec![1; 32],
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut no_sk_inv = pinned.clone();
+        no_sk_inv.intake.clear();
+        let gated = engine
+            .handshake_ingest_gate(&mut no_sk_inv, *cid.as_bytes(), &ok_invitee)
+            .expect("nski");
+        assert!(gated.is_none());
+        let ok_inviter = TxPayload::InviterIntro(super::super::payload::TxInviterIntro {
+            name: DisplayName::try_from("Y").expect("dny"),
+            profile_pic: None,
+            send_tag_key: TagKey::from_bytes([3; 32]),
+            eph_send_tag_key: TagKey::from_bytes([4; 32]),
+            encryption_pk: vec![1; 32],
+            signing_pk: vec![1; 32],
+            seed_ct: vec![1; 32],
+            prefs: OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
+        });
+        let mut no_sk_ie = sent_gate;
+        no_sk_ie.intake.clear();
+        let gated = engine
+            .handshake_ingest_gate(&mut no_sk_ie, *cid.as_bytes(), &ok_inviter)
+            .expect("nskie");
+        assert!(gated.is_none());
+        let mut role_ie = invitee_notice;
+        let gated = engine
+            .handshake_ingest_gate(&mut role_ie, *cid.as_bytes(), &ok_invitee)
+            .expect("roleie");
+        assert!(gated.is_none());
+        let mut role_inv = pinned.clone();
+        let gated = engine
+            .handshake_ingest_gate(&mut role_inv, *cid.as_bytes(), &ok_inviter)
+            .expect("roleinv");
+        assert!(gated.is_none());
         let mut dup_state = named_ie.state.clone();
         let gated = engine
             .handshake_ingest_gate(&mut dup_state, *cid.as_bytes(), &bad_intro)
@@ -7244,7 +8007,7 @@ mod tests {
             Conversation::HandshakeSync(Handshake::Inviter(HandshakeInviter::Confirming {
                 confirmation_digest: ref d,
                 ..
-            })) if d.is_empty()
+            })) if !d.is_empty()
         ));
         let ie_conf = engine
             .ingest_list(
@@ -7265,8 +8028,17 @@ mod tests {
             Conversation::HandshakeSync(Handshake::Invitee(HandshakeInvitee::Confirming {
                 confirmation_digest: ref d,
                 ..
-            })) if d.is_empty()
+            })) if !d.is_empty()
         ));
+        let mut missing_sync = ie_conf.state.clone();
+        missing_sync.shared_inviter.clear();
+        missing_sync.shared_invitee.clear();
+        assert_eq!(
+            engine
+                .confirm_established(missing_sync, &rng, ids)
+                .unwrap_err(),
+            EngineError::MalformedPayload
+        );
         let rejected = engine
             .reject_established(inv_conf.clone(), &rng, ids)
             .expect("rej");
@@ -7283,8 +8055,38 @@ mod tests {
             engine
                 .get_conversation(&confirmed.state, zeros, zid, sid)
                 .expect("est"),
+            Conversation::HandshakeSync(Handshake::Invitee(HandshakeInvitee::Confirming { .. }))
+        ));
+        let rows = engine
+            .list_conversations(&confirmed.state, zeros, zid)
+            .expect("slist");
+        assert_eq!(rows.len(), 2);
+        let child = rows
+            .iter()
+            .find_map(|r| match r.conversation {
+                Conversation::Synchronization(SynchronizationQuery::SyncEstablished) => {
+                    Some(r.conversation_id)
+                }
+                _ => None,
+            })
+            .expect("schild");
+        assert!(matches!(
+            engine
+                .get_conversation(&confirmed.state, zeros, zid, child)
+                .expect("schq"),
             Conversation::Synchronization(SynchronizationQuery::SyncEstablished)
         ));
+        let snap_s = engine.fold(confirmed.state.clone()).expect("sfoldc");
+        let restored_s = engine.apply_folded(&snap_s.snapshot).expect("safc");
+        assert!(restored_s.child_sync.contains(child.as_bytes()));
+        let mut child_ids = ids;
+        child_ids.conversation_id = child;
+        engine
+            .delete_conversation(confirmed.state.clone(), child_ids)
+            .expect("delschild");
+        engine
+            .leave_sync(confirmed.state.clone(), &rng)
+            .expect("lsync");
         let expired = engine.tick(inv_conf, 1_900_000_000).expect("exp");
         assert!(matches!(
             engine
