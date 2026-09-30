@@ -34,6 +34,18 @@ macro_rules! bytes32_type {
             }
         }
 
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+                self.0.cmp(&other.0)
+            }
+        }
+
         impl core::fmt::Debug for $name {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 f.write_str($debug)
@@ -133,5 +145,6 @@ mod tests {
         assert_eq!(format!("{:?}", Tag::from(r.clone())), "Tag(..)");
         assert_eq!(format!("{:?}", TagKey::from(r)), "TagKey(..)");
         assert_ne!(UserId::from_bytes([1; 32]), UserId::from_bytes([2; 32]));
+        assert!(UserId::from_bytes([1; 32]) < UserId::from_bytes([2; 32]));
     }
 }
