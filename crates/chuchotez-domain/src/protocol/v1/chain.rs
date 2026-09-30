@@ -329,13 +329,13 @@ pub(crate) fn packed_tx(suite: &Suite, body: &DurableBody) -> Vec<u8> {
 }
 
 pub(crate) fn set_xor_for(
-    txs: &std::collections::BTreeMap<[u8; 32], DurableBody>,
+    txs: &std::collections::BTreeMap<Tag, DurableBody>,
     conversation_id: ConversationId,
 ) -> Tag {
     let mut acc = [0u8; 32];
     for (id, body) in txs {
         if body.conversation_id == conversation_id {
-            for (a, b) in acc.iter_mut().zip(id.iter()) {
+            for (a, b) in acc.iter_mut().zip(id.as_bytes().iter()) {
                 *a ^= *b;
             }
         }
@@ -593,7 +593,7 @@ mod tests {
         let cid = ConversationId::from_bytes([4; 32]);
         let mut txs = BTreeMap::new();
         txs.insert(
-            [9; 32],
+            tx_id,
             DurableBody {
                 conversation_id: cid,
                 hlc: Hlc {
