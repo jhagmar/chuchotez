@@ -6,6 +6,7 @@ use super::super::{
     UserId,
 };
 use super::helpers::*;
+use super::party::HandshakeFailure;
 use super::query::*;
 use super::{Engine, EngineState};
 use crate::protocol::Rng;
@@ -17,15 +18,11 @@ impl Engine {
         ids: ConversationRef,
     ) -> Result<MutateOk, EngineError> {
         let cid = ids.conversation_id;
-        if state.established(cid).is_some() {
+        if state.established_secret(cid).is_some() {
             if !state.is_sync(cid) {
                 self.require_ids(&state, &ids)?;
             }
-            if let Some((_, super::state::ConversationNode::Established(es))) = state.take_node(cid)
-                && let Some(hs) = state.handshake_mut(es.parent)
-            {
-                hs.clear_child_if(cid);
-            }
+            let _ = state.drop_conversation(cid);
             return Ok(MutateOk {
                 state,
                 persist: Vec::new(),
@@ -34,16 +31,7 @@ impl Engine {
         }
         self.require_ids(&state, &ids)?;
         let ticket = state.ticket(cid).cloned().ok_or(EngineError::UnknownIds)?;
-        let _ = state.take_node(cid);
-        state
-            .send_chains
-            .retain(|k, _| k.get(..32) != Some(cid.as_bytes().as_slice()));
-        state
-            .recv_chains
-            .retain(|k, _| k.get(..32) != Some(cid.as_bytes().as_slice()));
-        state
-            .skipped_mks
-            .retain(|k, _| k.get(..32) != Some(cid.as_bytes().as_slice()));
+        let _ = state.drop_conversation(cid);
         state.frags.retain(|_, f| f.conversation_id != cid);
         let tag_key = handshake_tag_key(self.suite.hmac(), ticket.secret.as_bytes());
         for ch in &ticket.persistents {
@@ -88,9 +76,16 @@ impl Engine {
         self.require_confirming(&state, &ids)?;
         if state.is_sync(ids.conversation_id) {
             let secret = self.conv_secret(&state, &ids.conversation_id)?;
-            return self.mutate_on(state, &secret, ids.conversation_id, vec![TxPayload::Reject]);
+            let mut ok =
+                self.mutate_on(state, &secret, ids.conversation_id, vec![TxPayload::Reject])?;
+            ok.state
+                .fail(ids.conversation_id, HandshakeFailure::ConfirmationRejected);
+            return Ok(ok);
         }
-        self.mint_on(state, &ids, TxPayload::Reject)
+        let mut ok = self.mint_on(state, &ids, TxPayload::Reject)?;
+        ok.state
+            .fail(ids.conversation_id, HandshakeFailure::ConfirmationRejected);
+        Ok(ok)
     }
 
     /// Create a group from Established DMs.
@@ -430,6 +425,7 @@ impl Engine {
         if state.writes.len() == before {
             return Err(EngineError::UnknownWrite);
         }
+        self.advance_ack_phases(&mut state);
         Ok(MutateOk {
             state,
             persist: Vec::new(),

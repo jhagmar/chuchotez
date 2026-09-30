@@ -14,7 +14,7 @@ use super::payload::{
 };
 use super::{
     Base64Url, ConversationId, DeviceId, IdentityId, Json, KeyPair, Secret, SigningKeyPair, Tag,
-    TagKey, UserId,
+    TagKey, UnixSeconds, UserId,
 };
 
 pub(crate) fn bstr(b64u: &dyn Base64Url, bytes: &[u8]) -> Json {
@@ -98,7 +98,7 @@ pub(crate) fn ticket_to_json(b64u: &dyn Base64Url, ticket: &Ticket) -> Json {
             "persistents".into(),
             Json::Array(ticket.persistents.iter().map(durable_json).collect()),
         ),
-        ("expires".into(), Json::Number(ticket.expires)),
+        ("expires".into(), Json::Number(ticket.expires.as_u64())),
     ])
 }
 
@@ -117,7 +117,7 @@ pub(crate) fn ticket_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tic
     Ok(Ticket {
         secret,
         persistents,
-        expires: get_u64(m, "expires")?,
+        expires: UnixSeconds::from_u64(get_u64(m, "expires")?),
     })
 }
 
@@ -229,7 +229,7 @@ pub(crate) fn payload_to_json(b64u: &dyn Base64Url, payload: &TxPayload) -> Json
                 "ephemerals".into(),
                 Json::Array(n.ephemerals.iter().map(ephemeral_json).collect()),
             ));
-            members.push(("expires".into(), Json::Number(n.expires)));
+            members.push(("expires".into(), Json::Number(n.expires.as_u64())));
         }
         TxPayload::Confirm | TxPayload::Reject | TxPayload::EngineInit | TxPayload::GroupLeave => {}
         TxPayload::EngineCreateUser { user_id } => {
@@ -315,7 +315,9 @@ pub(crate) fn payload_to_json(b64u: &dyn Base64Url, payload: &TxPayload) -> Json
             ));
             members.push((
                 "expire_at".into(),
-                t.expire_at.map(Json::Number).unwrap_or(Json::Null),
+                t.expire_at
+                    .map(|t| Json::Number(t.as_u64()))
+                    .unwrap_or(Json::Null),
             ));
         }
         TxPayload::Edit(e) => {
@@ -495,7 +497,9 @@ fn media_fields(b64u: &dyn Base64Url, m: &TxMedia) -> Vec<(String, Json)> {
         ),
         (
             "expire_at".into(),
-            m.expire_at.map(Json::Number).unwrap_or(Json::Null),
+            m.expire_at
+                .map(|t| Json::Number(t.as_u64()))
+                .unwrap_or(Json::Null),
         ),
     ]
 }
@@ -836,7 +840,7 @@ fn parse_media(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxMedia, ()
         tag: get_tag(b64u, m, "tag")?,
         caption: parse_opt_str(get(m, "caption")?)?,
         reply_to: parse_opt_tag(b64u, get(m, "reply_to")?)?,
-        expire_at: parse_opt_u64(get(m, "expire_at")?)?,
+        expire_at: parse_opt_u64(get(m, "expire_at")?)?.map(UnixSeconds::from_u64),
     })
 }
 
@@ -919,7 +923,7 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
                 intake_pk: get_bstr(b64u, m, "intake_pk")?,
                 persistents: parse_durable_list(get(m, "persistents")?)?,
                 ephemerals: parse_ephemeral_list(get(m, "ephemerals")?)?,
-                expires: get_u64(m, "expires")?,
+                expires: UnixSeconds::from_u64(get_u64(m, "expires")?),
             }))
         }
         "v1-handshake-inviter-intro" => Ok(TxPayload::InviterIntro(parse_intro(b64u, m)?)),
@@ -937,7 +941,7 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
             Ok(TxPayload::Text(TxText {
                 body: get_str(m, "body")?.into(),
                 reply_to: parse_opt_tag(b64u, get(m, "reply_to")?)?,
-                expire_at: parse_opt_u64(get(m, "expire_at")?)?,
+                expire_at: parse_opt_u64(get(m, "expire_at")?)?.map(UnixSeconds::from_u64),
             }))
         }
         "v1-edit" => {
@@ -1526,7 +1530,7 @@ mod tests {
     use super::super::{
         Address, Base64Url, Base64UrlError, ConversationId, DeviceId, DurableChannel, EngineError,
         EphemeralChannel, IdentityId, Json, KeyPair, Kind, Secret, SigningKeyPair, Tag, TagKey,
-        UserId, Wake,
+        UnixSeconds, UserId, Wake,
     };
     use super::{
         bstr, durable_body_from_json, durable_body_to_json, durable_json, extra_ok, get, get_bool,
@@ -1576,11 +1580,11 @@ mod tests {
         let ticket = Ticket {
             secret: Secret::from_bytes([9; 32]),
             persistents: vec![ch.clone()],
-            expires: 99,
+            expires: UnixSeconds::from_u64(99),
         };
         let json = ticket_to_json(&Hex, &ticket);
         let back = ticket_from_json(&Hex, &json).expect("parse");
-        assert_eq!(back.expires, 99);
+        assert_eq!(back.expires, UnixSeconds::from_u64(99));
         assert!(Hex.decode("a").is_err());
         assert!(Hex.decode("zz").is_err());
         assert!(Hex.decode("0g").is_err());
@@ -1724,7 +1728,7 @@ mod tests {
             intake_pk: vec![1, 2, 3],
             persistents: vec![ch()],
             ephemerals: vec![eph()],
-            expires: 9,
+            expires: UnixSeconds::from_u64(9),
         }));
         roundtrip(TxPayload::InviterIntro(TxInviterIntro {
             name: name(),
@@ -1750,7 +1754,7 @@ mod tests {
         roundtrip(TxPayload::Text(TxText {
             body: "hi".into(),
             reply_to: Some(tag),
-            expire_at: Some(3),
+            expire_at: Some(UnixSeconds::from_u64(3)),
         }));
         roundtrip(TxPayload::Text(TxText {
             body: "hi".into(),
@@ -1778,7 +1782,7 @@ mod tests {
             tag,
             caption: Some("c".into()),
             reply_to: Some(tag),
-            expire_at: Some(9),
+            expire_at: Some(UnixSeconds::from_u64(9)),
         }));
         roundtrip(TxPayload::Advertise { encaps_pk: vec![1] });
         roundtrip(TxPayload::Wrap { kem_ct: vec![2] });
@@ -1984,7 +1988,7 @@ mod tests {
                 intake_pk: vec![1],
                 persistents: vec![ch()],
                 ephemerals: vec![eph()],
-                expires: 1,
+                expires: UnixSeconds::from_u64(1),
             }),
             TxPayload::InviterIntro(TxInviterIntro {
                 name: name(),

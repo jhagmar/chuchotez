@@ -1,14 +1,16 @@
 //! Folded engine CRDT and local identity directory.
 
-#[cfg(test)]
-use super::super::chain::chain_key;
 use super::super::chain::{CachedMk, SendChain};
 use super::super::kem::KeyPair;
 use super::super::payload::{ConversationSort, DurableBody, Ticket};
 use super::super::sign::SigningKeyPair;
 use super::super::{
-    ConversationId, DeviceId, DisplayName, DurableChannel, IdentityId, ProfilePic, Secret, Tag,
-    TagKey, UserId,
+    ActorId, ConversationId, DeviceId, DisplayName, DurableChannel, FragIndex, IdentityId,
+    PersistSeq, ProfilePic, Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
+};
+use super::party::{
+    DeviceConversation, DmParty, HandshakeFailure, IdentityConversation, InviteePhase,
+    InviterPhase, PartyMut, PartyRef, SyncParty,
 };
 use super::query::{BlobPut, DurableWrite, EphemeralWrite, FailedReason};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,16 +28,16 @@ pub(super) struct BinKey {
 pub(super) struct BinProgress {
     pub(super) channel: DurableChannel,
     pub(super) tag_key: TagKey,
-    pub(super) watermark: Option<u64>,
-    pub(super) completed: BTreeSet<u64>,
+    pub(super) watermark: Option<TimeBin>,
+    pub(super) completed: BTreeSet<TimeBin>,
 }
 
 /// Partial fragments of one `tx_id` until Last arrives.
 #[derive(Clone, Debug)]
 pub(super) struct FragSet {
     pub(super) conversation_id: ConversationId,
-    pub(super) parts: BTreeMap<u64, Vec<u8>>,
-    pub(super) last_i: Option<u64>,
+    pub(super) parts: BTreeMap<FragIndex, Vec<u8>>,
+    pub(super) last_i: Option<FragIndex>,
 }
 
 /// A handshake ticket whose InviteTag matches an ingested packet.
@@ -43,217 +45,61 @@ pub(super) struct HandshakeHit {
     pub(super) cid: ConversationId,
     pub(super) secret: Secret,
     pub(super) sort: ConversationSort,
-    pub(super) bin: u64,
+    pub(super) bin: TimeBin,
     pub(super) tag_key: TagKey,
 }
 
-/// Inviter minted the ticket; invitee received it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HandshakeRole {
-    Inviter,
-    Invitee,
+/// Packet chains, skip-ahead `mk`s, and last Persistent acks for one conversation.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ConversationChains {
+    pub(super) send: BTreeMap<ActorId, SendChain>,
+    pub(super) recv: BTreeMap<ActorId, SendChain>,
+    pub(super) skipped_mks: BTreeMap<ActorId, Vec<CachedMk>>,
+    pub(super) last_acks: BTreeMap<ActorId, BTreeSet<Tag>>,
 }
 
-/// Handshake secrets that live only while the row is still open.
+/// DM conversation row: phase plus packet chains.
 #[derive(Clone, Debug)]
-pub(super) struct HandshakeOpen {
-    pub(super) intake: Option<KeyPair>,
-    pub(super) shared_inviter: Option<Secret>,
-    pub(super) shared_invitee: Option<Secret>,
-    pub(super) child: Option<ConversationId>,
+pub(super) struct IdentityNode {
+    pub(super) kind: IdentityConversation,
+    pub(super) chains: ConversationChains,
 }
 
-/// Open handshake, or a stored [`FailedReason`].
+/// Sync conversation row: phase plus packet chains.
 #[derive(Clone, Debug)]
-pub(super) enum HandshakePhase {
-    Open(HandshakeOpen),
-    Failed(FailedReason),
+pub(super) struct DeviceNode {
+    pub(super) kind: DeviceConversation,
+    pub(super) chains: ConversationChains,
 }
 
-/// One handshake conversation: ticket, role, and either open secrets or a failure.
-#[derive(Clone, Debug)]
-pub(super) struct HandshakeSession {
-    pub(super) ticket: Ticket,
-    pub(super) role: HandshakeRole,
-    pub(super) phase: HandshakePhase,
-}
-
-impl HandshakeSession {
-    pub(super) fn open(ticket: Ticket, role: HandshakeRole) -> Self {
+impl IdentityNode {
+    pub(super) fn handshake(party: DmParty) -> Self {
         Self {
-            ticket,
-            role,
-            phase: HandshakePhase::Open(HandshakeOpen {
-                intake: None,
-                shared_inviter: None,
-                shared_invitee: None,
-                child: None,
-            }),
+            kind: IdentityConversation::DmHandshake(party),
+            chains: ConversationChains::default(),
         }
     }
 
-    pub(super) fn failed(ticket: Ticket, role: HandshakeRole, reason: FailedReason) -> Self {
+    pub(super) fn direct(secret: Secret, parent: ConversationId) -> Self {
         Self {
-            ticket,
-            role,
-            phase: HandshakePhase::Failed(reason),
-        }
-    }
-
-    pub(super) fn with_intake(mut self, intake: Option<KeyPair>) -> Self {
-        self.set_intake_opt(intake);
-        self
-    }
-
-    pub(super) fn with_shared_inviter(mut self, shared: Option<Secret>) -> Self {
-        if let HandshakePhase::Open(open) = &mut self.phase {
-            open.shared_inviter = shared;
-        }
-        self
-    }
-
-    pub(super) fn with_shared_invitee(mut self, shared: Option<Secret>) -> Self {
-        if let HandshakePhase::Open(open) = &mut self.phase {
-            open.shared_invitee = shared;
-        }
-        self
-    }
-
-    pub(super) fn with_child(mut self, child: Option<ConversationId>) -> Self {
-        if let HandshakePhase::Open(open) = &mut self.phase {
-            open.child = child;
-        }
-        self
-    }
-
-    pub(super) fn fail(&mut self, reason: FailedReason) {
-        self.phase = HandshakePhase::Failed(reason);
-    }
-
-    pub(super) fn failed_reason(&self) -> Option<FailedReason> {
-        match self.phase {
-            HandshakePhase::Failed(reason) => Some(reason),
-            HandshakePhase::Open(_) => None,
-        }
-    }
-
-    pub(super) fn is_inviter(&self) -> bool {
-        matches!(self.role, HandshakeRole::Inviter)
-    }
-
-    pub(super) fn open_mut(&mut self) -> Option<&mut HandshakeOpen> {
-        match &mut self.phase {
-            HandshakePhase::Open(open) => Some(open),
-            HandshakePhase::Failed(_) => None,
-        }
-    }
-
-    pub(super) fn open_ref(&self) -> Option<&HandshakeOpen> {
-        match &self.phase {
-            HandshakePhase::Open(open) => Some(open),
-            HandshakePhase::Failed(_) => None,
-        }
-    }
-
-    pub(super) fn intake(&self) -> Option<&KeyPair> {
-        self.open_ref().and_then(|o| o.intake.as_ref())
-    }
-
-    pub(super) fn set_intake_opt(&mut self, intake: Option<KeyPair>) {
-        if let Some(open) = self.open_mut() {
-            open.intake = intake;
-        }
-    }
-
-    pub(super) fn set_intake(&mut self, intake: KeyPair) {
-        self.set_intake_opt(Some(intake));
-    }
-
-    pub(super) fn shared_inviter(&self) -> Option<&Secret> {
-        self.open_ref().and_then(|o| o.shared_inviter.as_ref())
-    }
-
-    pub(super) fn set_shared_inviter(&mut self, shared: Secret) {
-        if let Some(open) = self.open_mut() {
-            open.shared_inviter = Some(shared);
-        }
-    }
-
-    pub(super) fn shared_invitee(&self) -> Option<&Secret> {
-        self.open_ref().and_then(|o| o.shared_invitee.as_ref())
-    }
-
-    pub(super) fn set_shared_invitee(&mut self, shared: Secret) {
-        if let Some(open) = self.open_mut() {
-            open.shared_invitee = Some(shared);
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn clear_intake(&mut self) {
-        self.set_intake_opt(None);
-    }
-
-    #[cfg(test)]
-    pub(super) fn clear_shared(&mut self) {
-        if let Some(open) = self.open_mut() {
-            open.shared_inviter = None;
-            open.shared_invitee = None;
-        }
-    }
-
-    pub(super) fn child(&self) -> Option<ConversationId> {
-        self.open_ref().and_then(|o| o.child)
-    }
-
-    pub(super) fn set_child(&mut self, child: ConversationId) {
-        if let Some(open) = self.open_mut() {
-            open.child = Some(child);
-        }
-    }
-
-    pub(super) fn clear_child_if(&mut self, child: ConversationId) {
-        if let Some(open) = self.open_mut()
-            && open.child == Some(child)
-        {
-            open.child = None;
+            kind: IdentityConversation::DirectMessage { secret, parent },
+            chains: ConversationChains::default(),
         }
     }
 }
 
-/// Spawned DM or Sync conversation whose secret is `spawn_secret`.
-#[derive(Clone, Debug)]
-pub(super) struct EstablishedSession {
-    pub(super) secret: Secret,
-    pub(super) parent: ConversationId,
-}
-
-/// Conversation row owned by an identity or by this device.
-#[derive(Clone, Debug)]
-pub(super) enum ConversationNode {
-    Handshake(HandshakeSession),
-    Established(EstablishedSession),
-}
-
-impl ConversationNode {
-    fn handshake(&self) -> Option<&HandshakeSession> {
-        match self {
-            Self::Handshake(hs) => Some(hs),
-            Self::Established(_) => None,
+impl DeviceNode {
+    pub(super) fn handshake(party: SyncParty) -> Self {
+        Self {
+            kind: DeviceConversation::SyncHandshake(party),
+            chains: ConversationChains::default(),
         }
     }
 
-    fn handshake_mut(&mut self) -> Option<&mut HandshakeSession> {
-        match self {
-            Self::Handshake(hs) => Some(hs),
-            Self::Established(_) => None,
-        }
-    }
-
-    fn established(&self) -> Option<&EstablishedSession> {
-        match self {
-            Self::Established(es) => Some(es),
-            Self::Handshake(_) => None,
+    pub(super) fn sync(secret: Secret, parent: ConversationId) -> Self {
+        Self {
+            kind: DeviceConversation::Synchronization { secret, parent },
+            chains: ConversationChains::default(),
         }
     }
 }
@@ -263,7 +109,7 @@ impl ConversationNode {
 pub(super) struct Identity {
     pub(super) name: Option<DisplayName>,
     pub(super) pic: Option<ProfilePic>,
-    pub(super) conversations: BTreeMap<ConversationId, ConversationNode>,
+    pub(super) conversations: BTreeMap<ConversationId, IdentityNode>,
 }
 
 /// One user: identities keyed by `IdentityId`.
@@ -276,10 +122,16 @@ pub(super) struct User {
 #[derive(Clone, Debug, Default)]
 pub(super) struct Device {
     pub(super) name: Option<DisplayName>,
+    pub(super) keys: Option<DeviceKeys>,
+    pub(super) conversations: BTreeMap<ConversationId, DeviceNode>,
+}
+
+/// Encryption and signing keys for this device. `id` is set when this device invites.
+#[derive(Clone, Debug)]
+pub(super) struct DeviceKeys {
     pub(super) id: Option<DeviceId>,
-    pub(super) enc: Option<KeyPair>,
-    pub(super) sign: Option<SigningKeyPair>,
-    pub(super) conversations: BTreeMap<ConversationId, ConversationNode>,
+    pub(super) enc: KeyPair,
+    pub(super) sign: SigningKeyPair,
 }
 
 /// Where a conversation row lives.
@@ -293,8 +145,9 @@ pub(super) enum ConversationScope {
 ///
 /// `txs` is the protocol CRDT: one set of `DurableBody` keyed by `tx_id`. Merge,
 /// persist, `set_xor`, and Sync gossip walk that set. Conversation query filters
-/// it. Packet chain, fragment, and list-bin maps stay keyed for ingest that
-/// matches InviteTag before a packet names an identity.
+/// it. Packet chains and last Persistent acks live on that row. Invite-tag
+/// `BinProgress` stays keyed by channel and tag-key so ingest can match
+/// InviteTag before a packet names an identity.
 ///
 /// `users` and `device` are the local directory. An identity owns its DM
 /// conversations. Sync conversations live on this device and appear on every
@@ -306,42 +159,25 @@ pub struct EngineState {
     /// Durable bodies keyed by `tx_id`.
     pub(super) txs: BTreeMap<Tag, DurableBody>,
     /// Next persist-record sequence number.
-    pub(super) next_seq: u64,
+    pub(super) next_seq: PersistSeq,
     /// Last `tick` Unix seconds.
-    pub(super) ticked: Option<u64>,
+    pub(super) ticked: Option<UnixSeconds>,
     /// Outstanding durable 512-byte writes.
     pub(super) writes: Vec<DurableWrite>,
     /// Outstanding ephemeral 512-byte writes.
     pub(super) eph_writes: Vec<EphemeralWrite>,
     /// Outstanding blob puts.
     pub(super) blob_puts: Vec<BlobPut>,
-    /// Sending packet chains, keyed by `chain_key(conversation_id, actor_id)`.
-    pub(super) send_chains: BTreeMap<Vec<u8>, SendChain>,
-    /// Receiving packet chains, keyed by the same chain key.
-    pub(super) recv_chains: BTreeMap<Vec<u8>, SendChain>,
-    /// Skip-ahead `mk` cache, keyed by the same chain key.
-    pub(super) skipped_mks: BTreeMap<Vec<u8>, Vec<CachedMk>>,
     /// In-flight packet fragments keyed by `tx_id`.
     pub(super) frags: BTreeMap<Tag, FragSet>,
     /// Invite-tag list-bin watermarks.
     pub(super) bin_progress: BTreeMap<BinKey, BinProgress>,
+    /// Persist seq to `tx_id` for fold watermark checks.
+    pub(super) persist_log: BTreeMap<PersistSeq, Tag>,
     /// Users, identities, and DM conversations.
     pub(super) users: BTreeMap<UserId, User>,
     /// This device and its Sync conversations.
     pub(super) device: Device,
-}
-
-/// Parsed fold arrays assembled into the identity directory.
-pub(super) struct FoldDirectory {
-    pub(super) tickets: Vec<(ConversationId, Ticket, bool)>,
-    pub(super) owners: BTreeMap<ConversationId, (UserId, IdentityId)>,
-    pub(super) inviters: BTreeSet<ConversationId>,
-    pub(super) intake: BTreeMap<ConversationId, KeyPair>,
-    pub(super) shared_inviter: BTreeMap<ConversationId, Secret>,
-    pub(super) shared_invitee: BTreeMap<ConversationId, Secret>,
-    pub(super) failed: BTreeMap<ConversationId, FailedReason>,
-    pub(super) children: BTreeMap<ConversationId, ConversationId>,
-    pub(super) established: Vec<(ConversationId, ConversationId, Secret, bool)>,
 }
 
 impl EngineState {
@@ -401,52 +237,53 @@ impl EngineState {
         user: UserId,
         identity: IdentityId,
         cid: ConversationId,
-        node: ConversationNode,
+        node: IdentityNode,
     ) {
         self.ensure_identity(user, identity)
             .conversations
             .insert(cid, node);
     }
 
-    pub(super) fn put_sync(&mut self, cid: ConversationId, node: ConversationNode) {
+    pub(super) fn put_sync(&mut self, cid: ConversationId, node: DeviceNode) {
         self.device.conversations.insert(cid, node);
     }
 
-    pub(super) fn put_handshake(
+    pub(super) fn put_dm_inviter(
         &mut self,
-        scope: ConversationScope,
+        user: UserId,
+        identity: IdentityId,
         cid: ConversationId,
-        session: HandshakeSession,
+        phase: InviterPhase,
     ) {
-        let node = ConversationNode::Handshake(session);
-        match scope {
-            ConversationScope::Identity { user, identity } => {
-                self.put_dm(user, identity, cid, node);
-            }
-            ConversationScope::Device => self.put_sync(cid, node),
-        }
+        self.put_dm(
+            user,
+            identity,
+            cid,
+            IdentityNode::handshake(DmParty::inviter(phase)),
+        );
     }
 
-    fn find_node(&self, cid: ConversationId) -> Option<&ConversationNode> {
-        for user in self.users.values() {
-            for ident in user.identities.values() {
-                if let Some(node) = ident.conversations.get(&cid) {
-                    return Some(node);
-                }
-            }
-        }
-        self.device.conversations.get(&cid)
+    pub(super) fn put_dm_invitee(
+        &mut self,
+        user: UserId,
+        identity: IdentityId,
+        cid: ConversationId,
+        phase: InviteePhase,
+    ) {
+        self.put_dm(
+            user,
+            identity,
+            cid,
+            IdentityNode::handshake(DmParty::invitee(phase)),
+        );
     }
 
-    fn find_node_mut(&mut self, cid: ConversationId) -> Option<&mut ConversationNode> {
-        self.users
-            .values_mut()
-            .find_map(|user| {
-                user.identities
-                    .values_mut()
-                    .find_map(|ident| ident.conversations.get_mut(&cid))
-            })
-            .or_else(|| self.device.conversations.get_mut(&cid))
+    pub(super) fn put_sync_inviter(&mut self, cid: ConversationId, phase: InviterPhase) {
+        self.put_sync(cid, DeviceNode::handshake(SyncParty::inviter(phase)));
+    }
+
+    pub(super) fn put_sync_invitee(&mut self, cid: ConversationId, phase: InviteePhase) {
+        self.put_sync(cid, DeviceNode::handshake(SyncParty::invitee(phase)));
     }
 
     pub(super) fn scope_of(&self, cid: ConversationId) -> Option<ConversationScope> {
@@ -467,46 +304,130 @@ impl EngineState {
         }
     }
 
-    pub(super) fn take_node(
-        &mut self,
-        cid: ConversationId,
-    ) -> Option<(ConversationScope, ConversationNode)> {
-        let from_identity = self.users.iter_mut().find_map(|(user_id, user)| {
-            user.identities.iter_mut().find_map(|(identity_id, ident)| {
-                ident.conversations.remove(&cid).map(|node| {
-                    (
-                        ConversationScope::Identity {
-                            user: *user_id,
-                            identity: *identity_id,
-                        },
-                        node,
-                    )
-                })
+    pub(super) fn party(&self, cid: ConversationId) -> Option<PartyRef<'_>> {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                if let Some(IdentityConversation::DmHandshake(party)) =
+                    ident.conversations.get(&cid).map(|n| &n.kind)
+                {
+                    return Some(PartyRef::Dm(party));
+                }
+            }
+        }
+        match self.device.conversations.get(&cid).map(|n| &n.kind) {
+            Some(DeviceConversation::SyncHandshake(party)) => Some(PartyRef::Sync(party)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn party_mut(&mut self, cid: ConversationId) -> Option<PartyMut<'_>> {
+        if let Some(party) = self.users.values_mut().find_map(|user| {
+            user.identities.values_mut().find_map(|ident| {
+                ident
+                    .conversations
+                    .get_mut(&cid)
+                    .and_then(|node| match &mut node.kind {
+                        IdentityConversation::DmHandshake(party) => Some(party),
+                        IdentityConversation::DirectMessage { .. } => None,
+                    })
             })
-        });
-        from_identity.or_else(|| {
-            self.device
-                .conversations
-                .remove(&cid)
-                .map(|node| (ConversationScope::Device, node))
-        })
+        }) {
+            return Some(PartyMut::Dm(party));
+        }
+        self.device
+            .conversations
+            .get_mut(&cid)
+            .and_then(|node| match &mut node.kind {
+                DeviceConversation::SyncHandshake(party) => Some(PartyMut::Sync(party)),
+                DeviceConversation::Synchronization { .. } => None,
+            })
     }
 
-    pub(super) fn handshake(&self, cid: ConversationId) -> Option<&HandshakeSession> {
-        self.find_node(cid).and_then(ConversationNode::handshake)
+    pub(super) fn chains(&self, cid: ConversationId) -> Option<&ConversationChains> {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                if let Some(node) = ident.conversations.get(&cid) {
+                    return Some(&node.chains);
+                }
+            }
+        }
+        self.device.conversations.get(&cid).map(|n| &n.chains)
     }
 
-    pub(super) fn handshake_mut(&mut self, cid: ConversationId) -> Option<&mut HandshakeSession> {
-        self.find_node_mut(cid)
-            .and_then(ConversationNode::handshake_mut)
+    pub(super) fn chains_mut(&mut self, cid: ConversationId) -> Option<&mut ConversationChains> {
+        if let Some(chains) = self.users.values_mut().find_map(|user| {
+            user.identities
+                .values_mut()
+                .find_map(|ident| ident.conversations.get_mut(&cid).map(|n| &mut n.chains))
+        }) {
+            return Some(chains);
+        }
+        self.device
+            .conversations
+            .get_mut(&cid)
+            .map(|n| &mut n.chains)
     }
 
-    pub(super) fn established(&self, cid: ConversationId) -> Option<&EstablishedSession> {
-        self.find_node(cid).and_then(ConversationNode::established)
+    pub(super) fn for_each_chains<F: FnMut(ConversationId, &ConversationChains)>(&self, mut f: F) {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                for (cid, node) in &ident.conversations {
+                    f(*cid, &node.chains);
+                }
+            }
+        }
+        for (cid, node) in &self.device.conversations {
+            f(*cid, &node.chains);
+        }
+    }
+
+    pub(super) fn each_chains_mut<F: FnMut(&mut ConversationChains)>(&mut self, mut f: F) {
+        for user in self.users.values_mut() {
+            for ident in user.identities.values_mut() {
+                for node in ident.conversations.values_mut() {
+                    f(&mut node.chains);
+                }
+            }
+        }
+        for node in self.device.conversations.values_mut() {
+            f(&mut node.chains);
+        }
     }
 
     pub(super) fn ticket(&self, cid: ConversationId) -> Option<&Ticket> {
-        self.handshake(cid).map(|hs| &hs.ticket)
+        if let Some(party) = self.dm_party(cid) {
+            return Some(party.ticket());
+        }
+        self.sync_party(cid).map(|p| p.ticket())
+    }
+
+    fn dm_party(&self, cid: ConversationId) -> Option<&DmParty> {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                if let Some(IdentityConversation::DmHandshake(party)) =
+                    ident.conversations.get(&cid).map(|n| &n.kind)
+                {
+                    return Some(party);
+                }
+            }
+        }
+        None
+    }
+
+    fn sync_party(&self, cid: ConversationId) -> Option<&SyncParty> {
+        match self.device.conversations.get(&cid).map(|n| &n.kind) {
+            Some(DeviceConversation::SyncHandshake(party)) => Some(party),
+            _ => None,
+        }
+    }
+
+    pub(super) fn intake_secret(&self, cid: ConversationId) -> Option<Vec<u8>> {
+        let copy = |party: PartyRef<'_>| party.intake().map(|k| k.secret_bytes().to_vec());
+        self.party(cid).and_then(copy)
+    }
+
+    pub(super) fn list_from(&self, cid: ConversationId) -> Option<TimeBin> {
+        self.party(cid).map(|p| p.list_from())
     }
 
     pub(super) fn is_sync(&self, cid: ConversationId) -> bool {
@@ -515,19 +436,59 @@ impl EngineState {
 
     #[cfg(test)]
     pub(super) fn is_sync_established(&self, cid: ConversationId) -> bool {
-        self.is_sync(cid) && self.established(cid).is_some()
+        matches!(
+            self.device.conversations.get(&cid).map(|n| &n.kind),
+            Some(DeviceConversation::Synchronization { .. })
+        )
     }
 
     pub(super) fn has_sync_handshake(&self) -> bool {
         self.device
             .conversations
             .values()
-            .any(|n| n.handshake().is_some())
+            .any(|n| matches!(n.kind, DeviceConversation::SyncHandshake(_)))
     }
 
     pub(super) fn is_inviter(&self, cid: ConversationId) -> bool {
-        self.handshake(cid)
-            .is_some_and(HandshakeSession::is_inviter)
+        self.party(cid).is_some_and(|p| p.is_inviter())
+    }
+
+    pub(super) fn established_secret(&self, cid: ConversationId) -> Option<Secret> {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                if let Some(IdentityConversation::DirectMessage { secret, .. }) =
+                    ident.conversations.get(&cid).map(|n| &n.kind)
+                {
+                    return Some(*secret);
+                }
+            }
+        }
+        match self.device.conversations.get(&cid).map(|n| &n.kind) {
+            Some(DeviceConversation::Synchronization { secret, .. }) => Some(*secret),
+            _ => None,
+        }
+    }
+
+    pub(super) fn child_of(&self, handshake: ConversationId) -> Option<ConversationId> {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                for (cid, node) in &ident.conversations {
+                    if let IdentityConversation::DirectMessage { parent, .. } = &node.kind
+                        && *parent == handshake
+                    {
+                        return Some(*cid);
+                    }
+                }
+            }
+        }
+        for (cid, node) in &self.device.conversations {
+            if let DeviceConversation::Synchronization { parent, .. } = &node.kind
+                && *parent == handshake
+            {
+                return Some(*cid);
+            }
+        }
+        None
     }
 
     pub(super) fn owner(&self, cid: ConversationId) -> Option<(UserId, IdentityId)> {
@@ -538,50 +499,19 @@ impl EngineState {
     }
 
     pub(super) fn failed(&self, cid: ConversationId) -> Option<FailedReason> {
-        self.handshake(cid)
-            .and_then(HandshakeSession::failed_reason)
+        self.party(cid).and_then(|p| p.failure()).map(Into::into)
     }
 
-    pub(super) fn fail(&mut self, cid: ConversationId, reason: FailedReason) {
-        if let Some(hs) = self.handshake_mut(cid) {
-            hs.fail(reason);
+    pub(super) fn fail(&mut self, cid: ConversationId, reason: HandshakeFailure) {
+        if let Some(mut party) = self.party_mut(cid) {
+            party.fail(reason);
         }
     }
 
-    pub(super) fn set_intake(&mut self, cid: ConversationId, intake: KeyPair) {
-        if let Some(hs) = self.handshake_mut(cid) {
-            hs.set_intake(intake);
+    pub(super) fn ack_posted(&mut self, cid: ConversationId) {
+        if let Some(mut party) = self.party_mut(cid) {
+            party.ack_posted();
         }
-    }
-
-    pub(super) fn set_shared_inviter(&mut self, cid: ConversationId, shared: Secret) {
-        if let Some(hs) = self.handshake_mut(cid) {
-            hs.set_shared_inviter(shared);
-        }
-    }
-
-    pub(super) fn set_shared_invitee(&mut self, cid: ConversationId, shared: Secret) {
-        if let Some(hs) = self.handshake_mut(cid) {
-            hs.set_shared_invitee(shared);
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn clear_shared(&mut self, cid: ConversationId) {
-        if let Some(hs) = self.handshake_mut(cid) {
-            hs.clear_shared();
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn clear_intake(&mut self, cid: ConversationId) {
-        if let Some(hs) = self.handshake_mut(cid) {
-            hs.clear_intake();
-        }
-    }
-
-    pub(super) fn child_of(&self, handshake: ConversationId) -> Option<ConversationId> {
-        self.handshake(handshake).and_then(HandshakeSession::child)
     }
 
     pub(super) fn spawn_established(
@@ -591,59 +521,46 @@ impl EngineState {
         secret: Secret,
     ) {
         if self.child_of(handshake).is_some() {
-            #[rustfmt::skip]
             return;
         }
-        if let Some(hs) = self.handshake_mut(handshake) {
-            hs.set_child(child);
-        }
-        let node = ConversationNode::Established(EstablishedSession {
-            secret,
-            parent: handshake,
-        });
         match self.scope_of(handshake) {
             Some(ConversationScope::Identity { user, identity }) => {
-                self.put_dm(user, identity, child, node);
+                self.put_dm(
+                    user,
+                    identity,
+                    child,
+                    IdentityNode::direct(secret, handshake),
+                );
             }
-            Some(ConversationScope::Device) | None => self.put_sync(child, node),
+            Some(ConversationScope::Device) | None => {
+                self.put_sync(child, DeviceNode::sync(secret, handshake));
+            }
         }
     }
 
-    pub(super) fn established_entries(&self) -> Vec<(ConversationId, &EstablishedSession, bool)> {
+    /// Ticket, list origin, sort, and whether the row is still a handshake.
+    pub(super) fn handshake_entries(&self) -> Vec<HandshakeEntry<'_>> {
         let mut rows = Vec::new();
         for user in self.users.values() {
             for ident in user.identities.values() {
                 for (cid, node) in &ident.conversations {
-                    if let ConversationNode::Established(es) = node {
-                        rows.push((*cid, es, false));
+                    if let IdentityConversation::DmHandshake(party) = &node.kind {
+                        rows.push(HandshakeEntry {
+                            cid: *cid,
+                            party: PartyRef::Dm(party),
+                            sort: ConversationSort::HandshakeDm,
+                        });
                     }
                 }
             }
         }
         for (cid, node) in &self.device.conversations {
-            if let ConversationNode::Established(es) = node {
-                rows.push((*cid, es, true));
-            }
-        }
-        rows
-    }
-
-    pub(super) fn handshake_entries(
-        &self,
-    ) -> Vec<(ConversationId, &HandshakeSession, ConversationSort)> {
-        let mut rows = Vec::new();
-        for user in self.users.values() {
-            for ident in user.identities.values() {
-                for (cid, node) in &ident.conversations {
-                    if let ConversationNode::Handshake(hs) = node {
-                        rows.push((*cid, hs, ConversationSort::HandshakeDm));
-                    }
-                }
-            }
-        }
-        for (cid, node) in &self.device.conversations {
-            if let ConversationNode::Handshake(hs) = node {
-                rows.push((*cid, hs, ConversationSort::HandshakeSync));
+            if let DeviceConversation::SyncHandshake(party) = &node.kind {
+                rows.push(HandshakeEntry {
+                    cid: *cid,
+                    party: PartyRef::Sync(party),
+                    sort: ConversationSort::HandshakeSync,
+                });
             }
         }
         rows
@@ -667,106 +584,159 @@ impl EngineState {
             for ident in user.identities.values_mut() {
                 rekey_map(&mut ident.conversations, from, to);
                 for node in ident.conversations.values_mut() {
-                    rekey_node_refs(node, from, to);
+                    if let IdentityConversation::DirectMessage { parent, .. } = &mut node.kind
+                        && *parent == from
+                    {
+                        *parent = to;
+                    }
                 }
             }
         }
         rekey_map(&mut self.device.conversations, from, to);
         for node in self.device.conversations.values_mut() {
-            rekey_node_refs(node, from, to);
+            if let DeviceConversation::Synchronization { parent, .. } = &mut node.kind
+                && *parent == from
+            {
+                *parent = to;
+            }
         }
     }
 
-    pub(super) fn install_from_fold(&mut self, fold: FoldDirectory) {
-        let FoldDirectory {
-            tickets,
-            owners,
-            inviters,
-            intake,
-            shared_inviter,
-            shared_invitee,
-            failed,
-            children,
-            established,
-        } = fold;
-        for (cid, ticket, sync) in tickets {
-            let role = if inviters.contains(&cid) {
-                HandshakeRole::Inviter
-            } else {
-                HandshakeRole::Invitee
-            };
-            let hs = if let Some(reason) = failed.get(&cid).copied() {
-                HandshakeSession::failed(ticket, role, reason)
-            } else {
-                HandshakeSession::open(ticket, role)
-                    .with_intake(intake.get(&cid).cloned())
-                    .with_shared_inviter(shared_inviter.get(&cid).copied())
-                    .with_shared_invitee(shared_invitee.get(&cid).copied())
-                    .with_child(children.get(&cid).copied())
-            };
-            if sync {
-                self.put_sync(cid, ConversationNode::Handshake(hs));
-            } else if let Some((user, identity)) = owners.get(&cid).copied() {
-                self.put_dm(user, identity, cid, ConversationNode::Handshake(hs));
-            }
-        }
-        for (child, handshake, secret, sync) in established {
-            if let Some(hs) = self.handshake_mut(handshake) {
-                hs.set_child(child);
-            }
-            let node = ConversationNode::Established(EstablishedSession {
-                secret,
-                parent: handshake,
-            });
-            if sync {
-                self.put_sync(child, node);
-            } else if let Some((user, identity)) = owners
-                .get(&child)
-                .or_else(|| owners.get(&handshake))
-                .copied()
-                .or_else(|| self.owner(handshake))
-            {
-                self.put_dm(user, identity, child, node);
-            }
-        }
+    pub(super) fn drop_conversation(&mut self, cid: ConversationId) -> bool {
+        let identity = self.users.iter_mut().any(|(_, user)| {
+            user.identities
+                .iter_mut()
+                .any(|(_, ident)| ident.conversations.remove(&cid).is_some())
+        });
+        let device = self.device.conversations.remove(&cid).is_some();
+        identity || device
     }
 
     #[cfg(test)]
     pub(crate) fn set_next_seq(&mut self, seq: u64) {
-        self.next_seq = seq;
+        self.next_seq = PersistSeq::from_u64(seq);
     }
 
     #[cfg(test)]
     pub(crate) fn send_chain_seq(&self, conversation_id: &ConversationId) -> Option<u64> {
-        self.send_chains
-            .get(&chain_key(conversation_id, &[]))
-            .map(|c| c.packet_seq)
+        self.chains(*conversation_id)
+            .and_then(|c| c.send.get(&ActorId::handshake()))
+            .map(|c| c.packet_seq.as_u64())
     }
 
     #[cfg(test)]
     pub(crate) fn recv_chain_seq(&self, conversation_id: &ConversationId) -> Option<u64> {
-        self.recv_chains
-            .get(&chain_key(conversation_id, &[]))
-            .map(|c| c.packet_seq)
+        self.chains(*conversation_id)
+            .and_then(|c| c.recv.get(&ActorId::handshake()))
+            .map(|c| c.packet_seq.as_u64())
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_last_acks(&self) -> bool {
+        self.users.values().any(|user| {
+            user.identities.values().any(|ident| {
+                ident
+                    .conversations
+                    .values()
+                    .any(|n| !n.chains.last_acks.is_empty())
+            })
+        }) || self
+            .device
+            .conversations
+            .values()
+            .any(|n| !n.chains.last_acks.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_skipped(&mut self, cid: ConversationId, actor: ActorId, entry: CachedMk) {
+        if let Some(chains) = self.chains_mut(cid) {
+            chains.skipped_mks.entry(actor).or_default().push(entry);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_send_chain(&mut self, cid: ConversationId, actor: ActorId, chain: SendChain) {
+        if let Some(chains) = self.chains_mut(cid) {
+            chains.send.insert(actor, chain);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_recv_chain(&mut self, cid: ConversationId, actor: ActorId, chain: SendChain) {
+        if let Some(chains) = self.chains_mut(cid) {
+            chains.recv.insert(actor, chain);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn put_last_ack(&mut self, cid: ConversationId, actor: ActorId, ids: BTreeSet<Tag>) {
+        if let Some(chains) = self.chains_mut(cid) {
+            chains.last_acks.insert(actor, ids);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copy_chains_from(&mut self, src: &EngineState, cid: ConversationId) {
+        if let Some(from) = src.chains(cid)
+            && let Some(to) = self.chains_mut(cid)
+        {
+            *to = from.clone();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_acks_snapshot(
+        &self,
+    ) -> BTreeMap<ConversationId, BTreeMap<ActorId, BTreeSet<Tag>>> {
+        let mut out = BTreeMap::new();
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                for (id, node) in &ident.conversations {
+                    out.insert(*id, node.chains.last_acks.clone());
+                }
+            }
+        }
+        for (id, node) in &self.device.conversations {
+            out.insert(*id, node.chains.last_acks.clone());
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cover_last_acks(&mut self) {
+        let mut by_cid: BTreeMap<ConversationId, BTreeSet<Tag>> = BTreeMap::new();
+        for (id, body) in &self.txs {
+            by_cid.entry(body.conversation_id).or_default().insert(*id);
+        }
+        let apply = |cid: ConversationId, chains: &mut ConversationChains| {
+            if let Some(ids) = by_cid.get(&cid) {
+                for set in chains.last_acks.values_mut() {
+                    *set = ids.clone();
+                }
+            }
+        };
+        for user in self.users.values_mut() {
+            for ident in user.identities.values_mut() {
+                for (cid, node) in ident.conversations.iter_mut() {
+                    apply(*cid, &mut node.chains);
+                }
+            }
+        }
+        for (cid, node) in self.device.conversations.iter_mut() {
+            apply(*cid, &mut node.chains);
+        }
+    }
+}
+
+/// One open or failed handshake row.
+pub(super) struct HandshakeEntry<'a> {
+    pub(super) cid: ConversationId,
+    pub(super) party: PartyRef<'a>,
+    pub(super) sort: ConversationSort,
 }
 
 fn rekey_map<V>(map: &mut BTreeMap<ConversationId, V>, from: ConversationId, to: ConversationId) {
     if let Some(v) = map.remove(&from) {
         map.insert(to, v);
-    }
-}
-
-fn rekey_node_refs(node: &mut ConversationNode, from: ConversationId, to: ConversationId) {
-    match node {
-        ConversationNode::Handshake(hs) => {
-            if let Some(open) = hs.open_mut()
-                && open.child == Some(from)
-            {
-                open.child = Some(to);
-            }
-        }
-        ConversationNode::Established(es) if es.parent == from => es.parent = to,
-        ConversationNode::Established(_) => {}
     }
 }

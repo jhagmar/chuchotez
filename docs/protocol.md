@@ -391,8 +391,10 @@ TimeBin = time_bin(unix_seconds)
 
 `unix_seconds` is a `UnixSeconds` value. At `W = TimeBin`, the live listen
 window is `W-1`, `W`, and `W+1`. Mapper `list` / `listen` MAY omit bodies
-whose TimeBin is less than `W - 71` (72 hour bins). Engine catch-up is that
-same 72-bin window.
+whose TimeBin is less than `W - 71` (72 hour bins). Engine catch-up lists
+incomplete bins from handshake `list_from` or `watermark + 1` through `W+1`,
+union the live listen window. `list_from` is the TimeBin of `createInvite` or
+`receiveTicket`.
 
 #### Hlc
 
@@ -562,10 +564,9 @@ ConversationSort = "HandshakeDm" / "HandshakeSync" / "DirectMessage"
 #### BinProgress
 
 EngineState listing progress for one `DurableChannel` and TagKey.
-`watermark` is the greatest bin such that every bin in `[W-71, watermark]`
+`watermark` is the greatest bin such that every bin in `[list_from, watermark]`
 has been listed in full. `completed` is fully listed bins greater than
-`watermark` and still ≥ `W-71`. Bins older than `W-71` are dropped from
-progress.
+`watermark`.
 
 ```
 BinProgress = {
@@ -608,9 +609,9 @@ Poll = {
 }
 ```
 
-Write `body` is the 512-byte packet. `list` tags are catch-up bins in
-`[W-71, W+1]` through `BinProgress` union `[W-1, W, W+1]` for every
-`send_tag_key` this device listens to. `listen_durable` is `[W-1, W, W+1]` on
+Write `body` is the 512-byte packet. `list` tags are incomplete catch-up bins
+from `list_from` or `watermark + 1` through `W+1`, union `[W-1, W, W+1]`, for
+every handshake InviteTag this device lists. `listen_durable` is `[W-1, W, W+1]` on
 handshake locators and on Established persist bins. `listen_ephemeral` is
 `[W-1, W, W+1]` on every Established DM, Group, and Synchronization so a
 peer’s live send can land; ephemeral writes use `W`. Handshake conversations
@@ -2228,12 +2229,12 @@ snapshot sealed with the DEK; the host stores those bytes as the folded file
 and drops log records whose txs are in the watermark. Folded file:
 
 ```
-fold_nonce   byte[12]   be<32>u(2) || be<64>u(seq)
+fold_nonce   byte[12]   be<32>u(1) || be<64>u(seq)
 snapshot     = fold_nonce || seal(dek, fold_nonce, folded_bytes)
 ```
 
 `folded_bytes` is the Engine snapshot of watermark txs through `seq`. Fold MAY
-omit txs with `expire_at` ≤ ticked now. `2` in
+omit txs with `expire_at` ≤ ticked now. `1` in
 the high four bytes is folded-snapshot format version. Reload is `unlock`,
 `applyFolded` of the snapshot, then `apply` of remaining log records.
 

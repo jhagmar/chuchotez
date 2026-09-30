@@ -2,8 +2,8 @@
 
 use super::super::payload::TxPayload;
 use super::super::{
-    ConversationId, Defaults, DeviceId, DisplayName, EngineError, IdentityId, KemSeed, OnWirePrefs,
-    Policy, SignSeed, UserId,
+    Defaults, DeviceId, DisplayName, EngineError, IdentityId, KemSeed, OnWirePrefs, Policy,
+    SignSeed, UserId,
 };
 use super::query::*;
 use super::{Engine, EngineState};
@@ -226,7 +226,7 @@ impl Engine {
         _rng: &dyn Rng,
         device_id: DeviceId,
     ) -> Result<MutateOk, EngineError> {
-        if state.device.id == Some(device_id) {
+        if state.device.keys.as_ref().and_then(|k| k.id) == Some(device_id) {
             return Err(EngineError::WrongPhase);
         }
         let secret = self.engine_secret()?;
@@ -243,16 +243,7 @@ impl Engine {
         mut state: EngineState,
         _rng: &dyn Rng,
     ) -> Result<MutateOk, EngineError> {
-        let sync_ids: Vec<ConversationId> = state.device.conversations.keys().copied().collect();
         state.device.conversations.clear();
-        let drop_sync = |k: &Vec<u8>| {
-            k.get(..32)
-                .and_then(|id| id.try_into().ok())
-                .is_none_or(|id: [u8; 32]| !sync_ids.contains(&ConversationId::from_bytes(id)))
-        };
-        state.send_chains.retain(|k, _| drop_sync(k));
-        state.recv_chains.retain(|k, _| drop_sync(k));
-        state.skipped_mks.retain(|k, _| drop_sync(k));
         Ok(MutateOk {
             state,
             persist: Vec::new(),

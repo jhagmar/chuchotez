@@ -1,6 +1,8 @@
 //! Conversation query ADTs, poll locators, and mutation results.
 
-use super::super::{Address, ConversationId, IdentityId, Kind, Policy, Tag, UserId};
+use super::super::{
+    Address, ConversationId, IdentityId, Kind, PersistSeq, Policy, Tag, UnixSeconds, UserId,
+};
 use super::super::{DurableChannel, EphemeralChannel};
 use super::state::EngineState;
 
@@ -180,7 +182,7 @@ pub struct FoldOk {
     /// Sealed snapshot bytes.
     pub snapshot: Vec<u8>,
     /// Persist seq included in the snapshot.
-    pub seq: u64,
+    pub seq: PersistSeq,
 }
 
 impl FoldOk {
@@ -214,22 +216,22 @@ pub enum HandshakeInviter {
     /// Ticket minted; invite-tag writes still outstanding.
     InviteCreated {
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
     },
     /// Invite-tag packet set acked.
     NoticePinned {
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
     },
     /// Invitee intro ingested; inviter intro minted.
     IntroductionMinted {
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
     },
     /// Intro packet set acked; waiting on confirm.
     Confirming {
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
         /// `text(fingerprint)`.
         confirmation_digest: String,
     },
@@ -245,28 +247,28 @@ pub enum HandshakeInvitee {
         /// Notice Policy.
         policy: Policy,
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
     },
     /// Invitee intro minted.
     IntroductionMinted {
         /// Notice Policy.
         policy: Policy,
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
     },
     /// Invitee intro packet set acked.
     IntroductionSent {
         /// Notice Policy.
         policy: Policy,
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
     },
     /// Inviter intro ingested; waiting on confirm.
     Confirming {
         /// Notice Policy.
         policy: Policy,
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
         /// `text(fingerprint)`.
         confirmation_digest: String,
     },
@@ -283,7 +285,7 @@ pub enum FailedReason {
     /// Ticked now is past `expires` pre-confirm.
     InviteExpired {
         /// Expiry Unix seconds.
-        expires: u64,
+        expires: UnixSeconds,
     },
     /// Notice `open`, decompress, or parse refused.
     NoticeUnlockFailed,

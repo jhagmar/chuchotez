@@ -4,7 +4,7 @@ use super::channel::{Address, DurableChannel, EphemeralChannel, Kind};
 use super::defaults::{Defaults, DisplayName, OnWirePrefs, ProfilePic};
 use super::{
     ConversationId, DeviceId, IdentityId, KeyPair, Policy, Secret, SigningKeyPair, Tag, TagKey,
-    UserId,
+    TimeBin, UnixSeconds, UserId,
 };
 use crate::protocol::Policy as PolicyEnum;
 
@@ -36,9 +36,6 @@ const _: () = assert!(PACKET_LEN == PACKET_NONCE_LEN + PACKET_PAD_LEN + AEAD_TAG
 
 /// Hour in seconds.
 pub const TIME_BIN_SECONDS: u64 = 3600;
-
-/// Catch-up window in hour bins.
-pub const BIN_WINDOW: u64 = 72;
 
 /// Which allowed payloads and secret-evolution rules apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,7 +119,7 @@ pub struct Ticket {
     /// Inviter persistent locators.
     pub persistents: Vec<DurableChannel>,
     /// Expiry Unix seconds.
-    pub expires: u64,
+    pub expires: UnixSeconds,
 }
 
 /// Presentation timestamp. Merge ignores `Hlc`.
@@ -483,8 +480,8 @@ pub struct TxNotice {
     pub persistents: Vec<DurableChannel>,
     /// Ephemeral channels.
     pub ephemerals: Vec<EphemeralChannel>,
-    /// Expiry.
-    pub expires: u64,
+    /// Expiry Unix seconds.
+    pub expires: UnixSeconds,
 }
 
 /// Inviter intro.
@@ -538,8 +535,8 @@ pub struct TxText {
     pub body: String,
     /// Reply target.
     pub reply_to: Option<Tag>,
-    /// Expire at.
-    pub expire_at: Option<u64>,
+    /// Expire at Unix seconds.
+    pub expire_at: Option<UnixSeconds>,
 }
 
 /// Edit.
@@ -581,8 +578,8 @@ pub struct TxMedia {
     pub caption: Option<String>,
     /// Reply target.
     pub reply_to: Option<Tag>,
-    /// Expire at.
-    pub expire_at: Option<u64>,
+    /// Expire at Unix seconds.
+    pub expire_at: Option<UnixSeconds>,
 }
 
 /// Group invite on a DM.
@@ -697,8 +694,8 @@ pub(crate) fn parse_policy(s: &str) -> Option<Policy> {
     }
 }
 
-pub(crate) fn time_bin(unix_seconds: u64) -> u64 {
-    unix_seconds / TIME_BIN_SECONDS
+pub(crate) fn time_bin(unix_seconds: UnixSeconds) -> TimeBin {
+    TimeBin::from_u64(unix_seconds.as_u64() / TIME_BIN_SECONDS)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -720,15 +717,14 @@ pub(crate) fn unpad(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        AEAD_TAG_LEN, BIN_WINDOW, ConversationSort, PACKET_LEN, PACKET_PAD_LEN, pad, parse_policy,
-        policy_str, time_bin, unpad,
+        AEAD_TAG_LEN, ConversationSort, PACKET_LEN, PACKET_PAD_LEN, pad, parse_policy, policy_str,
+        time_bin, unpad,
     };
     use crate::protocol::Policy;
 
     #[test]
     fn helpers() {
-        assert_eq!(time_bin(3600), 1);
-        assert_eq!(BIN_WINDOW, 72);
+        assert_eq!(time_bin(super::UnixSeconds::from_u64(3600)).as_u64(), 1);
         assert_eq!(PACKET_LEN, 512);
         assert_eq!(AEAD_TAG_LEN, 16);
         assert_eq!(policy_str(Policy::Classic), "Classic");

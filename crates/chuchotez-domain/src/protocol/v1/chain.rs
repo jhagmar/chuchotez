@@ -6,7 +6,10 @@ use super::payload::{
     ConversationSort, DurableBody, PACKET_LEN, PACKET_MAX_UNCOMPRESSED, PACKET_NONCE_LEN,
     PACKET_PAD_LEN, PacketPlain, PacketTxFragLast, PacketTxFragMore, unpad,
 };
-use super::{AeadKey, AeadNonce, Base64Url, ConversationId, EngineError, Json, Suite, Tag};
+use super::{
+    ActorId, AeadKey, AeadNonce, Base64Url, ConversationId, EngineError, Json, PacketEpoch,
+    PacketSeq, Suite, Tag, UnixSeconds,
+};
 use crate::protocol::Rng;
 
 pub(crate) const MK_LABEL: &[u8] = b"chuchotez/1/packet-mk";
@@ -23,8 +26,8 @@ pub(crate) const MAX_FRAGS: u64 = 64;
 pub(crate) struct SendChain {
     pub root: [u8; 32],
     pub c: [u8; 32],
-    pub epoch: u64,
-    pub packet_seq: u64,
+    pub epoch: PacketEpoch,
+    pub packet_seq: PacketSeq,
 }
 
 impl core::fmt::Debug for SendChain {
@@ -40,7 +43,8 @@ impl core::fmt::Debug for SendChain {
 #[derive(Clone)]
 pub(crate) struct CachedMk {
     pub mk: [u8; 32],
-    pub expires_at: u64,
+    pub expires_at: UnixSeconds,
+    pub tx_id: Option<Tag>,
 }
 
 impl core::fmt::Debug for CachedMk {
@@ -58,12 +62,7 @@ pub(crate) struct Opened {
     pub chain: SendChain,
     pub skipped: Vec<CachedMk>,
     pub from_cache: bool,
-}
-
-pub(crate) fn chain_key(conversation_id: &ConversationId, actor_id: &[u8]) -> Vec<u8> {
-    let mut key = conversation_id.as_bytes().to_vec();
-    key.extend_from_slice(actor_id);
-    key
+    pub mk: [u8; 32],
 }
 
 pub(crate) fn join(
@@ -87,22 +86,40 @@ pub(crate) fn join(
     Ok(SendChain {
         root,
         c,
-        epoch: 0,
-        packet_seq: 0,
+        epoch: PacketEpoch::from_u64(0),
+        packet_seq: PacketSeq::from_u64(0),
     })
 }
 
 pub(crate) fn mk(hmac: &dyn HmacSha256, chain: &SendChain) -> [u8; 32] {
-    labeled_expand(hmac, &chain.c, MK_LABEL, chain.epoch, chain.packet_seq)
+    labeled_expand(
+        hmac,
+        &chain.c,
+        MK_LABEL,
+        chain.epoch.as_u64(),
+        chain.packet_seq.as_u64(),
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn eph_mk(hmac: &dyn HmacSha256, chain: &SendChain) -> [u8; 32] {
-    labeled_expand(hmac, &chain.c, EPH_MK_LABEL, chain.epoch, chain.packet_seq)
+    labeled_expand(
+        hmac,
+        &chain.c,
+        EPH_MK_LABEL,
+        chain.epoch.as_u64(),
+        chain.packet_seq.as_u64(),
+    )
 }
 
 pub(crate) fn step(hmac: &dyn HmacSha256, chain: &SendChain) -> SendChain {
-    let c = labeled_expand(hmac, &chain.c, STEP_LABEL, chain.epoch, chain.packet_seq);
+    let c = labeled_expand(
+        hmac,
+        &chain.c,
+        STEP_LABEL,
+        chain.epoch.as_u64(),
+        chain.packet_seq.as_u64(),
+    );
     SendChain {
         root: chain.root,
         c,
@@ -188,7 +205,7 @@ pub(crate) fn open_skip_ahead(
     body: &[u8],
 ) -> Result<Opened, EngineError> {
     for entry in cached {
-        if entry.expires_at > now
+        if entry.expires_at.as_u64() > now
             && let Ok(packet) = open_plain(suite, &entry.mk, body)
         {
             return Ok(Opened {
@@ -196,6 +213,7 @@ pub(crate) fn open_skip_ahead(
                 chain: start.clone(),
                 skipped: Vec::new(),
                 from_cache: true,
+                mk: entry.mk,
             });
         }
     }
@@ -211,11 +229,13 @@ pub(crate) fn open_skip_ahead(
                 chain: next,
                 skipped,
                 from_cache: false,
+                mk: key,
             });
         }
         skipped.push(CachedMk {
             mk: key,
-            expires_at: now.saturating_add(MK_CACHE_SECS),
+            expires_at: UnixSeconds::from_u64(now.saturating_add(MK_CACHE_SECS)),
+            tx_id: None,
         });
         chain = step(hmac, &chain);
     }
@@ -225,7 +245,7 @@ pub(crate) fn open_skip_ahead(
                 root: start.root,
                 c: start.c,
                 epoch: start.epoch.saturating_add(de),
-                packet_seq: seq,
+                packet_seq: PacketSeq::from_u64(seq),
             };
             let key = mk(hmac, &probe);
             if let Ok(packet) = open_plain(suite, &key, body) {
@@ -234,6 +254,7 @@ pub(crate) fn open_skip_ahead(
                     chain: step(hmac, &probe),
                     skipped: Vec::new(),
                     from_cache: false,
+                    mk: key,
                 });
             }
         }
@@ -343,26 +364,32 @@ pub(crate) fn set_xor_for(
     Tag::from_bytes(acc)
 }
 
-pub(crate) fn chain_to_json(b64u: &dyn Base64Url, key: &[u8], chain: &SendChain) -> Json {
-    let (cid, actor_id) = if key.len() >= 32 {
-        (&key[..32], &key[32..])
-    } else {
-        (key, &[][..])
-    };
+pub(crate) fn chain_to_json(
+    b64u: &dyn Base64Url,
+    conversation_id: ConversationId,
+    actor_id: &ActorId,
+    chain: &SendChain,
+) -> Json {
     Json::Object(vec![
-        ("conversation_id".into(), super::codec::bstr(b64u, cid)),
-        ("actor_id".into(), super::codec::bstr(b64u, actor_id)),
+        (
+            "conversation_id".into(),
+            super::codec::bstr(b64u, conversation_id.as_bytes()),
+        ),
+        (
+            "actor_id".into(),
+            super::codec::bstr(b64u, actor_id.as_bytes()),
+        ),
         ("root".into(), super::codec::bstr(b64u, &chain.root)),
         ("c".into(), super::codec::bstr(b64u, &chain.c)),
-        ("epoch".into(), Json::Number(chain.epoch)),
-        ("packet_seq".into(), Json::Number(chain.packet_seq)),
+        ("epoch".into(), Json::Number(chain.epoch.as_u64())),
+        ("packet_seq".into(), Json::Number(chain.packet_seq.as_u64())),
     ])
 }
 
 pub(crate) fn chain_from_json(
     b64u: &dyn Base64Url,
     value: &Json,
-) -> Result<(Vec<u8>, SendChain), EngineError> {
+) -> Result<(ConversationId, ActorId, SendChain), EngineError> {
     let Json::Object(members) = value else {
         return Err(EngineError::MalformedPersist);
     };
@@ -383,15 +410,16 @@ pub(crate) fn chain_from_json(
     let Json::Number(packet_seq) = get("packet_seq").ok_or(EngineError::MalformedPersist)? else {
         return Err(EngineError::MalformedPersist);
     };
-    let mut key = cid;
-    key.extend_from_slice(&actor_id);
+    let cid =
+        ConversationId::from_bytes(cid.try_into().map_err(|_| EngineError::MalformedPersist)?);
     Ok((
-        key,
+        cid,
+        ActorId::from_bytes(actor_id),
         SendChain {
             root,
             c,
-            epoch: *epoch,
-            packet_seq: *packet_seq,
+            epoch: PacketEpoch::from_u64(*epoch),
+            packet_seq: PacketSeq::from_u64(*packet_seq),
         },
     ))
 }
@@ -414,13 +442,14 @@ mod tests {
     use super::{
         CachedMk, ConversationSort, EPH_MK_LABEL, LATER_EPOCHS, MAX_FRAGS, MK_CACHE_SECS, MK_LABEL,
         PACKET_LEN, PACKET_NONCE_LEN, PACKET_PAD_LEN, SKIP_AHEAD, STEP_LABEL, chain_from_json,
-        chain_key, chain_to_json, eph_mk, fragment_body, join, mk, open_skip_ahead, seal_packet,
-        set_xor_for, step,
+        chain_to_json, eph_mk, fragment_body, join, mk, open_skip_ahead, seal_packet, set_xor_for,
+        step,
     };
     use crate::protocol::v1::fixtures::{CounterRng, test_suite};
     use crate::protocol::v1::payload::{
         DurableBody, Hlc, PacketPlain, PacketTxFragLast, TxPayload,
     };
+    use crate::protocol::v1::{ActorId, PacketEpoch, PacketSeq, UnixSeconds};
     use crate::protocol::v1::{ConversationId, EngineError, Json, Tag};
     use std::collections::BTreeMap;
 
@@ -457,13 +486,13 @@ mod tests {
             join(s.hmac(), &secret, ConversationSort::HandshakeSync, &[])
                 .expect("sy")
                 .epoch,
-            0
+            PacketEpoch::from_u64(0)
         );
         assert_eq!(
             join(s.hmac(), &secret, ConversationSort::Group, &[3u8; 32])
                 .expect("g")
                 .packet_seq,
-            0
+            PacketSeq::from_u64(0)
         );
         assert_eq!(
             join(
@@ -474,7 +503,7 @@ mod tests {
             )
             .expect("sc")
             .epoch,
-            0
+            PacketEpoch::from_u64(0)
         );
     }
 
@@ -486,7 +515,7 @@ mod tests {
         let e0 = eph_mk(s.hmac(), &chain);
         assert_ne!(mk0, e0);
         let next = step(s.hmac(), &chain);
-        assert_eq!(next.packet_seq, 1);
+        assert_eq!(next.packet_seq, PacketSeq::from_u64(1));
         assert_ne!(next.c, chain.c);
         assert_eq!(next.root, chain.root);
         assert!(format!("{:?}", chain).contains("SendChain"));
@@ -528,7 +557,7 @@ mod tests {
         let opened0 = open_skip_ahead(&s, &start, &[], 10, &b0).expect("o0");
         assert!(!opened0.from_cache);
         assert_eq!(opened0.packet, p0);
-        assert_eq!(opened0.chain.packet_seq, 1);
+        assert_eq!(opened0.chain.packet_seq, PacketSeq::from_u64(1));
         let opened1 = open_skip_ahead(&s, &start, &[], 10, &b1).expect("o1");
         assert_eq!(opened1.skipped.len(), 1);
         assert_eq!(opened1.packet, p1);
@@ -547,14 +576,15 @@ mod tests {
         );
         let expired = CachedMk {
             mk: opened1.skipped[0].mk,
-            expires_at: 10,
+            expires_at: UnixSeconds::from_u64(10),
+            tx_id: None,
         };
         assert!(format!("{:?}", expired).contains("CachedMk"));
         let late_chain = super::SendChain {
             root: start.root,
             c: start.c,
-            epoch: 1,
-            packet_seq: 0,
+            epoch: PacketEpoch::from_u64(1),
+            packet_seq: PacketSeq::from_u64(0),
         };
         let b_late = seal_packet(&s, &rng, &mk(s.hmac(), &late_chain), &p0).expect("slate");
         let opened_late = open_skip_ahead(&s, &start, &[], 10, &b_late).expect("ol");
@@ -604,13 +634,13 @@ mod tests {
             },
         );
         assert_eq!(set_xor_for(&txs, cid), tx_id);
-        let key = chain_key(&cid, &[]);
         let chain = join(s.hmac(), &[1u8; 32], ConversationSort::HandshakeDm, &[]).expect("j");
-        let json = chain_to_json(s.b64u(), &key, &chain);
-        let (k2, c2) = chain_from_json(s.b64u(), &json).expect("parse");
-        assert_eq!(k2, key);
+        let json = chain_to_json(s.b64u(), cid, &ActorId::handshake(), &chain);
+        let (cid2, actor, c2) = chain_from_json(s.b64u(), &json).expect("parse");
+        assert_eq!(cid2, cid);
+        assert_eq!(actor, ActorId::handshake());
         assert_eq!(c2.root, chain.root);
-        assert_eq!(c2.packet_seq, 0);
+        assert_eq!(c2.packet_seq, PacketSeq::from_u64(0));
         assert!(chain_from_json(s.b64u(), &Json::Null).is_err());
         assert!(chain_from_json(s.b64u(), &Json::Object(vec![])).is_err());
         assert!(
@@ -668,8 +698,6 @@ mod tests {
             ("packet_seq".into(), Json::Bool(true)),
         ]);
         assert!(chain_from_json(s.b64u(), &bad_seq).is_err());
-        let tiny = chain_to_json(s.b64u(), &[1, 2, 3], &chain);
-        assert!(chain_from_json(s.b64u(), &tiny).is_err());
         let huge_actor = fragment_body(&s, b"hi", tx_id, xor, 0, &[0u8; 400]);
         assert!(huge_actor.is_err());
     }

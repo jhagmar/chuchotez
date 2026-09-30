@@ -1,9 +1,11 @@
 //! Host-owned handle bound to a v1 [`Suite`] and [`Defaults`].
 
+mod fold_tree;
 mod handshake;
 mod helpers;
 mod identity;
 mod invite;
+mod party;
 mod persist;
 mod poll;
 mod query;
@@ -28,7 +30,7 @@ use super::{AeadKey, Defaults, DisplayName, Suite};
 pub(super) const PERSIST_VERSION: u32 = 1;
 
 /// Folded snapshot format version.
-pub(super) const FOLD_VERSION: u32 = 2;
+pub(super) const FOLD_VERSION: u32 = 1;
 
 pub(super) const SPAWN_SECRET_INFO: &[u8] = b"chuchotez/1/spawn-secret";
 pub(super) const SPAWN_CONVERSATION_ID_INFO: &[u8] = b"chuchotez/1/spawn-conversation-id";

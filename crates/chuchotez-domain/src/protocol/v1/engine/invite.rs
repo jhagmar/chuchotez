@@ -2,14 +2,15 @@
 
 use super::super::codec::{ticket_from_json, ticket_to_json};
 use super::super::payload::{
-    DurableBody, Hlc, TICKET_MAX_UNCOMPRESSED, Ticket, TxNotice, TxPayload,
+    DurableBody, Hlc, TICKET_MAX_UNCOMPRESSED, Ticket, TxNotice, TxPayload, time_bin,
 };
 use super::super::{
     ConversationId, DeviceId, DisplayName, DurableChannel, EngineError, IdentityId, KemSeed,
-    Policy, Secret, SignSeed, UserId,
+    Policy, Secret, SignSeed, UnixSeconds, UserId,
 };
+use super::party::{InviteePhase, InviterPhase};
 use super::query::*;
-use super::state::{ConversationNode, ConversationScope, HandshakeRole, HandshakeSession};
+use super::state::DeviceKeys;
 use super::{Engine, EngineState};
 use crate::protocol::Rng;
 impl Engine {
@@ -25,6 +26,7 @@ impl Engine {
         persistents: Option<Vec<DurableChannel>>,
     ) -> Result<(MutateOk, ConversationId), EngineError> {
         let now = Self::require_tick(&state)?;
+        let expires = UnixSeconds::from_u64(expires);
         if expires <= now {
             return Err(EngineError::ExpiresNotAfterNow);
         }
@@ -58,7 +60,7 @@ impl Engine {
         let body = DurableBody {
             conversation_id,
             hlc: Hlc {
-                wall_ms: now.saturating_mul(1000),
+                wall_ms: now.as_u64().saturating_mul(1000),
                 counter: 0,
             },
             payload,
@@ -66,13 +68,15 @@ impl Engine {
         let persist = self.persist_record(state.next_seq, &body)?;
         state.next_seq = state.next_seq.saturating_add(1);
         state.txs.insert(tx_id, body);
-        state.put_handshake(
-            ConversationScope::Identity {
-                user: user_id,
-                identity: identity_id,
-            },
+        state.put_dm_inviter(
+            user_id,
+            identity_id,
             conversation_id,
-            HandshakeSession::open(ticket, HandshakeRole::Inviter).with_intake(Some(intake)),
+            InviterPhase::InviteCreated {
+                ticket,
+                intake,
+                list_from: time_bin(now),
+            },
         );
         #[rustfmt::skip]
         self.post_handshake_packets(&mut state, rng, conversation_id, &secret, tx_id)?;
@@ -136,16 +140,17 @@ impl Engine {
         identity_id: IdentityId,
         ticket_host_string: &str,
     ) -> Result<(MutateOk, ConversationId), EngineError> {
-        let _ = Self::require_tick(&state)?;
+        let now = Self::require_tick(&state)?;
         let ticket = self.parse_ticket_host_string(ticket_host_string)?;
         let conversation_id = ConversationId::from(rng.random32());
-        state.put_handshake(
-            ConversationScope::Identity {
-                user: user_id,
-                identity: identity_id,
-            },
+        state.put_dm_invitee(
+            user_id,
+            identity_id,
             conversation_id,
-            HandshakeSession::open(ticket, HandshakeRole::Invitee),
+            InviteePhase::TicketReceived {
+                ticket,
+                list_from: time_bin(now),
+            },
         );
         Ok((
             MutateOk {
@@ -201,6 +206,7 @@ impl Engine {
         persistents: Option<Vec<DurableChannel>>,
     ) -> Result<(MutateOk, ConversationId), EngineError> {
         let now = Self::require_tick(&state)?;
+        let expires = UnixSeconds::from_u64(expires);
         if expires <= now {
             return Err(EngineError::ExpiresNotAfterNow);
         }
@@ -211,33 +217,34 @@ impl Engine {
             .map_err(|_| EngineError::ChannelBounds)?;
         let conversation_id = ConversationId::from(rng.random32());
         let secret = Secret::from(rng.random32());
-        state.device.id = Some(
-            state
-                .device
-                .id
-                .unwrap_or_else(|| DeviceId::from(rng.random32())),
-        );
+        let device_id = state
+            .device
+            .keys
+            .as_ref()
+            .and_then(|k| k.id)
+            .unwrap_or_else(|| DeviceId::from(rng.random32()));
+        if state.device.keys.is_none() {
+            state.device.keys = Some(DeviceKeys {
+                id: Some(device_id),
+                enc: self
+                    .suite
+                    .kem()
+                    .generate(policy, &KemSeed::from_pair(rng.random32(), rng.random32()))
+                    .map_err(|_| EngineError::MalformedPayload)?,
+                sign: self
+                    .suite
+                    .sign()
+                    .generate(policy, &SignSeed::from_pair(rng.random32(), rng.random32()))
+                    .map_err(|_| EngineError::MalformedPayload)?,
+            });
+        } else if let Some(keys) = state.device.keys.as_mut() {
+            keys.id = Some(device_id);
+        }
         let intake = self
             .suite
             .kem()
             .generate(policy, &KemSeed::from_pair(rng.random32(), rng.random32()))
             .map_err(|_| EngineError::MalformedPayload)?;
-        if state.device.enc.is_none() {
-            state.device.enc = Some(
-                self.suite
-                    .kem()
-                    .generate(policy, &KemSeed::from_pair(rng.random32(), rng.random32()))
-                    .map_err(|_| EngineError::MalformedPayload)?,
-            );
-        }
-        if state.device.sign.is_none() {
-            state.device.sign = Some(
-                self.suite
-                    .sign()
-                    .generate(policy, &SignSeed::from_pair(rng.random32(), rng.random32()))
-                    .map_err(|_| EngineError::MalformedPayload)?,
-            );
-        }
         let payload = TxPayload::Notice(TxNotice {
             policy,
             intake_pk: intake.public_bytes().to_vec(),
@@ -249,7 +256,7 @@ impl Engine {
         let body = DurableBody {
             conversation_id,
             hlc: Hlc {
-                wall_ms: now.saturating_mul(1000),
+                wall_ms: now.as_u64().saturating_mul(1000),
                 counter: 0,
             },
             payload,
@@ -262,11 +269,13 @@ impl Engine {
             persistents: persistents.clone(),
             expires,
         };
-        state.put_sync(
+        state.put_sync_inviter(
             conversation_id,
-            ConversationNode::Handshake(
-                HandshakeSession::open(ticket, HandshakeRole::Inviter).with_intake(Some(intake)),
-            ),
+            InviterPhase::InviteCreated {
+                ticket,
+                intake,
+                list_from: time_bin(now),
+            },
         );
         state.device.name = Some(name);
         #[rustfmt::skip]
@@ -295,14 +304,16 @@ impl Engine {
         {
             return Err(EngineError::EmptyEngineRequired);
         }
-        let _ = Self::require_tick(&state)?;
+        let now = Self::require_tick(&state)?;
         let ticket = self.parse_ticket_host_string(ticket_host_string)?;
         let conversation_id = ConversationId::from(rng.random32());
         let mut state = state;
-        state.put_handshake(
-            ConversationScope::Device,
+        state.put_sync_invitee(
             conversation_id,
-            HandshakeSession::open(ticket, HandshakeRole::Invitee),
+            InviteePhase::TicketReceived {
+                ticket,
+                list_from: time_bin(now),
+            },
         );
         Ok((
             MutateOk {

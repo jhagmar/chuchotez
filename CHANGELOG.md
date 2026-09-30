@@ -12,7 +12,8 @@ required before `poll` and mints. Ticket host strings are
 `text(packed(Ticket))`. Query `Conversation` / `Handshake` are enums
 (`HandshakeInviter`, `HandshakeInvitee`, `FailedReason`, `DirectMessageQuery`,
 `GroupQuery`, `SynchronizationQuery`); `ConversationListRow` carries
-`Conversation`. `std_suite` adds SHA-256 (`LibcruxSha256`) and
+`Conversation`. The stored row is that phase. Fold version 1 writes users,
+identities, and those conversations, with Sync on the device. `std_suite` adds SHA-256 (`LibcruxSha256`) and
 Argon2id (`RustcryptoArgon2id`). Kem wrap/unwrap and Sign sign/verify ship
 for Classic, PostQuantum, and Hybrid. `ADDRESS_MAX_LEN` is 256. Persistent
 channel lists are length 1..=4; ephemeral lists are 0..=4. `PacketPlain`
@@ -35,4 +36,16 @@ child DM or Sync whose `conversation_id` is
 `mac(spawn_secret, "chuchotez/1/spawn-conversation-id")` and whose secret is
 `spawn_secret`. `rejectEstablished` stores `ConfirmationRejected`. Handshake
 and spawned DM are two `listConversations` rows. Group invites use an
-Established DM and have no Ticket, InviteTag, or intake KEM.
+Established DM and have no Ticket, InviteTag, or intake KEM. Durable
+`PacketTxFragLast` / `PacketXorAck` matching `set_xor` after merge stores
+last Persistent ack. Watermark is the intersection of last Persistent acks
+from members who have Persistent-acked at least once. `fold` is `WrongPhase`
+when a persist seq's tx is outside the watermark. Fold MAY drop txs with
+`expire_at` ≤ ticked now. Cached `mk` is deleted when every tx on that packet
+is watermarked. Invite-tag list continues until that intro is watermarked.
+Handshake catch-up lists incomplete bins from `list_from` (the TimeBin at
+`create_invite` / `receive_ticket`) or `watermark + 1` through `W+1`, union
+`[W-1, W, W+1]`. Mapper `list` / `listen` MAY omit TimeBin < `W-71`. Packet
+chains, skip-ahead `mk`s, and last Persistent acks live on the conversation
+row. `PersistSeq`, `UnixSeconds`, `TimeBin`, `PacketSeq`, `PacketEpoch`,
+`FragIndex`, and `ActorId` are branded.
