@@ -1,8 +1,6 @@
 //! Vault wrap, persist records, and mutation.
 
-use super::super::chain::{
-    chain_key, fragment_body, join, mk, packed_tx, seal_packet, set_xor_for, step,
-};
+use super::super::chain::{fragment_body, join, mk, packed_tx, seal_packet, set_xor_for, step};
 use super::super::codec::{durable_body_to_json, vault_header_to_json};
 use super::super::hmac::{HmacSha256Key, expand};
 use super::super::payload::{
@@ -10,7 +8,8 @@ use super::super::payload::{
     VAULT_P, VAULT_T, VaultHeader, time_bin,
 };
 use super::super::{
-    AEAD_NONCE_LEN, AeadKey, AeadNonce, ConversationId, EngineError, Json, Secret, Tag,
+    AEAD_NONCE_LEN, ActorId, AeadKey, AeadNonce, ConversationId, EngineError, Json, PersistSeq,
+    Secret, Tag, UnixSeconds,
 };
 use super::query::*;
 use super::{Engine, EngineState, PERSIST_VERSION};
@@ -190,7 +189,7 @@ impl Engine {
         self.dek.as_ref().ok_or(EngineError::Locked)
     }
 
-    pub(super) fn require_tick(state: &EngineState) -> Result<u64, EngineError> {
+    pub(super) fn require_tick(state: &EngineState) -> Result<UnixSeconds, EngineError> {
         state.ticked.ok_or(EngineError::NotTicked)
     }
 
@@ -236,11 +235,11 @@ impl Engine {
 
     pub(super) fn persist_record(
         &self,
-        seq: u64,
+        seq: PersistSeq,
         body: &DurableBody,
     ) -> Result<Vec<u8>, EngineError> {
         let dek = self.require_dek()?;
-        if seq == u64::MAX {
+        if seq.as_u64() == u64::MAX {
             return Err(EngineError::MalformedPersist);
         }
         let json = durable_body_to_json(self.suite.b64u(), body);
@@ -252,7 +251,7 @@ impl Engine {
         let _ = self.suite.hash().hash(&packed);
         let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
         nonce_bytes[..4].copy_from_slice(&PERSIST_VERSION.to_be_bytes());
-        nonce_bytes[4..].copy_from_slice(&seq.to_be_bytes());
+        nonce_bytes[4..].copy_from_slice(&seq.as_u64().to_be_bytes());
         let nonce = AeadNonce::from_bytes(nonce_bytes);
         let ct = self.suite.aead().seal(dek, &nonce, b"", &packed);
         let mut out = Vec::with_capacity(AEAD_NONCE_LEN + ct.len());
@@ -287,7 +286,7 @@ impl Engine {
                 &HmacSha256Key::from_bytes(*conv_secret.as_bytes()),
                 &[
                     b"chuchotez/1/handshake-invite".as_slice(),
-                    &time_bin(now).to_be_bytes(),
+                    &time_bin(now).as_u64().to_be_bytes(),
                 ]
                 .concat(),
             )
@@ -300,12 +299,22 @@ impl Engine {
             .clone();
         let packed = packed_tx(&self.suite, &body);
         let set_xor = set_xor_for(&state.txs, conversation_id);
-        let key = chain_key(&conversation_id, &[]);
-        let mut chain = match state.send_chains.get(&key) {
+        let actor = ActorId::handshake();
+        let mut chain = match state
+            .chains(conversation_id)
+            .and_then(|c| c.send.get(&actor))
+        {
             Some(c) => c.clone(),
             None => join(self.suite.hmac(), conv_secret.as_bytes(), sort, &[])?,
         };
-        let packets = fragment_body(&self.suite, &packed, tx_id, set_xor, chain.packet_seq, &[])?;
+        let packets = fragment_body(
+            &self.suite,
+            &packed,
+            tx_id,
+            set_xor,
+            chain.packet_seq.as_u64(),
+            &[],
+        )?;
         for packet in packets {
             let mk_bytes = mk(self.suite.hmac(), &chain);
             let sealed = seal_packet(&self.suite, rng, &mk_bytes, &packet)?;
@@ -318,7 +327,9 @@ impl Engine {
             }
             chain = step(self.suite.hmac(), &chain);
         }
-        state.send_chains.insert(key, chain);
+        if let Some(chains) = state.chains_mut(conversation_id) {
+            chains.send.insert(actor, chain);
+        }
         Ok(())
     }
 
@@ -334,7 +345,7 @@ impl Engine {
         let body = DurableBody {
             conversation_id,
             hlc: Hlc {
-                wall_ms: now.saturating_mul(1000),
+                wall_ms: now.as_u64().saturating_mul(1000),
                 counter: 0,
             },
             payload,
@@ -347,6 +358,8 @@ impl Engine {
             return Err(EngineError::Equivocation);
         }
         let persist = self.persist_record(state.next_seq, &body)?;
+        let seq = state.next_seq;
+        state.persist_log.insert(seq, tx_id);
         state.next_seq = state.next_seq.saturating_add(1);
         state.txs.insert(tx_id, body.clone());
         Ok((tx_id, body, persist))

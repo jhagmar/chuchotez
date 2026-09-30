@@ -44,7 +44,10 @@ pub use engine::{
 pub use error::EngineError;
 pub use hash::{HashBytes, Sha256};
 pub use hmac::{HmacSha256, HmacSha256Key, HmacSha256Mac};
-pub use ids::{ConversationId, DeviceId, IdentityId, Secret, Tag, TagKey, UserId};
+pub use ids::{
+    ActorId, ConversationId, DeviceId, FragIndex, IdentityId, PacketEpoch, PacketSeq, PersistSeq,
+    Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
+};
 pub use json::{CanonicalJson, CanonicalJsonError, Json};
 pub use kem::{
     CLASSIC_KEM_CT_LEN, CLASSIC_KEM_PK_LEN, CLASSIC_KEM_SK_LEN, KEM_SEED_LEN, KEM_SHARED_LEN, Kem,
@@ -53,7 +56,7 @@ pub use kem::{
     kem_pk_len, kem_sk_len,
 };
 pub use payload::{
-    AEAD_TAG_LEN, BIN_WINDOW, ConversationSort, DurableBody, GroupMember, Hlc, PACKET_LEN,
+    AEAD_TAG_LEN, ConversationSort, DurableBody, GroupMember, Hlc, PACKET_LEN,
     PACKET_MAX_UNCOMPRESSED, PACKET_PAD_LEN, PacketHealHalfXor, PacketHealHave, PacketHealWant,
     PacketPlain, PacketPresence, PacketPresenceActive, PacketTxFragLast, PacketTxFragMore,
     PacketTyping, PacketTypingActive, PacketXorAck, Ticket, TxEdit, TxGroupInvite, TxGroupRoster,

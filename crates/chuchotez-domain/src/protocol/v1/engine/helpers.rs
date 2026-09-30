@@ -1,20 +1,21 @@
 //! Shared engine helpers.
 
+use super::super::chain::set_xor_for;
 use super::super::hmac::{HmacSha256, HmacSha256Key, expand};
 use super::super::kem::{KEM_SHARED_LEN, kem_ct_len, kem_pk_len};
 use super::super::payload::{
-    BIN_WINDOW, ConversationSort, PacketPlain, Ticket, TxInviteeIntro, TxInviterIntro, TxNotice,
-    TxPayload, parse_policy, policy_str,
+    ConversationSort, PacketPlain, Ticket, TxInviteeIntro, TxInviterIntro, TxNotice, TxPayload,
 };
 use super::super::sign::sign_pk_len;
 use super::super::{
-    Address, ConversationId, DisplayName, DurableChannel, EngineError, Json, Kind, Policy, Secret,
-    Tag, TagKey,
+    ActorId, Address, ConversationId, DisplayName, DurableChannel, EngineError, FragIndex, Json,
+    Kind, Policy, Secret, Tag, TagKey, TimeBin, UnixSeconds,
 };
-use super::query::{DurableLocator, DurableWrite, EphemeralWrite, FailedReason};
+use super::party::HandshakeFailure;
+use super::query::*;
 use super::state::{BinKey, BinProgress, EngineState};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 pub(super) type CallingParts = (
     DisplayName,
@@ -39,6 +40,16 @@ pub(super) fn invitee_intro_for(
 ) -> Option<&TxInviteeIntro> {
     state.txs.values().find_map(|t| match &t.payload {
         TxPayload::InviteeIntro(i) if t.conversation_id == conversation_id => Some(i),
+        _ => None,
+    })
+}
+
+pub(super) fn invitee_intro_tx_id(
+    state: &EngineState,
+    conversation_id: ConversationId,
+) -> Option<Tag> {
+    state.txs.iter().find_map(|(id, t)| match &t.payload {
+        TxPayload::InviteeIntro(_) if t.conversation_id == conversation_id => Some(*id),
         _ => None,
     })
 }
@@ -72,9 +83,9 @@ pub(super) fn store_unlock_failed(state: &mut EngineState, cid: ConversationId) 
     }
     let conversation_id = cid;
     let reason = if notice_for(state, conversation_id).is_some() || state.is_inviter(cid) {
-        FailedReason::IntroUnlockFailed
+        HandshakeFailure::IntroUnlockFailed
     } else {
-        FailedReason::NoticeUnlockFailed
+        HandshakeFailure::NoticeUnlockFailed
     };
     state.fail(cid, reason);
 }
@@ -85,15 +96,18 @@ pub(super) fn handshake_rows(
     state
         .handshake_entries()
         .into_iter()
-        .map(|(id, hs, sort)| (id, hs.ticket.clone(), sort))
+        .map(|row| (row.cid, row.party.ticket().clone(), row.sort))
         .collect()
 }
 
-pub(super) fn window_start(w: u64) -> u64 {
-    w.saturating_sub(BIN_WINDOW.saturating_sub(1))
+pub(super) fn catch_up_start(progress: Option<&BinProgress>, list_from: TimeBin) -> TimeBin {
+    progress
+        .and_then(|p| p.watermark)
+        .map(|w| w.saturating_add(1))
+        .unwrap_or(list_from)
 }
 
-pub(super) fn listen_bins(w: u64) -> [u64; 3] {
+pub(super) fn listen_bins(w: TimeBin) -> [TimeBin; 3] {
     [w.saturating_sub(1), w, w.saturating_add(1)]
 }
 
@@ -108,14 +122,14 @@ pub(super) fn handshake_tag_key(hmac: &dyn HmacSha256, secret: &[u8; 32]) -> Tag
     )
 }
 
-pub(super) fn invite_tag(hmac: &dyn HmacSha256, secret: &[u8; 32], bin: u64) -> Tag {
+pub(super) fn invite_tag(hmac: &dyn HmacSha256, secret: &[u8; 32], bin: TimeBin) -> Tag {
     Tag::from_bytes(
         expand(
             hmac,
             &HmacSha256Key::from_bytes(*secret),
             &[
                 b"chuchotez/1/handshake-invite".as_slice(),
-                &bin.to_be_bytes(),
+                &bin.as_u64().to_be_bytes(),
             ]
             .concat(),
         )
@@ -131,23 +145,17 @@ pub(super) fn progress_key(channel: &DurableChannel, tag_key: &TagKey) -> BinKey
     }
 }
 
-pub(super) fn bin_complete(progress: Option<&BinProgress>, bin: u64) -> bool {
+pub(super) fn bin_complete(progress: Option<&BinProgress>, bin: TimeBin) -> bool {
     let Some(p) = progress else {
         return false;
     };
     p.watermark.is_some_and(|w| bin <= w) || p.completed.contains(&bin)
 }
 
-pub(super) fn prune_progress(progress: &mut BinProgress, start: u64) {
-    if let Some(w) = progress.watermark
-        && w < start
-    {
-        progress.watermark = None;
-    }
-    progress.completed.retain(|&b| b >= start);
+pub(super) fn advance_progress(progress: &mut BinProgress, list_from: TimeBin) {
     loop {
         let next = match progress.watermark {
-            None => start,
+            None => list_from,
             Some(w) => w.saturating_add(1),
         };
         if progress.completed.remove(&next) {
@@ -209,24 +217,24 @@ pub(super) fn sort_ephemeral_writes(writes: &mut [EphemeralWrite]) {
 
 pub(super) struct FragPart {
     pub(super) tx_id: Tag,
-    pub(super) frag_i: u64,
+    pub(super) frag_i: FragIndex,
     pub(super) frag: Vec<u8>,
-    pub(super) last_i: Option<u64>,
+    pub(super) last_i: Option<FragIndex>,
 }
 
 pub(super) fn frag_parts(packet: &PacketPlain) -> Option<FragPart> {
     match packet {
         PacketPlain::TxFragMore(p) => Some(FragPart {
             tx_id: p.tx_id,
-            frag_i: p.frag_i,
+            frag_i: FragIndex::from_u64(p.frag_i),
             frag: p.frag.clone(),
             last_i: None,
         }),
         PacketPlain::TxFragLast(p) => Some(FragPart {
             tx_id: p.tx_id,
-            frag_i: p.frag_i,
+            frag_i: FragIndex::from_u64(p.frag_i),
             frag: p.frag.clone(),
-            last_i: Some(p.frag_i),
+            last_i: Some(FragIndex::from_u64(p.frag_i)),
         }),
         _ => None,
     }
@@ -238,9 +246,6 @@ pub(super) fn rekey_conversation(
     to: ConversationId,
 ) {
     state.rekey_row(from, to);
-    rekey_prefix(&mut state.send_chains, from, to);
-    rekey_prefix(&mut state.recv_chains, from, to);
-    rekey_prefix(&mut state.skipped_mks, from, to);
     for frag in state.frags.values_mut() {
         frag.conversation_id = rekey_cid(frag.conversation_id, from, to);
     }
@@ -249,13 +254,6 @@ pub(super) fn rekey_conversation(
 #[rustfmt::skip]
 pub(super) fn rekey_cid(cid: ConversationId, from: ConversationId, to: ConversationId) -> ConversationId {
     if cid == from { to } else { cid }
-}
-
-#[rustfmt::skip]
-pub(super) fn rekey_prefix<V>(map: &mut BTreeMap<Vec<u8>, V>, from: ConversationId, to: ConversationId) {
-    *map = std::mem::take(map).into_iter().map(|(k, v)| {
-        if k.len() >= 32 && k[..32] == *from.as_bytes() { let mut nk = to.as_bytes().to_vec(); nk.extend_from_slice(&k[32..]); (nk, v) } else { (k, v) }
-    }).collect();
 }
 
 pub(super) fn decode_fold_bstr(
@@ -275,31 +273,6 @@ pub(super) fn decode_fold32(
     decode_fold_bstr(b64u, value)?
         .try_into()
         .map_err(|_| EngineError::MalformedPersist)
-}
-
-pub(super) fn parse_fold_shared_map(
-    b64u: &dyn super::super::Base64Url,
-    value: Option<&Json>,
-    out: &mut BTreeMap<ConversationId, Secret>,
-) -> Result<(), EngineError> {
-    match value {
-        Some(Json::Array(items)) => {
-            for item in items {
-                let Json::Object(m) = item else {
-                    return Err(EngineError::MalformedPersist);
-                };
-                let getm = |k: &str| m.iter().find(|(n, _)| n == k).map(|(_, v)| v);
-                #[rustfmt::skip]
-                let cid = decode_fold32(b64u, getm("conversation_id").ok_or(EngineError::MalformedPersist)?)?;
-                #[rustfmt::skip]
-                let shared = decode_fold32(b64u, getm("shared").ok_or(EngineError::MalformedPersist)?)?;
-                out.insert(ConversationId::from_bytes(cid), Secret::from_bytes(shared));
-            }
-            Ok(())
-        }
-        None => Ok(()),
-        Some(_) => Err(EngineError::MalformedPersist),
-    }
 }
 
 pub(super) fn sort32(a: &[u8; 32], b: &[u8; 32]) -> Vec<u8> {
@@ -341,49 +314,7 @@ pub(super) fn parse_fold_keypair(
     Ok((pk, sk))
 }
 
-pub(super) fn failed_to_json(
-    b64u: &dyn super::super::Base64Url,
-    id: ConversationId,
-    reason: FailedReason,
-) -> Json {
-    let mut members = vec![
-        (
-            "conversation_id".into(),
-            super::super::codec::bstr(b64u, id.as_bytes()),
-        ),
-        (
-            "reason".into(),
-            Json::String(
-                match reason {
-                    FailedReason::PolicyNotAccepted { .. } => "PolicyNotAccepted",
-                    FailedReason::InviteExpired { .. } => "InviteExpired",
-                    FailedReason::NoticeUnlockFailed => "NoticeUnlockFailed",
-                    FailedReason::NoticeConflict => "NoticeConflict",
-                    FailedReason::IntroUnlockFailed => "IntroUnlockFailed",
-                    FailedReason::IntroVerifyFailed => "IntroVerifyFailed",
-                    FailedReason::DuplicateIntro => "DuplicateIntro",
-                    FailedReason::ConfirmationRejected => "ConfirmationRejected",
-                    FailedReason::Equivocation => "Equivocation",
-                    FailedReason::OfferRejected => "OfferRejected",
-                    FailedReason::Kicked => "Kicked",
-                    FailedReason::Left => "Left",
-                }
-                .into(),
-            ),
-        ),
-    ];
-    match reason {
-        FailedReason::PolicyNotAccepted { policy } => {
-            members.push(("policy".into(), Json::String(policy_str(policy).into())));
-        }
-        FailedReason::InviteExpired { expires } => {
-            members.push(("expires".into(), Json::Number(expires)));
-        }
-        _ => {}
-    }
-    Json::Object(members)
-}
-
+#[cfg(test)]
 pub(super) fn parse_failed(
     b64u: &dyn super::super::Base64Url,
     value: &Json,
@@ -403,14 +334,17 @@ pub(super) fn parse_failed(
                 return Err(EngineError::MalformedPersist);
             };
             FailedReason::PolicyNotAccepted {
-                policy: parse_policy(p).ok_or(EngineError::MalformedPersist)?,
+                policy: super::super::payload::parse_policy(p)
+                    .ok_or(EngineError::MalformedPersist)?,
             }
         }
         "InviteExpired" => {
             let Json::Number(expires) = get("expires").ok_or(EngineError::MalformedPersist)? else {
                 return Err(EngineError::MalformedPersist);
             };
-            FailedReason::InviteExpired { expires: *expires }
+            FailedReason::InviteExpired {
+                expires: UnixSeconds::from_u64(*expires),
+            }
         }
         "NoticeUnlockFailed" => FailedReason::NoticeUnlockFailed,
         "NoticeConflict" => FailedReason::NoticeConflict,
@@ -441,4 +375,134 @@ pub(super) fn parse_fold_channel(value: &Json) -> Result<DurableChannel, EngineE
     let kind = Kind::try_from(kind.as_str()).map_err(|_| EngineError::MalformedPersist)?;
     let address = Address::try_from(address.as_str()).map_err(|_| EngineError::MalformedPersist)?;
     Ok(DurableChannel::new(kind, address))
+}
+
+pub(super) fn handshake_actor_key(actor_id: &[u8], local_inviter: bool) -> ActorId {
+    if actor_id.is_empty() {
+        ActorId::from_bytes(vec![u8::from(local_inviter)])
+    } else {
+        ActorId::from_bytes(actor_id)
+    }
+}
+
+pub(super) fn conversation_tx_ids(
+    state: &EngineState,
+    conversation_id: ConversationId,
+) -> BTreeSet<Tag> {
+    state
+        .txs
+        .iter()
+        .filter(|(_, body)| body.conversation_id == conversation_id)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+pub(super) fn watermark_of(state: &EngineState, conversation_id: ConversationId) -> BTreeSet<Tag> {
+    let Some(chains) = state.chains(conversation_id) else {
+        return conversation_tx_ids(state, conversation_id);
+    };
+    let mut iter = chains.last_acks.values().filter(|set| !set.is_empty());
+    let Some(first) = iter.next() else {
+        return conversation_tx_ids(state, conversation_id);
+    };
+    iter.fold(first.clone(), |acc, set| {
+        acc.intersection(set).copied().collect()
+    })
+}
+
+pub(super) fn tx_watermarked(state: &EngineState, tx_id: Tag) -> bool {
+    state
+        .txs
+        .get(&tx_id)
+        .is_some_and(|body| watermark_of(state, body.conversation_id).contains(&tx_id))
+}
+
+pub(super) fn payload_expire_at(payload: &TxPayload) -> Option<UnixSeconds> {
+    match payload {
+        TxPayload::Text(t) => t.expire_at,
+        TxPayload::Media(m) => m.expire_at,
+        _ => None,
+    }
+}
+
+pub(super) fn persist_outside_watermark(state: &EngineState) -> bool {
+    let now = state.ticked.unwrap_or_default();
+    state.persist_log.values().any(|tx_id| {
+        let Some(body) = state.txs.get(tx_id) else {
+            return false;
+        };
+        if payload_expire_at(&body.payload).is_some_and(|expires| expires <= now) {
+            return false;
+        }
+        !tx_watermarked(state, *tx_id)
+    })
+}
+
+pub(super) fn store_durable_last_ack(
+    state: &mut EngineState,
+    conversation_id: ConversationId,
+    actor_id: &[u8],
+    set_xor: Tag,
+) {
+    if set_xor_for(&state.txs, conversation_id) != set_xor {
+        return;
+    }
+    let local_inviter = state.is_inviter(conversation_id);
+    let actor = handshake_actor_key(actor_id, local_inviter);
+    let ids = conversation_tx_ids(state, conversation_id);
+    if let Some(chains) = state.chains_mut(conversation_id) {
+        chains.last_acks.insert(actor, ids);
+    }
+}
+
+pub(super) fn prune_cached_mks(state: &mut EngineState) {
+    let drop: BTreeSet<Tag> = {
+        let mut ids = Vec::new();
+        state.for_each_chains(|_, chains| {
+            ids.extend(
+                chains
+                    .skipped_mks
+                    .values()
+                    .flatten()
+                    .filter_map(|e| e.tx_id),
+            );
+        });
+        ids.into_iter()
+            .filter(|id| tx_watermarked(state, *id))
+            .collect()
+    };
+    state.each_chains_mut(|chains| {
+        for entries in chains.skipped_mks.values_mut() {
+            entries.retain(|e| e.tx_id.is_none_or(|id| !drop.contains(&id)));
+        }
+        chains.skipped_mks.retain(|_, e| !e.is_empty());
+    });
+}
+
+pub(super) fn annotate_cached_mk(
+    state: &mut EngineState,
+    cid: ConversationId,
+    actor: &ActorId,
+    mk: &[u8; 32],
+    tx_id: Tag,
+) {
+    if let Some(chains) = state.chains_mut(cid)
+        && let Some(entries) = chains.skipped_mks.get_mut(actor)
+    {
+        for e in entries {
+            if &e.mk == mk {
+                e.tx_id = Some(tx_id);
+            }
+        }
+    }
+}
+
+pub(super) fn intro_watermarked(state: &EngineState, conversation_id: ConversationId) -> bool {
+    let Some(tx_id) = invitee_intro_tx_id(state, conversation_id) else {
+        return false;
+    };
+    state
+        .chains(conversation_id)
+        .is_some_and(|c| c.last_acks.values().any(|set| !set.is_empty()))
+        && watermark_of(state, conversation_id).contains(&tx_id)
 }

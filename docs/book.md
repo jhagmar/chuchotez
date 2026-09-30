@@ -83,8 +83,13 @@ that id. `tick` is the clock; a first successful `tick` is required before
 `wrap_dek` returns a packed `VaultHeader` wrapping the held DEK (minted from
 `Rng` when absent) under a passphrase (UTF-8 length 8..=1024) or a 32-byte
 PRF secret. `unlock` holds that DEK. `lock` drops it. `fold` writes a sealed
-snapshot (fold version 2 in the nonce). Reload is `apply_folded` then `apply`
-of remaining persist records.
+snapshot of watermark txs (fold version 1 in the nonce). The snapshot is the
+state tree: users, identities, and conversation phases, with Sync
+conversations on the device. Query `Conversation` is a projection of that
+phase. `WrongPhase` when a
+persist seq's tx is outside the watermark. Fold MAY omit txs with
+`expire_at` ≤ ticked now. Reload is `apply_folded` then `apply` of remaining
+persist records.
 
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.
@@ -105,18 +110,27 @@ DEK, `tick`, `create_user`, `create_identity` with a Policy, `create_invite`,
 `receive_ticket`, the invitee lists the invite tag. `create_invite` posts
 sealed 512-byte `PacketTxFrag` bodies on the handshake sending chain.
 `ingest_list` / `ingest_packet` open those bodies with skip-ahead `mk`,
-reassemble fragments, and merge `DurableBody`. A full durable list completes
-that TimeBin in `BinProgress`. Empty invite-tag snapshot leaves Invitee
-`TicketReceived`; a valid `TxNotice` is `InviteReceived`. A valid notice
-plus `DisplayName` mints `TxInviteeIntro`. Inviter ingest of that intro mints
-`TxInviterIntro` and consumes the ticket. `writeAck` of the intro set is
-Inviter `Confirming` / Invitee `IntroductionSent`. Invitee ingest of inviter
-intro is `Confirming`. Policy mismatch, unlock failure, Notice conflict, intro
-unlock/verify failure, and duplicate intro store `FailedReason` overlays.
-`tick` past `expires` pre-confirm stores `InviteExpired`.
-`confirmation_digest` is `text(fingerprint)`. `confirmEstablished` inserts a
-child DM or Sync conversation. Heal, live-path XOR-acks, and group mint wait
-on later slices.
+reassemble fragments, and merge `DurableBody`. Durable `PacketTxFragLast` or
+`PacketXorAck` matching `set_xor` after merge stores that actor's last
+Persistent ack. A `PacketXorAck` from an EphemeralChannel with a matching
+`set_xor` is a live ack only. The watermark is the intersection of last
+Persistent acks from members who have Persistent-acked at least once. A full
+durable list completes that TimeBin in `BinProgress`. Handshake catch-up
+lists incomplete bins from `list_from` (the TimeBin at `create_invite` /
+`receive_ticket`) or `watermark + 1` through `W+1`, union `[W-1, W, W+1]`.
+Mapper `list` / `listen` MAY omit TimeBin < `W-71`. Packet chains, skip-ahead
+`mk`s, and last Persistent acks live on the conversation row. Empty invite-tag
+snapshot leaves Invitee `TicketReceived`; a valid `TxNotice` is
+`InviteReceived`. A valid notice plus `DisplayName` mints `TxInviteeIntro`.
+Inviter ingest of that intro mints `TxInviterIntro` and consumes the ticket.
+`writeAck` of the intro set is Inviter `Confirming` / Invitee
+`IntroductionSent`. Invitee ingest of inviter intro is `Confirming`. Policy
+mismatch, unlock failure, Notice conflict, intro unlock/verify failure, and
+duplicate intro store `FailedReason` overlays. `tick` past `expires`
+pre-confirm stores `InviteExpired`. `confirmation_digest` is
+`text(fingerprint)`. `confirmEstablished` inserts a child DM or Sync
+conversation. Invite-tag list continues until that intro is watermarked.
+Heal, live-path XOR-acks, and group mint wait on later slices.
 
 `std_suite` ships HMAC-SHA-256 over `libcrux-hmac` (`LibcruxHmac`), raw
 Deflate over `flate2` (`miniz_oxide`, `Compression::best()`), unpadded
