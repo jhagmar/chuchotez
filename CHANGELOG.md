@@ -61,4 +61,5 @@ Persistent; `tick` after 3 seconds enqueues it. `TxAdvertise`, `TxWrap`, and
 only. `sendText` and the other DM chat mutators require an established DM.
 `sendTyping` and `sendPresence` are also legal on established Sync. Query
 `messages` is the newest 1000 chat items. Typing clears after 6 ticked
-seconds. A durable DM tx pings the peer Wake when set.
+seconds. A durable DM tx pings the peer Wake when set. `sendMedia` seals each
+attachment under `media_key` and `open_media` checks `hash`.

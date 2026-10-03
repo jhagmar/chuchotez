@@ -134,8 +134,30 @@ impl Engine {
             write_durable,
             write_ephemeral,
             blob_put: state.blob_puts.clone(),
+            blob_get: blob_gets(state),
             blocked,
             ..Poll::default()
         })
     }
+}
+
+fn blob_gets(state: &EngineState) -> Vec<BlobGet> {
+    let mut out = Vec::new();
+    for tx in state.txs.values() {
+        let TxPayload::Media(media) = &tx.payload else {
+            continue;
+        };
+        let pending = state.blob_puts.iter().any(|put| {
+            put.kind == media.kind && put.address == media.address && put.tag == media.tag
+        });
+        if pending {
+            continue;
+        }
+        out.push(BlobGet {
+            kind: media.kind.clone(),
+            address: media.address.clone(),
+            tag: media.tag,
+        });
+    }
+    out
 }
