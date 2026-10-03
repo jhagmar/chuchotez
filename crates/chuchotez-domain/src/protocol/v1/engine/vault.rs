@@ -312,7 +312,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn write_chain_packets(
+    pub(super) fn write_chain_packets(
         &self,
         state: &mut EngineState,
         rng: &dyn Rng,
@@ -328,6 +328,23 @@ impl Engine {
             .ticket(conversation_id)
             .map(|t| t.secret)
             .ok_or(EngineError::UnknownIds)?;
+        let now = state.ticked;
+        if let Some(chains) = state.chains_mut(conversation_id)
+            && chains.heal.on_ephemeral
+        {
+            let due = now.is_some_and(|now| {
+                chains
+                    .heal
+                    .sent_at
+                    .is_some_and(|sent| now >= sent.saturating_add(3))
+            });
+            chains.heal.ready.clear();
+            chains.heal.sealed_from = None;
+            chains.heal.sealed_to = None;
+            if due {
+                chains.heal.needs_reseal = true;
+            }
+        }
         let body = state
             .txs
             .get(&tx_id)

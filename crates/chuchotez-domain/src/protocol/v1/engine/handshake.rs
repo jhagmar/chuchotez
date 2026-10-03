@@ -1,6 +1,6 @@
 //! Handshake query, intro mint, ingest, fingerprint, and spawn.
 
-use super::super::chain::{join, open_at};
+use super::super::chain::{eph_mk, join, open_at, open_plain};
 use super::super::codec::{durable_body_from_json, payload_to_json};
 use super::super::hmac::{HmacSha256Key, expand};
 use super::super::kem::KEM_SHARED_LEN;
@@ -540,6 +540,7 @@ impl Engine {
             return Err(EngineError::UnknownTag);
         }
         let mut state = state;
+        self.reseal_due(&mut state, rng)?;
         let mut persist = Vec::new();
         for body in bodies {
             persist.extend(self.ingest_known_body(&mut state, rng, &hits, body, true)?);
@@ -569,6 +570,7 @@ impl Engine {
         if hits.is_empty() {
             return Err(EngineError::UnknownTag);
         }
+        self.reseal_due(&mut state, rng)?;
         let persist = self.ingest_known_body(&mut state, rng, &hits, body, true)?;
         Ok(MutateOk {
             state,
@@ -593,6 +595,7 @@ impl Engine {
         if hits.is_empty() {
             return Err(EngineError::UnknownTag);
         }
+        self.reseal_due(&mut state, rng)?;
         let persist = self.ingest_known_body(&mut state, rng, &hits, body, false)?;
         Ok(MutateOk {
             state,
@@ -727,6 +730,13 @@ impl Engine {
             .and_then(|c| c.skipped_mks.get(&actor).cloned())
             .unwrap_or_default();
         cached.retain(|e| e.expires_at > now);
+        if !persistent {
+            let key = eph_mk(self.suite.hmac(), &start);
+            if let Ok(packet) = open_plain(&self.suite, &key, body) {
+                self.observe_ephemeral(state, rng, hit.cid, now, &packet)?;
+                return Ok(Vec::new());
+            }
+        }
         let opened = match open_at(
             &self.suite,
             &start,
@@ -777,9 +787,19 @@ impl Engine {
             annotate_cached_mk(state, hit.cid, &actor, &opened.mk, tx_id);
         }
         if let PacketPlain::XorAck(ack) = &opened.packet {
+            let remote = ack.set_xor;
             if persistent {
-                store_durable_last_ack(state, hit.cid, &ack.actor_id, ack.set_xor);
+                store_durable_last_ack(state, hit.cid, &ack.actor_id, remote);
             }
+            self.note_set_xor(state, rng, hit.cid, remote)?;
+            prune_cached_mks(state);
+            return Ok(Vec::new());
+        }
+        if matches!(
+            opened.packet,
+            PacketPlain::HealHalfXor(_) | PacketPlain::HealWant(_) | PacketPlain::HealHave(_)
+        ) {
+            self.on_heal_packet(state, rng, hit.cid, &opened.packet)?;
             prune_cached_mks(state);
             return Ok(Vec::new());
         }
@@ -852,6 +872,7 @@ impl Engine {
                         &last.actor_id,
                         last.set_xor,
                     );
+                    self.note_set_xor(state, rng, durable.conversation_id, last.set_xor)?;
                 }
                 prune_cached_mks(state);
                 return Ok(Vec::new());
@@ -869,6 +890,7 @@ impl Engine {
         state.txs.insert(part.tx_id, durable);
         if persistent && let PacketPlain::TxFragLast(last) = &opened.packet {
             store_durable_last_ack(state, cid, &last.actor_id, last.set_xor);
+            self.note_set_xor(state, rng, cid, last.set_xor)?;
         }
         prune_cached_mks(state);
         let conversation_id = cid;

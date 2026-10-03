@@ -2,6 +2,7 @@
 
 mod fold_tree;
 mod handshake;
+mod heal;
 mod helpers;
 mod identity;
 mod invite;

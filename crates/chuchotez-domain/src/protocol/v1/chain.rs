@@ -189,7 +189,11 @@ pub(crate) fn seal_packet(
         .ok_or(EngineError::MalformedPayload)
 }
 
-fn open_plain(suite: &Suite, mk_bytes: &[u8; 32], body: &[u8]) -> Result<PacketPlain, EngineError> {
+pub(crate) fn open_plain(
+    suite: &Suite,
+    mk_bytes: &[u8; 32],
+    body: &[u8],
+) -> Result<PacketPlain, EngineError> {
     if body.len() != PACKET_LEN {
         return Err(EngineError::UnknownTag);
     }

@@ -88,8 +88,12 @@ state tree: users, identities, and conversation phases, with Sync
 conversations on the device. Query `Conversation` is a projection of that
 phase. `WrongPhase` when a
 persist seq's tx is outside the watermark. Fold MAY omit txs with
-`expire_at` ≤ ticked now. Reload is `apply_folded` then `apply` of remaining
-persist records. When 50 durable packets have been sent since the last
+`expire_at` ≤ ticked now. When the sets differ, heal binary-searches
+sorted `tx_id`s with half-range XORs until one id, then want/have, and
+retransmits the missing tx under the current sending-chain keys. While the
+conversation is live, heal packets go out on Ephemeral; after 3 ticked
+seconds without an answer they continue on Persistent. Reload is
+`apply_folded` then `apply` of remaining persist records. When 50 durable packets have been sent since the last
 `TxAdvertise`, `TxWrap`, or `TxAck`, the next send mints the one still owed.
 Wrap uses an `encaps_pk` whose advertise tx is in the watermark. A shared
 enters the mix FIFO after a watermarked `ratchet_ack` of that `kem_ct`. Every
@@ -136,7 +140,7 @@ duplicate intro store `FailedReason` overlays. `tick` past `expires`
 pre-confirm stores `InviteExpired`. `confirmation_digest` is
 `text(fingerprint)`. `confirmEstablished` inserts a child DM or Sync
 conversation. Invite-tag list continues until that intro is watermarked.
-Heal, live-path XOR-acks, and group mint wait on later slices.
+Live-path sends and group mint wait on later slices.
 
 `std_suite` ships HMAC-SHA-256 over `libcrux-hmac` (`LibcruxHmac`), raw
 Deflate over `flate2` (`miniz_oxide`, `Compression::best()`), unpadded

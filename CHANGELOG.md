@@ -51,4 +51,7 @@ row. `PersistSeq`, `UnixSeconds`, `TimeBin`, `PacketSeq`, `PacketEpoch`,
 `FragIndex`, and `ActorId` are branded. When 50 durable packets have been
 sent since the last `TxAdvertise`, `TxWrap`, or `TxAck`, the next send mints
 the one still owed. Every 8th durable packet mixes when the FIFO holds 8
-agreed shareds. At most 8 unused advertised secret keys are kept.
+agreed shareds. At most 8 unused advertised secret keys are kept. A set-XOR mismatch binary-searches `tx_id`s until one
+id, then want/have, and retransmits the missing tx. While live, heal uses
+Ephemeral; after 3 ticked seconds without an answer it continues on
+Persistent.
