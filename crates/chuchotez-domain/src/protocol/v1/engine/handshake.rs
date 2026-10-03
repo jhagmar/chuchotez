@@ -1,6 +1,6 @@
 //! Handshake query, intro mint, ingest, fingerprint, and spawn.
 
-use super::super::chain::{join, open_skip_ahead};
+use super::super::chain::{join, open_at};
 use super::super::codec::{durable_body_from_json, payload_to_json};
 use super::super::hmac::{HmacSha256Key, expand};
 use super::super::kem::KEM_SHARED_LEN;
@@ -715,13 +715,36 @@ impl Engine {
             return Err(EngineError::UnknownTag);
         }
         let actor = ActorId::handshake();
-        let start = join(self.suite.hmac(), hit.secret.as_bytes(), hit.sort, &[])?;
+        self.absorb_peer_wraps(state, hit.cid);
+        let joined = join(self.suite.hmac(), hit.secret.as_bytes(), hit.sort, &[])?;
+        let start = state
+            .chains(hit.cid)
+            .and_then(|c| c.recv.get(&actor).cloned())
+            .unwrap_or_else(|| joined.clone());
+        let mixed = self.mixed_chain(state, hit.cid, hit.sort, &start, false);
         let mut cached = state
             .chains(hit.cid)
             .and_then(|c| c.skipped_mks.get(&actor).cloned())
             .unwrap_or_default();
         cached.retain(|e| e.expires_at > now);
-        let opened = open_skip_ahead(&self.suite, &start, &cached, now.as_u64(), body)?;
+        let opened = match open_at(
+            &self.suite,
+            &start,
+            mixed.as_ref(),
+            &cached,
+            now.as_u64(),
+            body,
+        ) {
+            Ok(opened) => opened,
+            Err(EngineError::UnknownTag)
+                if start.epoch != joined.epoch
+                    || start.packet_seq != joined.packet_seq
+                    || start.root != joined.root =>
+            {
+                open_at(&self.suite, &joined, None, &cached, now.as_u64(), body)?
+            }
+            Err(e) => return Err(e),
+        };
         cached.extend(opened.skipped.clone());
         cached.retain(|e| e.expires_at > now);
         if let Some(chains) = state.chains_mut(hit.cid) {
@@ -731,7 +754,14 @@ impl Engine {
                 chains.skipped_mks.insert(actor.clone(), cached);
             }
             if !opened.from_cache {
-                chains.recv.insert(actor.clone(), opened.chain.clone());
+                let ahead = chains.recv.get(&actor).is_none_or(|cur| {
+                    opened.chain.epoch > cur.epoch
+                        || (opened.chain.epoch == cur.epoch
+                            && opened.chain.packet_seq > cur.packet_seq)
+                });
+                if ahead {
+                    chains.recv.insert(actor.clone(), opened.chain.clone());
+                }
             } else {
                 chains.recv.entry(actor.clone()).or_insert(start);
             }

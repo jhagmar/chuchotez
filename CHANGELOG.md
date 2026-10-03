@@ -48,4 +48,7 @@ Handshake catch-up lists incomplete bins from `list_from` (the TimeBin at
 `[W-1, W, W+1]`. Mapper `list` / `listen` MAY omit TimeBin < `W-71`. Packet
 chains, skip-ahead `mk`s, and last Persistent acks live on the conversation
 row. `PersistSeq`, `UnixSeconds`, `TimeBin`, `PacketSeq`, `PacketEpoch`,
-`FragIndex`, and `ActorId` are branded.
+`FragIndex`, and `ActorId` are branded. When 50 durable packets have been
+sent since the last `TxAdvertise`, `TxWrap`, or `TxAck`, the next send mints
+the one still owed. Every 8th durable packet mixes when the FIFO holds 8
+agreed shareds. At most 8 unused advertised secret keys are kept.

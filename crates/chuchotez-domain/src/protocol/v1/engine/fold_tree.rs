@@ -570,7 +570,46 @@ fn chains_json(
         ("recv_chains".into(), Json::Array(recv)),
         ("skipped_mks".into(), Json::Array(skipped)),
         ("last_acks".into(), Json::Array(last_acks)),
+        ("ratchet".into(), ratchet_json(b64u, &chains.ratchet)),
     ]
+}
+
+fn ratchet_json(b64u: &dyn Base64Url, ratchet: &super::state::Ratchet) -> Json {
+    let minted = ratchet
+        .minted
+        .iter()
+        .map(|id| bstr(b64u, id.as_bytes()))
+        .collect();
+    let unused = ratchet
+        .unused
+        .iter()
+        .map(|sk| {
+            Json::Object(vec![
+                ("tx_id".into(), bstr(b64u, sk.tx_id.as_bytes())),
+                ("pk".into(), bstr(b64u, &sk.pk)),
+                ("sk".into(), bstr(b64u, &sk.sk)),
+            ])
+        })
+        .collect();
+    let known = ratchet
+        .known
+        .iter()
+        .map(|row| {
+            Json::Object(vec![
+                ("wrap_tx".into(), bstr(b64u, row.wrap_tx.as_bytes())),
+                ("shared".into(), bstr(b64u, row.shared.as_bytes())),
+                ("ct_hash".into(), bstr(b64u, row.ct_hash.as_bytes())),
+                ("from_us".into(), Json::Bool(row.from_us)),
+                ("encaps_pk".into(), bstr(b64u, &row.encaps_pk)),
+            ])
+        })
+        .collect();
+    Json::Object(vec![
+        ("since".into(), Json::Number(ratchet.since)),
+        ("minted".into(), Json::Array(minted)),
+        ("unused".into(), Json::Array(unused)),
+        ("known".into(), Json::Array(known)),
+    ])
 }
 
 fn parse_identity_conv(
@@ -860,7 +899,65 @@ fn parse_chains(
     } else if optional(m, "last_acks").is_some() {
         return Err(EngineError::MalformedPersist);
     }
+    if let Some(value) = optional(m, "ratchet") {
+        chains.ratchet = parse_ratchet(b64u, value)?;
+    }
     Ok(chains)
+}
+
+fn parse_ratchet(b64u: &dyn Base64Url, value: &Json) -> Result<super::state::Ratchet, EngineError> {
+    let Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let Json::Number(since) = field(m, "since")? else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let Json::Array(minted_v) = field(m, "minted")? else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let mut minted = BTreeSet::new();
+    for id in minted_v {
+        minted.insert(Tag::from_bytes(decode_fold32(b64u, id)?));
+    }
+    let Json::Array(unused_v) = field(m, "unused")? else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let mut unused = Vec::new();
+    for item in unused_v {
+        let Json::Object(row) = item else {
+            return Err(EngineError::MalformedPersist);
+        };
+        unused.push(super::state::UnusedSk {
+            tx_id: Tag::from_bytes(decode_fold32(b64u, field(row, "tx_id")?)?),
+            pk: decode_fold_bstr(b64u, field(row, "pk")?)?,
+            sk: decode_fold_bstr(b64u, field(row, "sk")?)?,
+        });
+    }
+    let Json::Array(known_v) = field(m, "known")? else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let mut known = Vec::new();
+    for item in known_v {
+        let Json::Object(row) = item else {
+            return Err(EngineError::MalformedPersist);
+        };
+        let Json::Bool(from_us) = field(row, "from_us")? else {
+            return Err(EngineError::MalformedPersist);
+        };
+        known.push(super::state::KnownShared {
+            wrap_tx: Tag::from_bytes(decode_fold32(b64u, field(row, "wrap_tx")?)?),
+            shared: Secret::from_bytes(decode_fold32(b64u, field(row, "shared")?)?),
+            ct_hash: Tag::from_bytes(decode_fold32(b64u, field(row, "ct_hash")?)?),
+            from_us: *from_us,
+            encaps_pk: decode_fold_bstr(b64u, field(row, "encaps_pk")?)?,
+        });
+    }
+    Ok(super::state::Ratchet {
+        since: *since,
+        minted,
+        unused,
+        known,
+    })
 }
 
 fn optional_secret(

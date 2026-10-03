@@ -112,6 +112,26 @@ pub(crate) fn eph_mk(hmac: &dyn HmacSha256, chain: &SendChain) -> [u8; 32] {
     )
 }
 
+pub(crate) fn mix(
+    hmac: &dyn HmacSha256,
+    chain: &SendChain,
+    sort: ConversationSort,
+    shared: &[u8; 32],
+) -> Result<SendChain, EngineError> {
+    let mix_label = sort.mix_label().ok_or(EngineError::WrongPhase)?;
+    let c_label = sort.chain_c_label().ok_or(EngineError::WrongPhase)?;
+    let mut info = mix_label.to_vec();
+    info.extend_from_slice(shared);
+    let root = expand(hmac, &HmacSha256Key::from_bytes(chain.root), &info).into_bytes();
+    let c = expand(hmac, &HmacSha256Key::from_bytes(root), c_label).into_bytes();
+    Ok(SendChain {
+        root,
+        c,
+        epoch: chain.epoch.saturating_add(1),
+        packet_seq: PacketSeq::from_u64(0),
+    })
+}
+
 pub(crate) fn step(hmac: &dyn HmacSha256, chain: &SendChain) -> SendChain {
     let c = labeled_expand(
         hmac,
@@ -262,6 +282,29 @@ pub(crate) fn open_skip_ahead(
     Err(EngineError::UnknownTag)
 }
 
+pub(crate) fn open_at(
+    suite: &Suite,
+    start: &SendChain,
+    mixed: Option<&SendChain>,
+    cached: &[CachedMk],
+    now: u64,
+    body: &[u8],
+) -> Result<Opened, EngineError> {
+    if let Some(mixed) = mixed {
+        let key = mk(suite.hmac(), mixed);
+        if let Ok(packet) = open_plain(suite, &key, body) {
+            return Ok(Opened {
+                packet,
+                chain: step(suite.hmac(), mixed),
+                skipped: Vec::new(),
+                from_cache: false,
+                mk: key,
+            });
+        }
+    }
+    open_skip_ahead(suite, start, cached, now, body)
+}
+
 fn largest_frag<F>(suite: &Suite, mut build: F) -> usize
 where
     F: FnMut(Vec<u8>) -> PacketPlain,
@@ -284,6 +327,68 @@ where
     lo
 }
 
+pub(crate) fn next_fragment(
+    suite: &Suite,
+    remaining: &[u8],
+    tx_id: Tag,
+    set_xor: Tag,
+    packet_seq: u64,
+    frag_i: u64,
+    actor_id: &[u8],
+) -> Result<(PacketPlain, usize), EngineError> {
+    if frag_i >= MAX_FRAGS {
+        return Err(EngineError::BodyTooLarge);
+    }
+    let max_last = largest_frag(suite, |frag| {
+        PacketPlain::TxFragLast(PacketTxFragLast {
+            actor_id: actor_id.to_vec(),
+            packet_seq,
+            tx_id,
+            frag_i,
+            frag,
+            set_xor,
+        })
+    });
+    if remaining.len() <= max_last {
+        let n = remaining.len();
+        return Ok((
+            PacketPlain::TxFragLast(PacketTxFragLast {
+                actor_id: actor_id.to_vec(),
+                packet_seq,
+                tx_id,
+                frag_i,
+                frag: remaining.to_vec(),
+                set_xor,
+            }),
+            n,
+        ));
+    }
+    let max_more = largest_frag(suite, |frag| {
+        PacketPlain::TxFragMore(PacketTxFragMore {
+            actor_id: actor_id.to_vec(),
+            packet_seq,
+            tx_id,
+            frag_i,
+            frag,
+        })
+    });
+    if max_more == 0 {
+        return Err(EngineError::BodyTooLarge);
+    }
+    let take = remaining.len().min(max_more);
+    Ok((
+        PacketPlain::TxFragMore(PacketTxFragMore {
+            actor_id: actor_id.to_vec(),
+            packet_seq,
+            tx_id,
+            frag_i,
+            frag: remaining[..take].to_vec(),
+        }),
+        take,
+    ))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fragment_body(
     suite: &Suite,
     packed_body: &[u8],
@@ -295,53 +400,17 @@ pub(crate) fn fragment_body(
     let mut remaining = packed_body;
     let mut packets = Vec::new();
     loop {
-        if u64::try_from(packets.len()).unwrap_or(u64::MAX) >= MAX_FRAGS {
-            return Err(EngineError::BodyTooLarge);
-        }
-        let frag_i = u64::try_from(packets.len()).unwrap_or(0);
-        let packet_seq = start_seq.saturating_add(frag_i);
-        let max_last = largest_frag(suite, |frag| {
-            PacketPlain::TxFragLast(PacketTxFragLast {
-                actor_id: actor_id.to_vec(),
-                packet_seq,
-                tx_id,
-                frag_i,
-                frag,
-                set_xor,
-            })
-        });
-        if remaining.len() <= max_last {
-            packets.push(PacketPlain::TxFragLast(PacketTxFragLast {
-                actor_id: actor_id.to_vec(),
-                packet_seq,
-                tx_id,
-                frag_i,
-                frag: remaining.to_vec(),
-                set_xor,
-            }));
+        let frag_i = u64::try_from(packets.len()).unwrap_or(u64::MAX);
+        let packet_seq = start_seq.saturating_add(u64::try_from(packets.len()).unwrap_or(0));
+        let (packet, n) = next_fragment(
+            suite, remaining, tx_id, set_xor, packet_seq, frag_i, actor_id,
+        )?;
+        let finished = matches!(packet, PacketPlain::TxFragLast(_));
+        remaining = &remaining[n..];
+        packets.push(packet);
+        if finished {
             return Ok(packets);
         }
-        let max_more = largest_frag(suite, |frag| {
-            PacketPlain::TxFragMore(PacketTxFragMore {
-                actor_id: actor_id.to_vec(),
-                packet_seq,
-                tx_id,
-                frag_i,
-                frag,
-            })
-        });
-        if max_more == 0 {
-            return Err(EngineError::BodyTooLarge);
-        }
-        let take = remaining.len().min(max_more);
-        packets.push(PacketPlain::TxFragMore(PacketTxFragMore {
-            actor_id: actor_id.to_vec(),
-            packet_seq,
-            tx_id,
-            frag_i,
-            frag: remaining[..take].to_vec(),
-        }));
-        remaining = &remaining[take..];
     }
 }
 
@@ -442,12 +511,12 @@ mod tests {
     use super::{
         CachedMk, ConversationSort, EPH_MK_LABEL, LATER_EPOCHS, MAX_FRAGS, MK_CACHE_SECS, MK_LABEL,
         PACKET_LEN, PACKET_NONCE_LEN, PACKET_PAD_LEN, SKIP_AHEAD, STEP_LABEL, chain_from_json,
-        chain_to_json, eph_mk, fragment_body, join, mk, open_skip_ahead, seal_packet, set_xor_for,
-        step,
+        chain_to_json, eph_mk, fragment_body, join, mix, mk, next_fragment, open_at,
+        open_skip_ahead, seal_packet, set_xor_for, step,
     };
     use crate::protocol::v1::fixtures::{CounterRng, test_suite};
     use crate::protocol::v1::payload::{
-        DurableBody, Hlc, PacketPlain, PacketTxFragLast, TxPayload,
+        DurableBody, Hlc, PacketPlain, PacketTxFragLast, PacketXorAck, TxPayload,
     };
     use crate::protocol::v1::{ActorId, PacketEpoch, PacketSeq, UnixSeconds};
     use crate::protocol::v1::{ConversationId, EngineError, Json, Tag};
@@ -700,5 +769,27 @@ mod tests {
         assert!(chain_from_json(s.b64u(), &bad_seq).is_err());
         let huge_actor = fragment_body(&s, b"hi", tx_id, xor, 0, &[0u8; 400]);
         assert!(huge_actor.is_err());
+        let rng = CounterRng::new();
+        assert!(next_fragment(&s, b"hi", tx_id, xor, 0, MAX_FRAGS, &[]).is_err());
+        let empty = fragment_body(&s, b"", tx_id, xor, 0, &[]).expect("empty");
+        assert!(matches!(empty[0], PacketPlain::TxFragLast(_)));
+        let mixed = mix(s.hmac(), &chain, ConversationSort::HandshakeDm, &[2; 32]).expect("mix");
+        assert_eq!(mixed.epoch, PacketEpoch::from_u64(1));
+        assert_eq!(mixed.packet_seq, PacketSeq::from_u64(0));
+        assert_ne!(mixed.root, chain.root);
+        assert!(mix(s.hmac(), &chain, ConversationSort::Engine, &[2; 32]).is_err());
+        let plain = PacketPlain::XorAck(PacketXorAck {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            set_xor: Tag::from_bytes([3; 32]),
+        });
+        let mixed_body = seal_packet(&s, &rng, &mk(s.hmac(), &mixed), &plain).expect("seal");
+        let opened = open_at(&s, &chain, Some(&mixed), &[], 10, &mixed_body).expect("mixed");
+        assert_eq!(opened.chain.epoch, PacketEpoch::from_u64(1));
+        assert_eq!(opened.chain.packet_seq, PacketSeq::from_u64(1));
+        let plain_body = seal_packet(&s, &rng, &mk(s.hmac(), &chain), &plain).expect("seal0");
+        let opened0 = open_at(&s, &chain, Some(&mixed), &[], 10, &plain_body).expect("plain");
+        assert_eq!(opened0.chain.packet_seq, PacketSeq::from_u64(1));
+        assert_eq!(opened0.chain.epoch, PacketEpoch::from_u64(0));
     }
 }
