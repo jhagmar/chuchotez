@@ -1,6 +1,6 @@
 //! Delete, confirm, group, and send.
 
-use super::super::payload::{TxEdit, TxMedia, TxPayload, TxReaction, TxText};
+use super::super::payload::{TxEdit, TxMedia, TxPayload, TxReaction};
 use super::super::{
     Address, ConversationId, DisplayName, DurableChannel, EngineError, IdentityId, Kind, Tag,
     UserId,
@@ -188,7 +188,11 @@ impl Engine {
         name: &str,
     ) -> Result<MutateOk, EngineError> {
         let name = DisplayName::try_from(name).map_err(|_| EngineError::MalformedDisplayName)?;
-        self.mint_on(state, _rng, &ids, TxPayload::Name { name })
+        self.gate_chat(&state, &ids)?;
+        let payload = TxPayload::Name { name };
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Set the group photo (owner).
@@ -205,7 +209,11 @@ impl Engine {
                 super::super::ProfilePic::try_from(b).map_err(|_| EngineError::MalformedPayload)?,
             ),
         };
-        self.mint_on(state, _rng, &ids, TxPayload::Photo { profile_pic })
+        self.gate_chat(&state, &ids)?;
+        let payload = TxPayload::Photo { profile_pic };
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Send a text message.
@@ -217,19 +225,12 @@ impl Engine {
         body: &str,
         reply_to: Option<Tag>,
     ) -> Result<MutateOk, EngineError> {
-        if body.is_empty() || body.len() > 4096 {
-            return Err(EngineError::MalformedPayload);
-        }
-        self.mint_on(
-            state,
-            _rng,
-            &ids,
-            TxPayload::Text(TxText {
-                body: body.into(),
-                reply_to,
-                expire_at: None,
-            }),
-        )
+        self.chat_text(body)?;
+        self.gate_chat(&state, &ids)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let payload = self.text_payload(&state, ids.conversation_id, body.into(), reply_to);
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Send media pointers.
@@ -289,18 +290,15 @@ impl Engine {
         target: Tag,
         body: &str,
     ) -> Result<MutateOk, EngineError> {
-        if body.is_empty() || body.len() > 4096 {
-            return Err(EngineError::MalformedPayload);
-        }
-        self.mint_on(
-            state,
-            _rng,
-            &ids,
-            TxPayload::Edit(TxEdit {
-                target,
-                body: body.into(),
-            }),
-        )
+        self.chat_text(body)?;
+        self.gate_chat(&state, &ids)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let payload = TxPayload::Edit(TxEdit {
+            target,
+            body: body.into(),
+        });
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Remove a message.
@@ -311,7 +309,11 @@ impl Engine {
         ids: ConversationRef,
         target: Tag,
     ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, _rng, &ids, TxPayload::Remove { target })
+        self.gate_chat(&state, &ids)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let payload = TxPayload::Remove { target };
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Add or remove a reaction.
@@ -324,19 +326,16 @@ impl Engine {
         emoji: &str,
         add: bool,
     ) -> Result<MutateOk, EngineError> {
-        if emoji.is_empty() || emoji.len() > 16 {
-            return Err(EngineError::MalformedPayload);
-        }
-        self.mint_on(
-            state,
-            _rng,
-            &ids,
-            TxPayload::Reaction(TxReaction {
-                target,
-                emoji: emoji.into(),
-                add,
-            }),
-        )
+        self.chat_emoji(emoji)?;
+        self.gate_chat(&state, &ids)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let payload = TxPayload::Reaction(TxReaction {
+            target,
+            emoji: emoji.into(),
+            add,
+        });
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Send a typing packet.
@@ -347,9 +346,13 @@ impl Engine {
         ids: ConversationRef,
         composing: bool,
     ) -> Result<MutateOk, EngineError> {
-        self.require_ids(&state, &ids)?;
-        let _ = composing;
-        state.eph_writes.clear();
+        if !state.is_sync(ids.conversation_id) {
+            self.require_ids(&state, &ids)?;
+        }
+        self.require_signal(&state, ids.conversation_id)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        #[rustfmt::skip]
+        self.post_signal(&mut state, _rng, ids.conversation_id, &secret, Some(composing))?;
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -365,7 +368,11 @@ impl Engine {
         ids: ConversationRef,
         up_to: Tag,
     ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, _rng, &ids, TxPayload::Read { up_to })
+        self.gate_chat(&state, &ids)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let payload = TxPayload::Read { up_to };
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Send a delivered marker.
@@ -376,7 +383,11 @@ impl Engine {
         ids: ConversationRef,
         up_to: Tag,
     ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, _rng, &ids, TxPayload::Delivered { up_to })
+        self.gate_chat(&state, &ids)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let payload = TxPayload::Delivered { up_to };
+        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
     }
 
     /// Send a presence packet.
@@ -386,12 +397,31 @@ impl Engine {
         _rng: &dyn Rng,
         ids: ConversationRef,
     ) -> Result<MutateOk, EngineError> {
-        self.require_ids(&state, &ids)?;
+        if !state.is_sync(ids.conversation_id) {
+            self.require_ids(&state, &ids)?;
+        }
+        self.require_signal(&state, ids.conversation_id)?;
+        let secret = self.conv_secret(&state, &ids.conversation_id)?;
+        let mut state = state;
+        self.post_signal(&mut state, _rng, ids.conversation_id, &secret, None)?;
         Ok(MutateOk {
             state,
             persist: Vec::new(),
             pings: Vec::new(),
         })
+    }
+
+    fn finish_chat(
+        &self,
+        mut ok: MutateOk,
+        cid: ConversationId,
+        secret: &super::super::Secret,
+        payload: &TxPayload,
+    ) -> Result<MutateOk, EngineError> {
+        let tx_id = self.tx_id(secret, payload);
+        self.remember_sender(&mut ok.state, cid, tx_id);
+        ok.pings.extend(self.fill_ping(&ok.state, cid));
+        Ok(ok)
     }
 
     /// Query a conversation.

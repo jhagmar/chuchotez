@@ -1,5 +1,6 @@
 //! Host-owned handle bound to a v1 [`Suite`] and [`Defaults`].
 
+mod chat;
 mod fold_tree;
 mod handshake;
 mod heal;
@@ -21,9 +22,10 @@ mod tests;
 
 pub use query::{
     BlobGet, BlobPut, BlockedIdentity, BlockedMissing, Conversation, ConversationListRow,
-    ConversationRef, DirectMessageQuery, DurableLocator, DurableWrite, EphemeralLocator,
-    EphemeralWrite, FailedReason, FoldOk, GroupQuery, Handshake, HandshakeInvitee,
-    HandshakeInviter, MediaDraft, MutateOk, PingTarget, Poll, SynchronizationQuery, WrapDekOk,
+    ConversationRef, DirectMessageQuery, DmEstablished, DurableLocator, DurableWrite,
+    EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupQuery, Handshake,
+    HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk, PingTarget, Poll,
+    PresenceView, SynchronizationQuery, TypingView, WrapDekOk,
 };
 pub use state::EngineState;
 

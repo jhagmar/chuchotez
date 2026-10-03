@@ -288,6 +288,7 @@ impl Engine {
         ids: ConversationRef,
         prefs: super::super::ConversationPrefs,
     ) -> Result<MutateOk, EngineError> {
+        self.gate_chat(&state, &ids)?;
         self.mint_on(
             state,
             _rng,

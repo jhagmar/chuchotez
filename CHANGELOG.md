@@ -58,4 +58,7 @@ Persistent. Established DM and Sync sends with a nonempty ephemerals list
 enqueue on Ephemeral first. A matching ephemeral `PacketXorAck` omits
 Persistent; `tick` after 3 seconds enqueues it. `TxAdvertise`, `TxWrap`, and
 `TxAck` stay Persistent. Empty ephemerals and Group sends are Persistent
-only.
+only. `sendText` and the other DM chat mutators require an established DM.
+`sendTyping` and `sendPresence` are also legal on established Sync. Query
+`messages` is the newest 1000 chat items. Typing clears after 6 ticked
+seconds. A durable DM tx pings the peer Wake when set.
