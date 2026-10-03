@@ -266,18 +266,30 @@ fn tick_user_identity_invite() {
             .unwrap_err(),
         EngineError::WrongPhase
     );
-    engine
-        .accept_group(acked.state.clone(), &rng, ids)
-        .expect("ag");
-    engine
-        .reject_group(acked.state.clone(), &rng, ids)
-        .expect("rg");
-    engine
-        .kick_group_member(acked.state.clone(), &rng, ids, &[1])
-        .expect("kg");
-    engine
-        .leave_group(acked.state.clone(), &rng, ids)
-        .expect("lg");
+    assert_eq!(
+        engine
+            .accept_group(acked.state.clone(), &rng, ids)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .reject_group(acked.state.clone(), &rng, ids)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .kick_group_member(acked.state.clone(), &rng, ids, &[1])
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .leave_group(acked.state.clone(), &rng, ids)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
     assert_eq!(
         engine
             .create_group(acked.state.clone(), &rng, uid, iid, &[], "G", None)
@@ -2046,8 +2058,28 @@ fn query_adt_debug() {
         DirectMessageQuery::Established(super::DmEstablished::default())
     );
     let _ = format!("{:?}", DirectMessageQuery::Failed(FailedReason::Left));
-    let _ = format!("{:?}", GroupQuery::GroupOffer);
-    let _ = format!("{:?}", GroupQuery::GroupEstablished);
+    let _ = format!(
+        "{:?}",
+        GroupQuery::GroupOffer(super::GroupOfferView {
+            name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
+            photo: None,
+            owner_signing_pk: vec![],
+            from_conversation_id: crate::protocol::v1::ConversationId::from_bytes([1; 32]),
+        })
+    );
+    let _ = format!(
+        "{:?}",
+        GroupQuery::GroupEstablished(super::GroupEstablishedView {
+            name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
+            photo: None,
+            owner_signing_pk: vec![],
+            members: vec![],
+            pending: vec![],
+            persistents: vec![],
+            ephemerals: vec![],
+            messages: vec![],
+        })
+    );
     let _ = format!("{:?}", GroupQuery::GroupFailed(FailedReason::Kicked));
     let hs = Handshake::Invitee(HandshakeInvitee::TicketReceived);
     let _ = format!("{:?}", SynchronizationQuery::Handshake(hs));
@@ -2071,7 +2103,15 @@ fn query_adt_debug() {
             super::DmEstablished::default()
         ))
     );
-    let _ = format!("{:?}", Conversation::Group(GroupQuery::GroupOffer));
+    let _ = format!(
+        "{:?}",
+        Conversation::Group(GroupQuery::GroupOffer(super::GroupOfferView {
+            name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
+            photo: None,
+            owner_signing_pk: vec![],
+            from_conversation_id: crate::protocol::v1::ConversationId::from_bytes([1; 32]),
+        }))
+    );
     let _ = format!(
         "{:?}",
         Conversation::Synchronization(SynchronizationQuery::SyncEstablished)
@@ -7472,7 +7512,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
 fn live_path_waits_then_falls_back() {
     use super::super::chain::{eph_mk, join, mk, seal_packet};
     use super::super::payload::{ConversationSort, PacketPlain, PacketXorAck};
-    use super::{Conversation, ConversationRef, DirectMessageQuery};
+    use super::{Conversation, ConversationRef, DirectMessageQuery, GroupQuery};
     use crate::protocol::v1::fixtures::sample_durable;
     use crate::protocol::v1::{
         Address, Defaults, EphemeralChannel, Kind, NotificationPrivacy, Tag,
@@ -7922,14 +7962,18 @@ fn live_path_waits_then_falls_back() {
         .send_delivered(ada, &rng, ada_ids, target)
         .expect("dv")
         .state;
-    ada = engine
-        .set_group_name(ada, &rng, ada_ids, "Ada")
-        .expect("name")
-        .state;
-    ada = engine
-        .set_group_photo(ada, &rng, ada_ids, None)
-        .expect("photo")
-        .state;
+    assert_eq!(
+        engine
+            .set_group_name(ada.clone(), &rng, ada_ids, "Ada")
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .set_group_photo(ada.clone(), &rng, ada_ids, None)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
     let mark = ada.eph_writes.len();
     ada = engine
         .send_typing(ada, &rng, ada_ids, false)
@@ -8077,6 +8121,520 @@ fn live_path_waits_then_falls_back() {
         .expect("ack");
     let after = engine.poll(&acked.state).expect("poll2");
     assert!(after.blob_get.iter().any(|get| get.tag == put.tag));
+    let eph_mark = acked.state.eph_writes.len();
+    let (grouped, gid) = engine
+        .create_group(acked.state, &rng, uid, iid, &[child], "Team", None)
+        .expect("group");
+    assert!(matches!(
+        engine
+            .get_conversation(&grouped.state, uid, iid, gid)
+            .expect("gq"),
+        Conversation::Group(GroupQuery::GroupEstablished(_))
+    ));
+    assert_eq!(
+        engine
+            .add_group_member(
+                grouped.state.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: uid,
+                    identity_id: iid,
+                    conversation_id: gid,
+                },
+                child
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    let pending_pk = super::group::live_mut(&mut grouped.state.clone(), gid)
+        .expect("live")
+        .pending[0]
+        .signing_pk
+        .clone();
+    assert_eq!(
+        engine
+            .kick_group_member(
+                grouped.state.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: uid,
+                    identity_id: iid,
+                    conversation_id: gid,
+                },
+                &pending_pk,
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    let mut again = grouped.state.clone();
+    again.ensure_identity(uid, crate::protocol::v1::IdentityId::from_bytes([7; 32]));
+    for user in again.users.values_mut() {
+        for ident in user.identities.values_mut() {
+            if let Some(node) = ident.conversations.get_mut(&gid)
+                && let super::party::IdentityConversation::Group(super::party::GroupPhase::Live(
+                    live,
+                )) = &mut node.kind
+            {
+                live.pending.clear();
+            }
+        }
+    }
+    engine
+        .add_group_member(
+            again,
+            &rng,
+            ConversationRef {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: gid,
+            },
+            child,
+        )
+        .expect("add-member");
+    let mut bob = bob_ping.state;
+    for write in grouped.state.eph_writes[eph_mark..].iter().cloned() {
+        bob = engine
+            .ingest_ephemeral_packet(bob, &rng, write.channel, write.tag, &write.body)
+            .expect("invite-eph")
+            .state;
+    }
+    assert!(matches!(
+        engine
+            .get_conversation(&bob, ie_uid, ie_iid, gid)
+            .expect("offer"),
+        Conversation::Group(GroupQuery::GroupOffer(_))
+    ));
+    let offer_state = bob.clone();
+    let _dropped = engine
+        .kick_group_member(
+            bob.clone(),
+            &rng,
+            ConversationRef {
+                user_id: ie_uid,
+                identity_id: ie_iid,
+                conversation_id: gid,
+            },
+            &[1],
+        )
+        .expect("drop-offer");
+    let rejected = engine
+        .reject_group(
+            bob.clone(),
+            &rng,
+            ConversationRef {
+                user_id: ie_uid,
+                identity_id: ie_iid,
+                conversation_id: gid,
+            },
+        )
+        .expect("rej");
+    assert!(matches!(
+        engine
+            .get_conversation(&rejected.state, ie_uid, ie_iid, gid)
+            .expect("rej-q"),
+        Conversation::Group(GroupQuery::GroupFailed(_))
+    ));
+    let eph_before_accept = bob.eph_writes.len();
+    let accepted = engine
+        .accept_group(
+            bob,
+            &rng,
+            ConversationRef {
+                user_id: ie_uid,
+                identity_id: ie_iid,
+                conversation_id: gid,
+            },
+        )
+        .expect("acc");
+    let mut owner = grouped.state.clone();
+    for write in accepted.state.eph_writes[eph_before_accept..]
+        .iter()
+        .cloned()
+    {
+        owner = engine
+            .ingest_ephemeral_packet(owner, &rng, write.channel, write.tag, &write.body)
+            .expect("acc-eph")
+            .state;
+    }
+    assert!(
+        owner
+            .txs
+            .values()
+            .any(|tx| matches!(tx.payload, TxPayload::GroupRoster(_))),
+        "roster posted"
+    );
+    assert_eq!(
+        engine
+            .add_group_member(
+                owner.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: uid,
+                    identity_id: iid,
+                    conversation_id: gid,
+                },
+                child,
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .add_group_member(
+                accepted.state.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: ie_uid,
+                    identity_id: ie_iid,
+                    conversation_id: gid,
+                },
+                child,
+            )
+            .unwrap_err(),
+        EngineError::NotOwner
+    );
+    let mut owner_live = owner.clone();
+    let owner_pk = super::group::live_mut(&mut owner_live, gid)
+        .expect("live")
+        .owner_signing_pk
+        .clone();
+    let peer_pk = super::group::live_mut(&mut owner_live, gid)
+        .expect("live")
+        .members
+        .iter()
+        .find(|member| member.signing_pk != owner_pk)
+        .map(|member| member.signing_pk.clone())
+        .expect("peer");
+    engine
+        .kick_group_member(
+            owner.clone(),
+            &rng,
+            ConversationRef {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: gid,
+            },
+            &peer_pk,
+        )
+        .expect("kick-member");
+    let roster = owner
+        .txs
+        .values()
+        .find(|tx| matches!(tx.payload, TxPayload::GroupRoster(_)))
+        .expect("roster-tx")
+        .payload
+        .clone();
+    let mut member = accepted.state.clone();
+    engine
+        .on_group_payload(&mut member, &rng, gid, &roster)
+        .expect("apply-roster");
+    assert!(matches!(
+        engine.get_conversation(&member, ie_uid, ie_iid, gid).expect("mem"),
+        Conversation::Group(GroupQuery::GroupEstablished(ref view)) if !view.members.is_empty()
+    ));
+    assert!(super::group::roster_body(&TxPayload::GroupLeave).is_none());
+    let mut body = super::group::roster_body(&roster).expect("roster");
+    body.members.clear();
+    engine
+        .on_group_payload(&mut member, &rng, gid, &TxPayload::GroupRoster(body))
+        .expect("kick-roster");
+    assert!(matches!(
+        engine
+            .get_conversation(&member, ie_uid, ie_iid, gid)
+            .expect("kicked"),
+        Conversation::Group(GroupQuery::GroupFailed(_))
+    ));
+    let group_ids = ConversationRef {
+        user_id: uid,
+        identity_id: iid,
+        conversation_id: gid,
+    };
+    let named = engine
+        .set_group_name(grouped.state.clone(), &rng, group_ids, "Team2")
+        .expect("rename");
+    assert!(matches!(
+        engine.get_conversation(&named.state, uid, iid, gid).expect("named"),
+        Conversation::Group(GroupQuery::GroupEstablished(ref view)) if view.name.as_str() == "Team2"
+    ));
+    let left = engine
+        .delete_conversation(named.state, group_ids)
+        .expect("del");
+    assert!(matches!(
+        engine
+            .get_conversation(&left.state, uid, iid, gid)
+            .expect("left"),
+        Conversation::Group(GroupQuery::GroupFailed(_))
+    ));
+    engine
+        .set_group_photo(grouped.state.clone(), &rng, group_ids, None)
+        .expect("photo");
+    engine
+        .leave_group(grouped.state.clone(), &rng, group_ids)
+        .expect("leave");
+    assert_eq!(
+        engine
+            .set_group_name(
+                accepted.state.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: ie_uid,
+                    identity_id: ie_iid,
+                    conversation_id: gid,
+                },
+                "no",
+            )
+            .unwrap_err(),
+        EngineError::NotOwner
+    );
+    assert_eq!(
+        engine
+            .create_group(
+                grouped.state.clone(),
+                &rng,
+                uid,
+                iid,
+                &[child, child],
+                "Z",
+                None,
+            )
+            .unwrap_err(),
+        EngineError::DuplicateMember
+    );
+    assert_eq!(
+        engine
+            .create_group(
+                grouped.state.clone(),
+                &rng,
+                uid,
+                iid,
+                &[child],
+                "Z",
+                Some(&[1, 2, 3]),
+            )
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    let mut slim = grouped.state.clone();
+    slim.persist_log.clear();
+    let folded = engine.fold(slim).expect("fold-g");
+    engine.apply_folded(&folded.snapshot).expect("apply-g");
+    let mut offer = offer_state.clone();
+    offer.persist_log.clear();
+    let folded_offer = engine.fold(offer).expect("fold-o");
+    engine
+        .apply_folded(&folded_offer.snapshot)
+        .expect("apply-o");
+    let mut failed = rejected.state.clone();
+    failed.persist_log.clear();
+    let folded_failed = engine.fold(failed).expect("fold-f");
+    engine
+        .apply_folded(&folded_failed.snapshot)
+        .expect("apply-f");
+    let invite = grouped
+        .state
+        .txs
+        .values()
+        .find_map(|tx| match &tx.payload {
+            TxPayload::GroupInvite(inv) => Some(inv.clone()),
+            _ => None,
+        })
+        .expect("invite");
+    let mut foreign = owner.clone();
+    engine
+        .on_group_payload(
+            &mut foreign,
+            &rng,
+            gid,
+            &TxPayload::GroupInvite(invite.clone()),
+        )
+        .expect("not-local");
+    let mut dup_offer = offer_state.clone();
+    engine
+        .on_group_payload(
+            &mut dup_offer,
+            &rng,
+            gid,
+            &TxPayload::GroupInvite(invite.clone()),
+        )
+        .expect("dup-offer");
+    let mut opened = offer_state.clone();
+    opened.drop_conversation(gid);
+    let mut short = invite;
+    short.group_secret_ct.clear();
+    assert_eq!(
+        engine
+            .on_group_payload(&mut opened, &rng, gid, &TxPayload::GroupInvite(short))
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    engine
+        .on_group_payload(
+            &mut owner.clone(),
+            &rng,
+            gid,
+            &TxPayload::GroupAccept {
+                group_id: crate::protocol::v1::ConversationId::from_bytes([9; 32]),
+            },
+        )
+        .expect("no-accept-group");
+    engine
+        .on_group_payload(
+            &mut owner.clone(),
+            &rng,
+            gid,
+            &TxPayload::GroupAccept { group_id: gid },
+        )
+        .expect("empty-pending");
+    engine
+        .on_group_payload(
+            &mut owner.clone(),
+            &rng,
+            crate::protocol::v1::ConversationId::from_bytes([8; 32]),
+            &roster,
+        )
+        .expect("no-owner");
+    let mut still_offer = offer_state.clone();
+    engine
+        .on_group_payload(&mut still_offer, &rng, gid, &roster)
+        .expect("offer-roster");
+    let mut failed_phase = left.state.clone();
+    engine
+        .on_group_payload(&mut failed_phase, &rng, gid, &roster)
+        .expect("failed-roster");
+    engine
+        .post_roster(
+            &mut grouped.state.clone(),
+            &rng,
+            ConversationRef {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: crate::protocol::v1::ConversationId::from_bytes([4; 32]),
+            },
+        )
+        .expect("no-live-roster");
+    assert!(super::group::live_mut(&mut offer_state.clone(), gid).is_none());
+    assert!(super::group::group_phase_mut(&mut grouped.state.clone(), child).is_none());
+    assert!(
+        super::group::group_phase_mut(
+            &mut grouped.state.clone(),
+            crate::protocol::v1::ConversationId::from_bytes([5; 32])
+        )
+        .is_none()
+    );
+    assert!(super::group::dm_peer(&grouped.state, child, &[0]).is_none());
+    assert_eq!(
+        engine
+            .add_group_member(
+                grouped.state.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: uid,
+                    identity_id: iid,
+                    conversation_id: child,
+                },
+                child,
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    let mut capped = grouped.state.clone();
+    let pad_name = crate::protocol::v1::DisplayName::try_from("P").expect("pad");
+    let live = super::group::live_mut(&mut capped, gid).expect("live");
+    while live.members.len() + live.pending.len() < 32 {
+        live.pending.push(super::party::GroupPending {
+            signing_pk: vec![live.pending.len() as u8],
+            encryption_pk: vec![1],
+            from_conversation_id: child,
+            name: pad_name.clone(),
+            photo: None,
+        });
+    }
+    assert_eq!(
+        engine
+            .add_group_member(capped, &rng, group_ids, child)
+            .unwrap_err(),
+        EngineError::MemberCap
+    );
+    let prefs_none = crate::protocol::v1::ConversationPrefs {
+        read_receipts: true,
+        online_visible: false,
+        send_typing: true,
+        disappear_after: None,
+        notification_privacy: crate::protocol::v1::NotificationPrivacy::Name,
+        wake: None,
+    };
+    engine
+        .set_conversation_prefs(grouped.state.clone(), &rng, group_ids, prefs_none)
+        .expect("disp-none");
+    let prefs_some = crate::protocol::v1::ConversationPrefs {
+        read_receipts: true,
+        online_visible: false,
+        send_typing: true,
+        disappear_after: Some(1),
+        notification_privacy: crate::protocol::v1::NotificationPrivacy::Name,
+        wake: None,
+    };
+    engine
+        .set_conversation_prefs(grouped.state.clone(), &rng, group_ids, prefs_some.clone())
+        .expect("disp-owner");
+    engine
+        .set_conversation_prefs(
+            grouped.state.clone(),
+            &rng,
+            ConversationRef {
+                user_id: uid,
+                identity_id: iid,
+                conversation_id: child,
+            },
+            prefs_some.clone(),
+        )
+        .expect("disp-dm");
+    let group_wake = crate::protocol::v1::Wake::try_new(
+        "https://push.example/g",
+        &[3u8; 65],
+        &[4u8; 16],
+        Some(vec![9, 9, 9]),
+    )
+    .expect("gw");
+    let mut prefs_wake = prefs_some.clone();
+    prefs_wake.disappear_after = None;
+    prefs_wake.wake = Some(group_wake);
+    let woke = engine
+        .set_conversation_prefs(grouped.state.clone(), &rng, group_ids, prefs_wake)
+        .expect("gwake");
+    assert_eq!(woke.pings().len(), 1);
+    assert_eq!(woke.pings()[0].endpoint, "https://push.example/g");
+    assert_eq!(
+        engine
+            .set_conversation_prefs(
+                accepted.state.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: ie_uid,
+                    identity_id: ie_iid,
+                    conversation_id: gid,
+                },
+                prefs_some,
+            )
+            .unwrap_err(),
+        EngineError::NotOwner
+    );
+    assert_eq!(
+        engine
+            .kick_group_member(
+                accepted.state.clone(),
+                &rng,
+                ConversationRef {
+                    user_id: ie_uid,
+                    identity_id: ie_iid,
+                    conversation_id: gid,
+                },
+                &[1],
+            )
+            .unwrap_err(),
+        EngineError::NotOwner
+    );
+    let _ = owner;
 }
 
 #[test]

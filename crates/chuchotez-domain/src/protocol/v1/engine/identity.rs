@@ -289,17 +289,19 @@ impl Engine {
         prefs: super::super::ConversationPrefs,
     ) -> Result<MutateOk, EngineError> {
         self.gate_chat(&state, &ids)?;
-        self.mint_on(
-            state,
-            _rng,
-            &ids,
-            TxPayload::Prefs(OnWirePrefs {
-                read_receipts: prefs.read_receipts,
-                online_visible: prefs.online_visible,
-                send_typing: prefs.send_typing,
-                disappear_after: prefs.disappear_after,
-                wake: prefs.wake,
-            }),
-        )
+        self.group_disappear_blocked(&state, &ids, prefs.disappear_after)?;
+        let payload = TxPayload::Prefs(OnWirePrefs {
+            read_receipts: prefs.read_receipts,
+            online_visible: prefs.online_visible,
+            send_typing: prefs.send_typing,
+            disappear_after: prefs.disappear_after,
+            wake: prefs.wake,
+        });
+        let mut ok = self.mint_on(state, _rng, &ids, payload.clone())?;
+        if super::group::group_live(&ok.state, ids.conversation_id).is_some() {
+            let secret = self.conv_secret(&ok.state, &ids.conversation_id)?;
+            ok = self.finish_chat(ok, ids.conversation_id, &secret, &payload)?;
+        }
+        Ok(ok)
     }
 }

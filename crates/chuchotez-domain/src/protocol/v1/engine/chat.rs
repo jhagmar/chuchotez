@@ -99,14 +99,14 @@ impl Engine {
             .insert(tx_id, actor);
     }
 
-    pub(super) fn fill_ping(&self, state: &EngineState, cid: ConversationId) -> Option<PingTarget> {
-        let wake = peer_wake(self, state, cid)?;
-        Some(PingTarget {
-            endpoint: wake.endpoint().to_owned(),
-            p256dh: *wake.p256dh(),
-            auth: *wake.auth(),
-            vapid_pk: wake.vapid_pk().map(|bytes| bytes.to_vec()),
-        })
+    pub(super) fn fill_ping(&self, state: &EngineState, cid: ConversationId) -> Vec<PingTarget> {
+        if super::group::group_live(state, cid).is_some() {
+            return group_member_pings(state, cid);
+        }
+        peer_wake(self, state, cid)
+            .map(ping_target)
+            .into_iter()
+            .collect()
     }
 
     pub(super) fn note_typing(
@@ -179,6 +179,81 @@ impl Engine {
     pub(super) fn shows_online(&self, state: &EngineState, cid: ConversationId) -> bool {
         latest_online(state, cid).unwrap_or_else(|| self.defaults.online_visible())
     }
+}
+
+fn ping_target(wake: Wake) -> PingTarget {
+    PingTarget {
+        endpoint: wake.endpoint().to_owned(),
+        p256dh: *wake.p256dh(),
+        auth: *wake.auth(),
+        vapid_pk: wake.vapid_pk().map(|bytes| bytes.to_vec()),
+    }
+}
+
+struct PrefsSeen {
+    id: Tag,
+    sender: Vec<u8>,
+    wall: u64,
+    counter: u64,
+    wake: Option<Wake>,
+}
+
+struct LatestWake {
+    sender: Vec<u8>,
+    key: (u64, u64, [u8; 32]),
+    wake: Option<Wake>,
+}
+
+fn group_member_pings(state: &EngineState, cid: ConversationId) -> Vec<PingTarget> {
+    let members: Vec<Vec<u8>> = super::group::group_live(state, cid)
+        .expect("group")
+        .members
+        .iter()
+        .map(|member| member.signing_pk.clone())
+        .collect();
+    let senders = state.chains(cid).expect("row").chat_senders.clone();
+    let mut rows = Vec::new();
+    for (id, tx) in &state.txs {
+        if tx.conversation_id != cid {
+            continue;
+        }
+        let TxPayload::Prefs(prefs) = &tx.payload else {
+            continue;
+        };
+        let Some(sender) = senders.get(id) else {
+            continue;
+        };
+        rows.push(PrefsSeen {
+            id: *id,
+            sender: sender.clone(),
+            wall: tx.hlc.wall_ms,
+            counter: tx.hlc.counter,
+            wake: prefs.wake.clone(),
+        });
+    }
+    rows.sort_by_key(|row| *row.id.as_bytes());
+    let mut best: Vec<LatestWake> = Vec::new();
+    for row in rows {
+        if !members.iter().any(|member| member == &row.sender) {
+            continue;
+        }
+        let key = (row.wall, row.counter, *row.id.as_bytes());
+        if let Some(kept) = best.iter_mut().find(|kept| kept.sender == row.sender) {
+            if key > kept.key {
+                kept.key = key;
+                kept.wake = row.wake;
+            }
+        } else {
+            best.push(LatestWake {
+                sender: row.sender,
+                key,
+                wake: row.wake,
+            });
+        }
+    }
+    best.into_iter()
+        .filter_map(|kept| kept.wake.map(ping_target))
+        .collect()
 }
 
 fn latest_disappear(state: &EngineState, cid: ConversationId) -> Option<Option<u64>> {
@@ -411,5 +486,116 @@ mod tests {
         let state = EngineState::new();
         let cid = super::super::super::ConversationId::from_bytes([1; 32]);
         assert!(engine.shows_online(&state, cid));
+    }
+
+    #[test]
+    fn group_pings_keep_each_members_latest_wake() {
+        use super::super::super::payload::{DurableBody, GroupMember, Hlc};
+        use super::super::party::{GroupLive, GroupPhase, IdentityConversation};
+        use super::super::state::{EngineState, IdentityNode};
+        use super::group_member_pings;
+        use crate::protocol::v1::{
+            ConversationId, DisplayName, IdentityId, OnWirePrefs, Secret, Tag, TagKey, UserId, Wake,
+        };
+        let cid = ConversationId::from_bytes([7; 32]);
+        let owner = vec![1u8];
+        let other = vec![2u8];
+        let member = |pk: Vec<u8>, n: u8| GroupMember {
+            signing_pk: pk,
+            encryption_pk: vec![1],
+            send_tag_key: TagKey::from_bytes([n; 32]),
+            eph_send_tag_key: TagKey::from_bytes([n.wrapping_add(1); 32]),
+        };
+        let mut state = EngineState::new();
+        state.put_dm(
+            UserId::from_bytes([3; 32]),
+            IdentityId::from_bytes([4; 32]),
+            cid,
+            IdentityNode {
+                kind: IdentityConversation::Group(GroupPhase::Live(GroupLive {
+                    secret: Secret::from_bytes([5; 32]),
+                    name: DisplayName::try_from("G").expect("n"),
+                    photo: None,
+                    owner_signing_pk: owner.clone(),
+                    persistents: Vec::new(),
+                    ephemerals: Vec::new(),
+                    members: vec![member(owner.clone(), 6), member(other.clone(), 8)],
+                    pending: Vec::new(),
+                    epoch: 0,
+                })),
+                chains: Default::default(),
+            },
+        );
+        let wake = |endpoint: &str| {
+            Wake::try_new(endpoint, &[3u8; 65], &[4u8; 16], Some(vec![9, 9, 9])).expect("w")
+        };
+        let prefs = |wall, wake| DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: wall,
+                counter: 0,
+            },
+            payload: TxPayload::Prefs(OnWirePrefs {
+                read_receipts: true,
+                online_visible: false,
+                send_typing: true,
+                disappear_after: None,
+                wake,
+            }),
+        };
+        let id = |byte: u8| Tag::from_bytes([byte; 32]);
+        state
+            .txs
+            .insert(id(0), prefs(10, Some(wake("https://push.example/a"))));
+        state
+            .txs
+            .insert(id(1), prefs(30, Some(wake("https://push.example/b"))));
+        state
+            .txs
+            .insert(id(2), prefs(20, Some(wake("https://push.example/c"))));
+        state
+            .txs
+            .insert(id(3), prefs(40, Some(wake("https://push.example/d"))));
+        state
+            .txs
+            .insert(id(4), prefs(50, Some(wake("https://push.example/e"))));
+        state.txs.insert(id(8), prefs(1, None));
+        state.txs.insert(
+            id(6),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 1,
+                    counter: 0,
+                },
+                payload: TxPayload::Confirm,
+            },
+        );
+        state.txs.insert(
+            id(5),
+            DurableBody {
+                conversation_id: ConversationId::from_bytes([9; 32]),
+                hlc: Hlc {
+                    wall_ms: 1,
+                    counter: 0,
+                },
+                payload: TxPayload::Prefs(OnWirePrefs {
+                    read_receipts: true,
+                    online_visible: false,
+                    send_typing: true,
+                    disappear_after: None,
+                    wake: None,
+                }),
+            },
+        );
+        let chains = state.chains_mut(cid).expect("chains");
+        chains.chat_senders.insert(id(0), owner.clone());
+        chains.chat_senders.insert(id(1), owner.clone());
+        chains.chat_senders.insert(id(2), owner);
+        chains.chat_senders.insert(id(3), vec![9]);
+        chains.chat_senders.insert(id(8), other);
+        let pings = group_member_pings(&state, cid);
+        assert_eq!(pings.len(), 1);
+        assert_eq!(pings[0].endpoint, "https://push.example/b");
     }
 }

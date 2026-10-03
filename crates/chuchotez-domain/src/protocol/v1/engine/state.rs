@@ -430,7 +430,8 @@ impl EngineState {
                     .get_mut(&cid)
                     .and_then(|node| match &mut node.kind {
                         IdentityConversation::DmHandshake(party) => Some(party),
-                        IdentityConversation::DirectMessage { .. } => None,
+                        IdentityConversation::DirectMessage { .. }
+                        | IdentityConversation::Group(_) => None,
                     })
             })
         }) {
@@ -558,10 +559,14 @@ impl EngineState {
     pub(super) fn established_secret(&self, cid: ConversationId) -> Option<Secret> {
         for user in self.users.values() {
             for ident in user.identities.values() {
-                if let Some(IdentityConversation::DirectMessage { secret, .. }) =
-                    ident.conversations.get(&cid).map(|n| &n.kind)
-                {
-                    return Some(*secret);
+                match ident.conversations.get(&cid).map(|n| &n.kind) {
+                    Some(IdentityConversation::DirectMessage { secret, .. }) => {
+                        return Some(*secret);
+                    }
+                    Some(IdentityConversation::Group(super::party::GroupPhase::Live(live))) => {
+                        return Some(live.secret);
+                    }
+                    _ => {}
                 }
             }
         }

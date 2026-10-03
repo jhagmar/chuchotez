@@ -2,7 +2,8 @@
 
 use super::super::payload::{Hlc, TxPayload};
 use super::super::{
-    Address, ConversationId, IdentityId, Kind, PersistSeq, Policy, Tag, UnixSeconds, UserId,
+    Address, ConversationId, DisplayName, IdentityId, Kind, PersistSeq, Policy, Tag, UnixSeconds,
+    UserId,
 };
 use super::super::{DurableChannel, EphemeralChannel};
 use super::state::EngineState;
@@ -373,14 +374,74 @@ pub enum DirectMessageQuery {
 }
 
 /// Group query.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupQuery {
     /// Incoming group offer on a DM.
-    GroupOffer,
+    GroupOffer(GroupOfferView),
     /// Owner or accepted member roster.
-    GroupEstablished,
+    GroupEstablished(GroupEstablishedView),
     /// Failed group.
     GroupFailed(FailedReason),
+}
+
+/// Incoming group offer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupOfferView {
+    /// Group name.
+    pub name: DisplayName,
+    /// Group photo.
+    pub photo: Option<super::super::ProfilePic>,
+    /// Owner signing public key.
+    pub owner_signing_pk: Vec<u8>,
+    /// DM the offer arrived on.
+    pub from_conversation_id: ConversationId,
+}
+
+/// Accepted member shown in the group query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupMemberView {
+    /// Signing public key.
+    pub signing_pk: Vec<u8>,
+    /// Encryption public key.
+    pub encryption_pk: Vec<u8>,
+    /// Display name carried with the member.
+    pub name: DisplayName,
+    /// Photo carried with the member.
+    pub photo: Option<super::super::ProfilePic>,
+}
+
+/// Invite that is not yet accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupPendingView {
+    /// Invitee signing public key.
+    pub signing_pk: Vec<u8>,
+    /// DM the invite was posted on.
+    pub from_conversation_id: ConversationId,
+    /// Name on the invite.
+    pub name: DisplayName,
+    /// Photo on the invite.
+    pub photo: Option<super::super::ProfilePic>,
+}
+
+/// Established group query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupEstablishedView {
+    /// Group name.
+    pub name: DisplayName,
+    /// Group photo.
+    pub photo: Option<super::super::ProfilePic>,
+    /// Owner signing public key.
+    pub owner_signing_pk: Vec<u8>,
+    /// Accepted members.
+    pub members: Vec<GroupMemberView>,
+    /// Outstanding invites.
+    pub pending: Vec<GroupPendingView>,
+    /// Persistent channels.
+    pub persistents: Vec<super::super::DurableChannel>,
+    /// Ephemeral channels.
+    pub ephemerals: Vec<super::super::EphemeralChannel>,
+    /// Chat history.
+    pub messages: Vec<HistoryItem>,
 }
 
 /// Synchronization query.

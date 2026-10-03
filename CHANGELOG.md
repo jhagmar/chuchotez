@@ -62,4 +62,8 @@ only. `sendText` and the other DM chat mutators require an established DM.
 `sendTyping` and `sendPresence` are also legal on established Sync. Query
 `messages` is the newest 1000 chat items. Typing clears after 6 ticked
 seconds. A durable DM tx pings the peer Wake when set. `sendMedia` seals each
-attachment under `media_key` and `open_media` checks `hash`.
+attachment under `media_key` and `open_media` checks `hash`. `create_group`
+takes 1..=31 established DMs. `accept_group` posts `TxGroupAccept`, and the
+owner posts `TxGroupRoster` and `TxGroupWrap`. A roster that omits the local
+signing key stores `Kicked`. Leave and delete store `Left`. A durable group
+tx pings every member whose latest `TxPrefs.wake` is set.
