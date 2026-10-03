@@ -661,6 +661,10 @@ impl Engine {
             state.next_seq = state.next_seq.saturating_add(1);
             state.txs.insert(part.tx_id, durable.clone());
             self.on_group_payload(state, rng, cid, &durable.payload)?;
+            if let TxPayload::EngineKickDevice { device_id } = &durable.payload {
+                #[rustfmt::skip]
+                self.note_device_kick(state, *device_id)?;
+            }
             state
                 .chains_mut(cid)
                 .expect("row")

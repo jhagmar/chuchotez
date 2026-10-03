@@ -60,7 +60,7 @@ pub(super) fn device_json(b64u: &dyn Base64Url, device: &Device) -> Json {
     for (cid, node) in &device.conversations {
         conversations.push(device_conv_json(b64u, *cid, node));
     }
-    Json::Object(vec![
+    let mut members = vec![
         (
             "name".into(),
             device
@@ -78,7 +78,11 @@ pub(super) fn device_json(b64u: &dyn Base64Url, device: &Device) -> Json {
                 .unwrap_or(Json::Null),
         ),
         ("conversations".into(), Json::Array(conversations)),
-    ])
+    ];
+    if let Some(ct) = &device.dek_ct {
+        members.push(("dek_ct".into(), bstr(b64u, ct)));
+    }
+    Json::Object(members)
 }
 
 pub(super) fn install_users(
@@ -147,6 +151,13 @@ pub(super) fn install_device(
     state.device.keys = match field(m, "keys")? {
         Json::Null => None,
         other => Some(parse_keys(b64u, other)?),
+    };
+    state.device.dek_ct = match m.iter().find(|(key, _)| key == "dek_ct") {
+        Some((_, Json::String(s))) => {
+            Some(b64u.decode(s).map_err(|_| EngineError::MalformedPersist)?)
+        }
+        Some(_) => return Err(EngineError::MalformedPersist),
+        None => None,
     };
     let Json::Array(conversations) = field(m, "conversations")? else {
         return Err(EngineError::MalformedPersist);

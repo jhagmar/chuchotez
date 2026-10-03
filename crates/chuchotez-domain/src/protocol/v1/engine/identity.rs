@@ -1,10 +1,13 @@
 //! Users, identities, names, and this device.
 
-use super::super::payload::TxPayload;
+use super::super::hmac::{HmacSha256Key, expand};
+use super::super::payload::{PACKET_NONCE_LEN, TxPayload};
 use super::super::{
-    Defaults, DeviceId, DisplayName, EngineError, IdentityId, KemSeed, OnWirePrefs, Policy,
-    SignSeed, UserId,
+    AeadKey, AeadNonce, Defaults, DeviceId, DisplayName, EngineError, IdentityId, KemSeed,
+    OnWirePrefs, Policy, Secret, SignSeed, UserId,
 };
+use super::helpers::{invitee_intro_for, notice_for};
+use super::party::DeviceConversation;
 use super::query::*;
 use super::{Engine, EngineState};
 use crate::protocol::Rng;
@@ -30,7 +33,7 @@ impl Engine {
             .then_some(TxPayload::EngineInit),
         );
         payloads.push(TxPayload::EngineSetDefaults { defaults });
-        self.mutate(state, &secret, payloads)
+        self.mutate(state, None, &secret, payloads)
     }
 
     /// Mint a user.
@@ -50,7 +53,7 @@ impl Engine {
             payloads.push(TxPayload::EngineInit);
         }
         payloads.push(TxPayload::EngineCreateUser { user_id });
-        let mut ok = self.mutate(state, &secret, payloads)?;
+        let mut ok = self.mutate(state, Some(rng), &secret, payloads)?;
         ok.state.ensure_user(user_id);
         Ok((ok, user_id))
     }
@@ -82,6 +85,7 @@ impl Engine {
             .map_err(|_| EngineError::MalformedPayload)?;
         let mut ok = self.mutate(
             state,
+            Some(rng),
             &secret,
             vec![TxPayload::EngineCreateIdentity {
                 user_id,
@@ -104,6 +108,7 @@ impl Engine {
         let secret = self.engine_secret()?;
         self.mutate(
             state,
+            None,
             &secret,
             vec![TxPayload::EngineDeleteUser { user_id }],
         )
@@ -123,6 +128,7 @@ impl Engine {
         let secret = self.engine_secret()?;
         self.mutate(
             state,
+            None,
             &secret,
             vec![TxPayload::EngineDeleteIdentity {
                 user_id,
@@ -150,6 +156,7 @@ impl Engine {
         let secret = self.engine_secret()?;
         let mut ok = self.mutate(
             state,
+            Some(rng),
             &secret,
             vec![TxPayload::EngineSetDisplayName {
                 user_id,
@@ -173,6 +180,7 @@ impl Engine {
         let secret = self.engine_secret()?;
         let mut ok = self.mutate(
             state,
+            None,
             &secret,
             vec![TxPayload::EngineUnsetDisplayName {
                 user_id,
@@ -197,6 +205,7 @@ impl Engine {
         let secret = self.engine_secret()?;
         let ok = self.mutate(
             state.clone(),
+            Some(rng),
             &secret,
             vec![TxPayload::EngineSetDeviceName { name: name.clone() }],
         );
@@ -230,11 +239,11 @@ impl Engine {
             return Err(EngineError::WrongPhase);
         }
         let secret = self.engine_secret()?;
-        self.mutate(
-            state,
-            &secret,
-            vec![TxPayload::EngineKickDevice { device_id }],
-        )
+        #[rustfmt::skip]
+        let mut ok = self.mutate(state, Some(_rng), &secret, vec![TxPayload::EngineKickDevice { device_id }])?;
+        #[rustfmt::skip]
+        self.note_device_kick(&mut ok.state, device_id)?;
+        Ok(ok)
     }
 
     /// Unlink this device from Sync.
@@ -244,6 +253,7 @@ impl Engine {
         _rng: &dyn Rng,
     ) -> Result<MutateOk, EngineError> {
         state.device.conversations.clear();
+        state.device.dek_ct = None;
         Ok(MutateOk {
             state,
             persist: Vec::new(),
@@ -269,6 +279,7 @@ impl Engine {
         let secret = self.engine_secret()?;
         let mut ok = self.mutate(
             state,
+            Some(_rng),
             &secret,
             vec![TxPayload::EngineSetProfilePic {
                 user_id,
@@ -278,6 +289,108 @@ impl Engine {
         )?;
         ok.state.ensure_identity(user_id, identity_id).pic = pic;
         Ok(ok)
+    }
+
+    pub(super) fn fan_engine_to_sync(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        payloads: &[TxPayload],
+    ) -> Result<(), EngineError> {
+        let engine_secret = self.engine_secret()?;
+        let syncs: Vec<_> = state
+            .device
+            .conversations
+            .iter()
+            .filter_map(|(cid, node)| {
+                matches!(node.kind, DeviceConversation::Synchronization { .. }).then_some(*cid)
+            })
+            .collect();
+        if syncs.is_empty() {
+            return Ok(());
+        }
+        for payload in payloads {
+            let tx_id = self.tx_id(&engine_secret, payload);
+            for cid in &syncs {
+                let secret = state.established_secret(*cid).expect("sync");
+                #[rustfmt::skip]
+                self.post_live(state, rng, *cid, &secret, tx_id, payload)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn note_device_kick(
+        &self,
+        state: &mut EngineState,
+        device_id: DeviceId,
+    ) -> Result<(), EngineError> {
+        if state.device.kicked.contains(&device_id) {
+            return Ok(());
+        }
+        state.device.kicked.push(device_id);
+        let cids: Vec<_> = state.device.conversations.keys().copied().collect();
+        for cid in cids {
+            let node = state.device.conversations.get_mut(&cid).expect("row");
+            let DeviceConversation::Synchronization { secret, .. } = &mut node.kind else {
+                continue;
+            };
+            let mut info = b"chuchotez/1/sync-rekey".to_vec();
+            info.extend_from_slice(device_id.as_bytes());
+            let next = expand(
+                self.suite.hmac(),
+                &HmacSha256Key::from_bytes(*secret.as_bytes()),
+                &info,
+            )
+            .into_bytes();
+            *secret = Secret::from_bytes(next);
+            node.chains.send.clear();
+            node.chains.recv.clear();
+            node.chains.skipped_mks.clear();
+            node.chains.live_pending.clear();
+        }
+        Ok(())
+    }
+
+    pub(super) fn wrap_sync_dek(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        handshake: super::super::ConversationId,
+    ) -> Result<(), EngineError> {
+        let policy = notice_for(state, handshake)
+            .ok_or(EngineError::WrongPhase)?
+            .policy;
+        let pk = invitee_intro_for(state, handshake)
+            .ok_or(EngineError::WrongPhase)?
+            .encryption_pk
+            .clone();
+        let dek = self.require_dek()?.as_bytes().to_vec();
+        state.device.dek_ct = Some(seal_sync_dek(self, rng, policy, &pk, &dek)?);
+        Ok(())
+    }
+
+    /// Open a sync DEK wrap with this device encryption key and hold that DEK.
+    pub fn open_sync_dek(&mut self, state: &EngineState, ct: &[u8]) -> Result<(), EngineError> {
+        let policy = state
+            .txs
+            .values()
+            .find_map(|tx| match &tx.payload {
+                TxPayload::Notice(notice) => Some(notice.policy),
+                _ => None,
+            })
+            .ok_or(EngineError::WrongPhase)?;
+        let sk = state
+            .device
+            .keys
+            .as_ref()
+            .ok_or(EngineError::WrongPhase)?
+            .enc
+            .secret_bytes()
+            .to_vec();
+        let dek = open_sync_dek(self, policy, &sk, ct)?;
+        self.dek = Some(AeadKey::from_bytes(dek));
+        Ok(())
     }
 
     /// Set conversation prefs.
@@ -304,4 +417,79 @@ impl Engine {
         }
         Ok(ok)
     }
+}
+
+const SYNC_DEK_INFO: &[u8] = b"chuchotez/1/sync-dek";
+
+fn seal_sync_dek(
+    engine: &Engine,
+    rng: &dyn Rng,
+    policy: Policy,
+    pk: &[u8],
+    dek: &[u8],
+) -> Result<Vec<u8>, EngineError> {
+    let seed = KemSeed::from_pair(rng.random32(), rng.random32());
+    #[rustfmt::skip]
+    let (shared, ct) = engine.suite.kem().wrap(policy, pk, &seed).map_err(|_| EngineError::MalformedPayload)?;
+    let key = expand(
+        engine.suite.hmac(),
+        &HmacSha256Key::from_bytes(shared32(&shared)),
+        SYNC_DEK_INFO,
+    )
+    .into_bytes();
+    let rnd = rng.random32();
+    let mut nonce = [0u8; PACKET_NONCE_LEN];
+    nonce.copy_from_slice(&rnd.as_bytes()[..PACKET_NONCE_LEN]);
+    let sealed = engine.suite.aead().seal(
+        &AeadKey::from_bytes(key),
+        &AeadNonce::from_bytes(nonce),
+        b"",
+        dek,
+    );
+    let mut out = ct;
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&sealed);
+    Ok(out)
+}
+
+fn open_sync_dek(
+    engine: &Engine,
+    policy: Policy,
+    sk: &[u8],
+    packed: &[u8],
+) -> Result<[u8; 32], EngineError> {
+    let ct_len = super::super::kem::kem_ct_len(policy);
+    if packed.len() <= ct_len + PACKET_NONCE_LEN {
+        return Err(EngineError::MalformedPayload);
+    }
+    let (ct, rest) = packed.split_at(ct_len);
+    #[rustfmt::skip]
+    let shared = engine.suite.kem().unwrap(policy, sk, ct).map_err(|_| EngineError::MalformedPayload)?;
+    let key = expand(
+        engine.suite.hmac(),
+        &HmacSha256Key::from_bytes(shared32(&shared)),
+        SYNC_DEK_INFO,
+    )
+    .into_bytes();
+    let (nonce_bytes, aead_ct) = rest.split_at(PACKET_NONCE_LEN);
+    let mut nonce = [0u8; PACKET_NONCE_LEN];
+    nonce.copy_from_slice(nonce_bytes);
+    let plain = engine
+        .suite
+        .aead()
+        .open(
+            &AeadKey::from_bytes(key),
+            &AeadNonce::from_bytes(nonce),
+            b"",
+            aead_ct,
+        )
+        .map_err(|_| EngineError::MalformedPayload)?;
+    plain.try_into().map_err(|_| EngineError::MalformedPayload)
+}
+
+fn shared32(shared: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = shared.len().min(32);
+    out[..n].copy_from_slice(&shared[..n]);
+    out
 }

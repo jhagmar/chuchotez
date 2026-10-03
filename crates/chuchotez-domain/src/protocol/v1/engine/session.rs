@@ -60,10 +60,14 @@ impl Engine {
         self.require_confirming(&state, &ids)?;
         if state.is_sync(ids.conversation_id) {
             let secret = self.conv_secret(&state, &ids.conversation_id)?;
+            let inviter = state.is_inviter(ids.conversation_id);
             #[rustfmt::skip]
             let mut ok = self.mutate_on(state, &secret, ids.conversation_id, vec![TxPayload::Confirm])?;
             #[rustfmt::skip]
             self.spawn_child(&mut ok.state, ids.conversation_id)?;
+            if inviter {
+                self.wrap_sync_dek(&mut ok.state, _rng, ids.conversation_id)?;
+            }
             return Ok(ok);
         }
         let mut ok = self.mint_on(state, _rng, &ids, TxPayload::Confirm)?;
