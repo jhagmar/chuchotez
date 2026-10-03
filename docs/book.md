@@ -112,6 +112,20 @@ otherwise `PacketPresence`. The conversation stays live for 30 ticked seconds
 after an ephemeral packet from the other party. On this pairwise Sync, that
 party is the other device.
 
+`sendText`, `editMessage`, `removeMessage`, `sendReaction`, `sendRead`,
+`sendDelivered`, `setConversationPrefs`, and conversation `TxName` /
+`TxPhoto` require an established DM (`WrongPhase` on a handshake).
+`sendTyping` and `sendPresence` are also legal on established Sync. Body
+and caption are NFC, with UTF-8 length 1..=16384 and at most 4096
+characters. `expire_at` is ticked now plus the conversation’s
+`disappear_after`, or nil when that duration is nil. Query `messages` on
+the established DM is the newest 1000 chat transactions after
+`(hlc, tx_id)` sort. Handshake, ratchet, name, photo, prefs, group, and
+engine payloads are omitted, as are txs with `expire_at` ≤ ticked now.
+Typing clears 6 ticked seconds after the signal. Reload has empty typing
+and presence. A durable DM send pings the peer `Wake` when that
+subscription is set.
+
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.
 `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes. `KemSeed` /

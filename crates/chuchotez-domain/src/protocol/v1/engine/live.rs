@@ -7,7 +7,7 @@ use super::super::codec::durable_body_from_json;
 use super::super::hmac::{HmacSha256, HmacSha256Key, expand};
 use super::super::payload::{
     ConversationSort, PACKET_MAX_UNCOMPRESSED, PacketPlain, PacketPresence, PacketPresenceActive,
-    TxPayload, time_bin,
+    PacketTyping, PacketTypingActive, TxPayload, time_bin,
 };
 use super::super::{
     ActorId, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex, Secret, Tag,
@@ -295,6 +295,53 @@ impl Engine {
         Ok(())
     }
 
+    /// Post a typing or presence packet on every ephemeral channel.
+    /// `composing` `None` is presence.
+    pub(super) fn post_signal(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        cid: ConversationId,
+        secret: &Secret,
+        composing: Option<bool>,
+    ) -> Result<(), EngineError> {
+        let route = self.live_route(state, cid).expect("route");
+        let now = state.ticked.expect("ticked");
+        let chain = self.sending_chain(state, cid, secret, &route)?;
+        let actor = route.actor.as_bytes().to_vec();
+        let seq = chain.packet_seq.as_u64();
+        let packet = match (composing, self.shows_online(state, cid)) {
+            (Some(composing), true) => PacketPlain::TypingActive(PacketTypingActive {
+                actor_id: actor,
+                packet_seq: seq,
+                conversation_id: cid,
+                last_active: now.as_u64(),
+                composing,
+            }),
+            (Some(composing), false) => PacketPlain::Typing(PacketTyping {
+                actor_id: actor,
+                packet_seq: seq,
+                conversation_id: cid,
+                composing,
+            }),
+            (None, true) => PacketPlain::PresenceActive(PacketPresenceActive {
+                actor_id: actor,
+                packet_seq: seq,
+                conversation_id: cid,
+                last_active: now.as_u64(),
+            }),
+            (None, false) => PacketPlain::Presence(PacketPresence {
+                actor_id: actor,
+                packet_seq: seq,
+                conversation_id: cid,
+            }),
+        };
+        #[rustfmt::skip]
+        let sealed = seal_packet(&self.suite, rng, &eph_mk(self.suite.hmac(), &chain), &packet)?;
+        self.push_eph(state, &route, now, sealed);
+        Ok(())
+    }
+
     fn sending_chain(
         &self,
         state: &EngineState,
@@ -500,7 +547,7 @@ impl Engine {
                 .unwrap_or(joined);
             if !persistent {
                 let mut cursor = start.clone();
-                for _ in 0..16 {
+                for _ in 0..64 {
                     let key = eph_mk(self.suite.hmac(), &cursor);
                     if let Ok(packet) = open_plain(&self.suite, &key, body) {
                         let persist = self.on_established(state, rng, cid, now, &packet, false)?;
@@ -537,6 +584,7 @@ impl Engine {
             self.note_set_xor(state, rng, cid, ack.set_xor)?;
             return Ok(Vec::new());
         }
+        self.note_packet_signal(state, cid, now, packet);
         self.accept_fragment(state, rng, cid, packet, persistent)
     }
 
@@ -612,6 +660,11 @@ impl Engine {
             state.persist_log.insert(seq, part.tx_id);
             state.next_seq = state.next_seq.saturating_add(1);
             state.txs.insert(part.tx_id, durable);
+            state
+                .chains_mut(cid)
+                .expect("row")
+                .chat_senders
+                .insert(part.tx_id, packet_actor(packet));
             if persistent && let PacketPlain::TxFragLast(last) = packet {
                 store_durable_last_ack(state, cid, &last.actor_id, last.set_xor);
                 self.note_set_xor(state, rng, cid, last.set_xor)?;
@@ -622,7 +675,15 @@ impl Engine {
     }
 }
 
-fn local_material(
+fn packet_actor(packet: &PacketPlain) -> Vec<u8> {
+    match packet {
+        PacketPlain::TxFragMore(packet) => packet.actor_id.clone(),
+        PacketPlain::TxFragLast(packet) => packet.actor_id.clone(),
+        _ => Vec::new(),
+    }
+}
+
+pub(super) fn local_material(
     engine: &Engine,
     state: &EngineState,
     cid: ConversationId,
@@ -722,5 +783,28 @@ mod tests {
             let _ = sort.persist_label();
             let _ = sort.eph_label();
         }
+        let more = PacketPlain::TxFragMore(super::super::super::payload::PacketTxFragMore {
+            actor_id: vec![1],
+            packet_seq: 0,
+            tx_id: Tag::from_bytes([1; 32]),
+            frag_i: 0,
+            frag: vec![2],
+        });
+        assert_eq!(super::packet_actor(&more), vec![1]);
+        let last = PacketPlain::TxFragLast(super::super::super::payload::PacketTxFragLast {
+            actor_id: vec![3],
+            packet_seq: 1,
+            tx_id: Tag::from_bytes([1; 32]),
+            frag_i: 1,
+            frag: vec![4],
+            set_xor: Tag::from_bytes([2; 32]),
+        });
+        assert_eq!(super::packet_actor(&last), vec![3]);
+        let ack = PacketPlain::XorAck(super::super::super::payload::PacketXorAck {
+            actor_id: vec![5],
+            packet_seq: 0,
+            set_xor: Tag::from_bytes([2; 32]),
+        });
+        assert!(super::packet_actor(&ack).is_empty());
     }
 }

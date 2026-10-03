@@ -151,88 +151,121 @@ fn tick_user_identity_invite() {
             .unwrap_err(),
         EngineError::WrongPhase
     );
-    engine
-        .send_text(acked.state.clone(), &rng, ids, "hi", None)
-        .expect("txt");
+    assert_eq!(
+        engine
+            .send_text(acked.state.clone(), &rng, ids, "hi", None)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
     assert_eq!(
         engine
             .send_text(acked.state.clone(), &rng, ids, "", None)
             .unwrap_err(),
         EngineError::MalformedPayload
     );
-    engine
-        .edit_message(
-            acked.state.clone(),
-            &rng,
-            ids,
-            crate::protocol::v1::Tag::from_bytes([1; 32]),
-            "x",
-        )
-        .expect("ed");
-    engine
-        .remove_message(
-            acked.state.clone(),
-            &rng,
-            ids,
-            crate::protocol::v1::Tag::from_bytes([1; 32]),
-        )
-        .expect("rm");
-    engine
-        .send_reaction(
-            acked.state.clone(),
-            &rng,
-            ids,
-            crate::protocol::v1::Tag::from_bytes([1; 32]),
-            "👍",
-            true,
-        )
-        .expect("rx");
-    engine
-        .send_read(
-            acked.state.clone(),
-            &rng,
-            ids,
-            crate::protocol::v1::Tag::from_bytes([1; 32]),
-        )
-        .expect("rd");
-    engine
-        .send_delivered(
-            acked.state.clone(),
-            &rng,
-            ids,
-            crate::protocol::v1::Tag::from_bytes([1; 32]),
-        )
-        .expect("dv");
-    engine
-        .send_typing(acked.state.clone(), &rng, ids, true)
-        .expect("ty");
-    engine
-        .send_presence(acked.state.clone(), &rng, ids)
-        .expect("pr");
-    engine
-        .set_conversation_prefs(
-            acked.state.clone(),
-            &rng,
-            ids,
-            crate::protocol::v1::ConversationPrefs {
-                read_receipts: true,
-                online_visible: true,
-                send_typing: true,
-                disappear_after: None,
-                notification_privacy: crate::protocol::v1::NotificationPrivacy::Name,
-                wake: None,
-            },
-        )
-        .expect("prefs");
+    assert_eq!(
+        engine
+            .edit_message(
+                acked.state.clone(),
+                &rng,
+                ids,
+                crate::protocol::v1::Tag::from_bytes([1; 32]),
+                "x",
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .remove_message(
+                acked.state.clone(),
+                &rng,
+                ids,
+                crate::protocol::v1::Tag::from_bytes([1; 32]),
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .send_reaction(
+                acked.state.clone(),
+                &rng,
+                ids,
+                crate::protocol::v1::Tag::from_bytes([1; 32]),
+                "👍",
+                true,
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .send_read(
+                acked.state.clone(),
+                &rng,
+                ids,
+                crate::protocol::v1::Tag::from_bytes([1; 32]),
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .send_delivered(
+                acked.state.clone(),
+                &rng,
+                ids,
+                crate::protocol::v1::Tag::from_bytes([1; 32]),
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .send_typing(acked.state.clone(), &rng, ids, true)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .send_presence(acked.state.clone(), &rng, ids)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .set_conversation_prefs(
+                acked.state.clone(),
+                &rng,
+                ids,
+                crate::protocol::v1::ConversationPrefs {
+                    read_receipts: true,
+                    online_visible: true,
+                    send_typing: true,
+                    disappear_after: None,
+                    notification_privacy: crate::protocol::v1::NotificationPrivacy::Name,
+                    wake: None,
+                },
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
     engine
         .set_profile_pic(acked.state.clone(), &rng, uid, iid, None)
         .expect("pic");
-    engine
-        .set_group_name(acked.state.clone(), &rng, ids, "G")
-        .expect("gn");
-    engine
-        .set_group_photo(acked.state.clone(), &rng, ids, None)
-        .expect("gp");
+    assert_eq!(
+        engine
+            .set_group_name(acked.state.clone(), &rng, ids, "G")
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .set_group_photo(acked.state.clone(), &rng, ids, None)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
     engine
         .accept_group(acked.state.clone(), &rng, ids)
         .expect("ag");
@@ -685,12 +718,18 @@ fn library_edges() {
             .unwrap_err(),
         EngineError::WrongPhase
     );
-    let once = engine
-        .send_text(invited.state.clone(), &rng, ids, "hi", None)
-        .expect("txt1");
-    engine
-        .send_text(once.state, &rng, ids, "hi", None)
-        .expect("txt2");
+    assert_eq!(
+        engine
+            .send_text(invited.state.clone(), &rng, ids, "hi", None)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        engine
+            .send_text(invited.state.clone(), &rng, ids, "hi", None)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
     let missing = ConversationRef {
         user_id: uid,
         identity_id: iid,
@@ -700,7 +739,7 @@ fn library_edges() {
         engine
             .send_text(invited.state.clone(), &rng, missing, "hi", None)
             .unwrap_err(),
-        EngineError::UnknownIds
+        EngineError::WrongPhase
     );
     assert_eq!(
         engine
@@ -1974,7 +2013,10 @@ fn query_adt_debug() {
     );
     let _ = format!("{:?}", Handshake::Invitee(HandshakeInvitee::TicketReceived));
     let _ = format!("{:?}", Handshake::Failed(FailedReason::Left));
-    let _ = format!("{:?}", DirectMessageQuery::Established);
+    let _ = format!(
+        "{:?}",
+        DirectMessageQuery::Established(super::DmEstablished::default())
+    );
     let _ = format!("{:?}", DirectMessageQuery::Failed(FailedReason::Left));
     let _ = format!("{:?}", GroupQuery::GroupOffer);
     let _ = format!("{:?}", GroupQuery::GroupEstablished);
@@ -1997,7 +2039,9 @@ fn query_adt_debug() {
     );
     let _ = format!(
         "{:?}",
-        Conversation::DirectMessage(DirectMessageQuery::Established)
+        Conversation::DirectMessage(DirectMessageQuery::Established(
+            super::DmEstablished::default()
+        ))
     );
     let _ = format!("{:?}", Conversation::Group(GroupQuery::GroupOffer));
     let _ = format!(
@@ -3251,7 +3295,9 @@ fn handshake_intros_confirming_and_failures() {
     let child_ie = rows_ie
         .iter()
         .find_map(|r| match r.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established) => Some(r.conversation_id),
+            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
+                Some(r.conversation_id)
+            }
             _ => None,
         })
         .expect("iechild");
@@ -3297,7 +3343,9 @@ fn handshake_intros_confirming_and_failures() {
     let child = rows
         .iter()
         .find_map(|r| match r.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established) => Some(r.conversation_id),
+            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
+                Some(r.conversation_id)
+            }
             _ => None,
         })
         .expect("child");
@@ -3306,7 +3354,7 @@ fn handshake_intros_confirming_and_failures() {
         engine
             .get_conversation(&confirmed.state, uid, iid, child)
             .expect("chq"),
-        Conversation::DirectMessage(DirectMessageQuery::Established)
+        Conversation::DirectMessage(DirectMessageQuery::Established(_))
     ));
     assert!(confirmed.state.party(child).is_none());
     let mut spawned = confirmed.state.clone();
@@ -3335,7 +3383,7 @@ fn handshake_intros_confirming_and_failures() {
         engine
             .get_conversation(&restored_c, uid, iid, child)
             .expect("chf"),
-        Conversation::DirectMessage(DirectMessageQuery::Established)
+        Conversation::DirectMessage(DirectMessageQuery::Established(_))
     ));
     let mut no_map = confirmed.state.clone();
     no_map.cover_last_acks();
@@ -7522,7 +7570,7 @@ fn live_path_waits_then_falls_back() {
         .expect("list")
         .into_iter()
         .find_map(|row| match row.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established) => {
+            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
                 Some(row.conversation_id)
             }
             _ => None,
@@ -7533,7 +7581,7 @@ fn live_path_waits_then_falls_back() {
         .expect("ielist")
         .into_iter()
         .find_map(|row| match row.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established) => {
+            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
                 Some(row.conversation_id)
             }
             _ => None,
@@ -7748,6 +7796,183 @@ fn live_path_waits_then_falls_back() {
         .expect("post-adv");
     assert!(ada.writes.len() > writes_before);
     assert!(ada.eph_writes.len() > eph_before);
+    assert_eq!(
+        engine
+            .send_text(ada.clone(), &rng, ada_ids, "e\u{0301}", None)
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    assert_eq!(
+        engine
+            .send_reaction(
+                ada.clone(),
+                &rng,
+                ada_ids,
+                crate::protocol::v1::Tag::from_bytes([1; 32]),
+                &"x".repeat(33),
+                true,
+            )
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    let secret = ada.established_secret(child).expect("sec3");
+    let bare = TxPayload::Text(crate::protocol::v1::payload::TxText {
+        body: "bare".into(),
+        reply_to: None,
+        expire_at: None,
+    });
+    engine
+        .merge_tx(&mut ada, &secret, child, bare)
+        .expect("bare");
+    let early = ada.eph_writes.len();
+    ada = engine
+        .send_typing(ada, &rng, ada_ids, true)
+        .expect("type-on")
+        .state;
+    let early_writes: Vec<_> = ada.eph_writes[early..].to_vec();
+    for write in early_writes {
+        ada = engine
+            .ingest_ephemeral_packet(ada, &rng, write.channel, write.tag, &write.body)
+            .expect("type-on-in")
+            .state;
+    }
+    ada = engine
+        .set_conversation_prefs(
+            ada,
+            &rng,
+            ada_ids,
+            crate::protocol::v1::ConversationPrefs {
+                read_receipts: true,
+                online_visible: false,
+                send_typing: true,
+                disappear_after: Some(1),
+                notification_privacy: crate::protocol::v1::NotificationPrivacy::Name,
+                wake: None,
+            },
+        )
+        .expect("prefs")
+        .state;
+    ada = engine
+        .set_conversation_prefs(
+            ada,
+            &rng,
+            ada_ids,
+            crate::protocol::v1::ConversationPrefs {
+                read_receipts: true,
+                online_visible: false,
+                send_typing: true,
+                disappear_after: Some(1),
+                notification_privacy: crate::protocol::v1::NotificationPrivacy::Silent,
+                wake: None,
+            },
+        )
+        .expect("prefs2")
+        .state;
+    let stamped = engine
+        .send_text(ada, &rng, ada_ids, "gone", None)
+        .expect("gone");
+    assert!(stamped.pings().is_empty());
+    ada = stamped.state;
+    let target = crate::protocol::v1::Tag::from_bytes([8; 32]);
+    ada = engine
+        .edit_message(ada, &rng, ada_ids, target, "edited")
+        .expect("ed")
+        .state;
+    ada = engine
+        .remove_message(ada, &rng, ada_ids, target)
+        .expect("rm")
+        .state;
+    ada = engine
+        .send_reaction(ada, &rng, ada_ids, target, "ok", true)
+        .expect("rx")
+        .state;
+    ada = engine
+        .send_read(ada, &rng, ada_ids, target)
+        .expect("rd")
+        .state;
+    ada = engine
+        .send_delivered(ada, &rng, ada_ids, target)
+        .expect("dv")
+        .state;
+    ada = engine
+        .set_group_name(ada, &rng, ada_ids, "Ada")
+        .expect("name")
+        .state;
+    ada = engine
+        .set_group_photo(ada, &rng, ada_ids, None)
+        .expect("photo")
+        .state;
+    let mark = ada.eph_writes.len();
+    ada = engine
+        .send_typing(ada, &rng, ada_ids, false)
+        .expect("type")
+        .state;
+    ada = engine
+        .send_presence(ada, &rng, ada_ids)
+        .expect("pres")
+        .state;
+    let signals: Vec<_> = ada.eph_writes[mark..].to_vec();
+    for write in signals {
+        ada = engine
+            .ingest_ephemeral_packet(ada, &rng, write.channel, write.tag, &write.body)
+            .expect("sig")
+            .state;
+    }
+    let _ = engine
+        .get_conversation(&ada, uid, iid, child)
+        .expect("view");
+    let view = engine.dm_view(&ada, child);
+    assert!(view.messages.iter().any(|item| {
+        matches!(&item.payload, TxPayload::Text(text) if text.body == "hi")
+            && !item.sender.is_empty()
+    }));
+    assert!(view.messages.iter().any(|item| {
+        matches!(&item.payload, TxPayload::Text(text) if text.body == "bare")
+            && item.sender.is_empty()
+    }));
+    assert!(view.messages.iter().all(|item| !matches!(
+        item.payload,
+        TxPayload::Advertise { .. } | TxPayload::Name { .. }
+    )));
+    assert!(view.typing.is_some());
+    assert!(view.presence.is_some());
+    ada = engine.tick(ada, now + 4).expect("expire").state;
+    let view = engine.dm_view(&ada, child);
+    assert!(
+        view.messages
+            .iter()
+            .all(|item| !matches!(&item.payload, TxPayload::Text(text) if text.body == "gone"))
+    );
+    ada = engine.tick(ada, now + 12).expect("clear").state;
+    let view = engine.dm_view(&ada, child);
+    assert!(view.typing.is_none());
+    assert!(view.presence.is_some());
+    let wake = crate::protocol::v1::Wake::try_new(
+        "https://push.example/x",
+        &[3u8; 65],
+        &[4u8; 16],
+        Some(vec![9, 9, 9]),
+    )
+    .expect("wake");
+    for tx in ada.txs.values_mut() {
+        if let TxPayload::InviteeIntro(intro) = &mut tx.payload {
+            intro.prefs.wake = Some(wake.clone());
+        }
+    }
+    let pinged = engine
+        .send_text(ada, &rng, ada_ids, "ping", None)
+        .expect("ping");
+    assert_eq!(pinged.pings().len(), 1);
+    assert_eq!(pinged.pings()[0].endpoint, "https://push.example/x");
+    for tx in bob.txs.values_mut() {
+        if let TxPayload::InviterIntro(intro) = &mut tx.payload {
+            intro.prefs.wake = Some(wake.clone());
+        }
+    }
+    let bob_ping = engine
+        .send_text(bob, &rng, bob_ids, "pong", None)
+        .expect("pong");
+    assert_eq!(bob_ping.pings().len(), 1);
 }
 
 #[test]
@@ -7883,11 +8108,25 @@ fn live_path_sync_uses_device_actor() {
         conversation_id: child,
     };
     let mut ada = confirmed.state;
+    assert_eq!(
+        engine
+            .send_text(ada.clone(), &rng, child_ids, "sync-hi", None)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    let secret = ada.established_secret(child).expect("sec");
+    let payload = TxPayload::Text(crate::protocol::v1::payload::TxText {
+        body: "sync-hi".into(),
+        reply_to: None,
+        expire_at: None,
+    });
+    let (tx_id, _, _) = engine
+        .merge_tx(&mut ada, &secret, child, payload.clone())
+        .expect("merge");
     let before = ada.writes.len();
-    ada = engine
-        .send_text(ada, &rng, child_ids, "sync-hi", None)
-        .expect("send")
-        .state;
+    engine
+        .post_live(&mut ada, &rng, child, &secret, tx_id, &payload)
+        .expect("post");
     assert_eq!(ada.writes.len(), before);
     assert!(!ada.eph_writes.is_empty());
     assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
@@ -7899,4 +8138,14 @@ fn live_path_sync_uses_device_actor() {
     ada = engine.tick(ada, now + 3).expect("due").state;
     assert!(ada.writes.len() > before);
     assert!(ada.chains(child).expect("c").live_pending.is_empty());
+    let eph_before = ada.eph_writes.len();
+    ada = engine
+        .send_presence(ada, &rng, child_ids)
+        .expect("presence")
+        .state;
+    ada = engine
+        .send_typing(ada, &rng, child_ids, true)
+        .expect("typing")
+        .state;
+    assert!(ada.eph_writes.len() > eph_before);
 }

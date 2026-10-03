@@ -61,7 +61,9 @@ impl Engine {
                     SynchronizationQuery::SyncEstablished,
                 ));
             }
-            return Some(Conversation::DirectMessage(DirectMessageQuery::Established));
+            return Some(Conversation::DirectMessage(
+                DirectMessageQuery::Established(self.dm_view(state, conversation_id)),
+            ));
         }
         let party = state.party(conversation_id)?;
         let sync = state.is_sync(conversation_id);
@@ -269,11 +271,7 @@ impl Engine {
         ids: &ConversationRef,
         payload: TxPayload,
     ) -> Result<MutateOk, EngineError> {
-        let established_sync = state.is_sync(ids.conversation_id)
-            && state.established_secret(ids.conversation_id).is_some();
-        if !established_sync {
-            self.require_ids(&state, ids)?;
-        }
+        self.require_ids(&state, ids)?;
         let secret = self.conv_secret(&state, &ids.conversation_id)?;
         let mut ok = self.mutate_on(state, &secret, ids.conversation_id, vec![payload.clone()])?;
         #[rustfmt::skip]

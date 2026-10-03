@@ -1,5 +1,6 @@
 //! Conversation query ADTs, poll locators, and mutation results.
 
+use super::super::payload::{Hlc, TxPayload};
 use super::super::{
     Address, ConversationId, IdentityId, Kind, PersistSeq, Policy, Tag, UnixSeconds, UserId,
 };
@@ -320,11 +321,53 @@ pub enum Handshake {
     Failed(FailedReason),
 }
 
+/// One durable row in query `messages`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryItem {
+    /// Transaction id.
+    pub tx_id: Tag,
+    /// Sender signing public key, or `DeviceId`.
+    pub sender: Vec<u8>,
+    /// Presentation timestamp.
+    pub hlc: Hlc,
+    /// Chat payload.
+    pub payload: TxPayload,
+    /// Disappear time, or never.
+    pub expire_at: Option<UnixSeconds>,
+}
+
+/// Composing signal on an established DM.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypingView {
+    /// Whether the peer is composing.
+    pub composing: bool,
+    /// Time the signal is measured from.
+    pub last_active: UnixSeconds,
+}
+
+/// Liveness signal on an established DM.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresenceView {
+    /// Time of the latest presence packet.
+    pub last_active: UnixSeconds,
+}
+
+/// Established DM query.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DmEstablished {
+    /// Most recent durable chat items.
+    pub messages: Vec<HistoryItem>,
+    /// Peer composing signal.
+    pub typing: Option<TypingView>,
+    /// Peer liveness signal.
+    pub presence: Option<PresenceView>,
+}
+
 /// Established or failed DM query.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectMessageQuery {
     /// Child DM after both confirms.
-    Established,
+    Established(DmEstablished),
     /// Failed DM.
     Failed(FailedReason),
 }

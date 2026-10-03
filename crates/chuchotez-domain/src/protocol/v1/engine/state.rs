@@ -145,6 +145,19 @@ pub(super) struct ConversationChains {
     pub(super) live_pending: Vec<LivePending>,
     /// A presence probe was sent since this process came online.
     pub(super) presence_sent: bool,
+    /// Sender of a chat tx, for query `messages`.
+    pub(super) chat_senders: BTreeMap<Tag, Vec<u8>>,
+    /// Latest composing signal. Not folded.
+    pub(super) typing: Option<TypingNote>,
+    /// Latest presence time. Not folded.
+    pub(super) presence_at: Option<UnixSeconds>,
+}
+
+/// Ephemeral composing signal kept until query or reload.
+#[derive(Clone, Debug)]
+pub(super) struct TypingNote {
+    pub(super) composing: bool,
+    pub(super) at: UnixSeconds,
 }
 
 /// DM conversation row: phase plus packet chains.

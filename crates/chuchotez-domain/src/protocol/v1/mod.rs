@@ -36,10 +36,10 @@ pub use defaults::{
 };
 pub use engine::{
     BlobGet, BlobPut, BlockedIdentity, BlockedMissing, Conversation, ConversationListRow,
-    ConversationRef, DirectMessageQuery, DurableLocator, DurableWrite, Engine, EngineState,
-    EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupQuery, Handshake,
-    HandshakeInvitee, HandshakeInviter, MediaDraft, MutateOk, PingTarget, Poll,
-    SynchronizationQuery, WrapDekOk,
+    ConversationRef, DirectMessageQuery, DmEstablished, DurableLocator, DurableWrite, Engine,
+    EngineState, EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupQuery, Handshake,
+    HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk, PingTarget, Poll,
+    PresenceView, SynchronizationQuery, TypingView, WrapDekOk,
 };
 pub use error::EngineError;
 pub use hash::{HashBytes, Sha256};
