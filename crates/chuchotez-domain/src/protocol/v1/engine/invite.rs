@@ -206,6 +206,9 @@ impl Engine {
         persistents: Option<Vec<DurableChannel>>,
     ) -> Result<(MutateOk, ConversationId), EngineError> {
         let now = Self::require_tick(&state)?;
+        if sync_peer_count(&state) >= 4 {
+            return Err(EngineError::MemberCap);
+        }
         let expires = UnixSeconds::from_u64(expires);
         if expires <= now {
             return Err(EngineError::ExpiresNotAfterNow);
@@ -345,4 +348,16 @@ impl Engine {
             .map_err(|_| EngineError::MalformedTicket)?;
         ticket_from_json(self.suite.b64u(), &json).map_err(|_| EngineError::MalformedTicket)
     }
+}
+
+fn sync_peer_count(state: &EngineState) -> usize {
+    state
+        .device
+        .conversations
+        .iter()
+        .filter(|(cid, node)| match &node.kind {
+            super::party::DeviceConversation::Synchronization { .. } => true,
+            super::party::DeviceConversation::SyncHandshake(_) => state.child_of(**cid).is_none(),
+        })
+        .count()
 }

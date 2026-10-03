@@ -8750,9 +8750,16 @@ fn live_path_sync_uses_device_actor() {
     let confirmed = engine
         .confirm_established(inv_conf, &rng, ids)
         .expect("conf");
-    let _ = engine
+    let ie_state = ie_conf.state.clone();
+    let ie_confirmed = engine
         .confirm_established(ie_conf.state, &rng, ids)
         .expect("ieconf");
+    let ct = confirmed.state.device.dek_ct.clone().expect("dek-ct");
+    assert!(engine.open_sync_dek(&ie_state, &[]).is_err());
+    let before_dek = *engine.dek.as_ref().expect("dek").as_bytes();
+    engine.open_sync_dek(&ie_state, &ct).expect("open-dek");
+    assert_eq!(engine.dek.as_ref().expect("dek").as_bytes(), &before_dek);
+    let _ = ie_confirmed;
     let child = engine
         .list_conversations(&confirmed.state, zeros, zid)
         .expect("list")
@@ -8769,6 +8776,7 @@ fn live_path_sync_uses_device_actor() {
         identity_id: zid,
         conversation_id: child,
     };
+    let confirmed_state = confirmed.state.clone();
     let mut ada = confirmed.state;
     assert_eq!(
         engine
@@ -8810,4 +8818,87 @@ fn live_path_sync_uses_device_actor() {
         .expect("typing")
         .state;
     assert!(ada.eph_writes.len() > eph_before);
+    let eph_engine = ada.eph_writes.len();
+    let (with_user, _) = engine.create_user(ada, &rng).expect("sync-user");
+    assert!(with_user.state.eph_writes.len() > eph_engine);
+    let secret_before = with_user.state.established_secret(child).expect("sec2");
+    let pre_kick = with_user.state.clone();
+    let eph_at = pre_kick.eph_writes.len();
+    let other = crate::protocol::v1::DeviceId::from_bytes([9; 32]);
+    let kicked = engine
+        .kick_device(with_user.state, &rng, other)
+        .expect("kick-dev");
+    let mut peer = pre_kick;
+    for write in kicked.state.eph_writes[eph_at..].iter().cloned() {
+        peer = engine
+            .ingest_ephemeral_packet(peer, &rng, write.channel, write.tag, &write.body)
+            .expect("kick-pkt")
+            .state;
+    }
+    assert_ne!(
+        peer.established_secret(child).expect("peer-rekey"),
+        secret_before
+    );
+    assert_ne!(
+        kicked.state.established_secret(child).expect("rekeyed"),
+        secret_before
+    );
+    let again = engine
+        .kick_device(kicked.state.clone(), &rng, other)
+        .expect("kick-again");
+    assert_eq!(
+        again.state.established_secret(child).expect("same"),
+        kicked.state.established_secret(child).expect("rekeyed2")
+    );
+    let mine = again
+        .state
+        .device
+        .keys
+        .as_ref()
+        .expect("keys")
+        .id
+        .expect("id");
+    assert_eq!(
+        engine
+            .kick_device(again.state.clone(), &rng, mine)
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    let left = engine.leave_sync(again.state, &rng).expect("leave-sync");
+    assert!(left.state.device.conversations.is_empty());
+    assert!(left.state.device.dek_ct.is_none());
+    let mut slots = confirmed_state.clone();
+    for _ in 0..3 {
+        let (next, _) = engine
+            .create_sync_invite(slots, &rng, Policy::Classic, 1_800_000_000, "phone", None)
+            .expect("slot");
+        slots = next.state;
+    }
+    assert_eq!(
+        engine
+            .create_sync_invite(slots, &rng, Policy::Classic, 1_800_000_000, "phone", None)
+            .unwrap_err(),
+        EngineError::MemberCap
+    );
+    let ticked_user = engine.tick(EngineState::new(), now).expect("tu").state;
+    let (occupied, _) = engine.create_user(ticked_user, &rng).expect("occ");
+    assert_eq!(
+        engine
+            .receive_sync_ticket(occupied.state, &rng, &ticket_s)
+            .unwrap_err(),
+        EngineError::EmptyEngineRequired
+    );
+    let mut slim = confirmed_state;
+    slim.persist_log.clear();
+    let folded = engine.fold(slim).expect("fold-s");
+    let restored = engine.apply_folded(&folded.snapshot).expect("apply-s");
+    assert!(restored.device.dek_ct.is_some());
+    let bad = super::super::Json::Object(vec![
+        ("name".into(), super::super::Json::Null),
+        ("keys".into(), super::super::Json::Null),
+        ("conversations".into(), super::super::Json::Array(vec![])),
+        ("dek_ct".into(), super::super::Json::Bool(true)),
+    ]);
+    let mut blank = EngineState::new();
+    assert!(super::fold_tree::install_device(engine.suite.b64u(), &mut blank, &bad).is_err());
 }

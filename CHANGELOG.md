@@ -67,3 +67,7 @@ takes 1..=31 established DMs. `accept_group` posts `TxGroupAccept`, and the
 owner posts `TxGroupRoster` and `TxGroupWrap`. A roster that omits the local
 signing key stores `Kicked`. Leave and delete store `Left`. A durable group
 tx pings every member whose latest `TxPrefs.wake` is set.
+`create_sync_invite` keeps at most 4 peers besides this device. Confirm
+seals the DEK to the invitee encryption key. `kick_device` rekeys Sync
+sending chains. `leave_sync` clears this device's Sync rows. Engine txs
+also post on each established Sync live path.

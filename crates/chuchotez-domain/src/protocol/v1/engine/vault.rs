@@ -434,11 +434,16 @@ impl Engine {
     pub(super) fn mutate(
         &self,
         state: EngineState,
+        rng: Option<&dyn crate::protocol::Rng>,
         conv_secret: &Secret,
         payloads: Vec<TxPayload>,
     ) -> Result<MutateOk, EngineError> {
         let conversation_id = self.engine_conversation_id()?;
-        self.mutate_on(state, conv_secret, conversation_id, payloads)
+        let mut ok = self.mutate_on(state, conv_secret, conversation_id, payloads.clone())?;
+        if let Some(rng) = rng {
+            self.fan_engine_to_sync(&mut ok.state, rng, &payloads)?;
+        }
+        Ok(ok)
     }
 
     pub(super) fn mutate_on(

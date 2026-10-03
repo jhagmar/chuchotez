@@ -226,6 +226,10 @@ pub(super) struct Device {
     pub(super) name: Option<DisplayName>,
     pub(super) keys: Option<DeviceKeys>,
     pub(super) conversations: BTreeMap<ConversationId, DeviceNode>,
+    /// DEK sealed to the invitee device encryption key at sync confirm.
+    pub(super) dek_ct: Option<Vec<u8>>,
+    /// Device ids already removed from sync membership.
+    pub(super) kicked: Vec<DeviceId>,
 }
 
 /// Encryption and signing keys for this device. `id` is set when this device invites.
