@@ -61,7 +61,7 @@ impl Engine {
             self.spawn_child(&mut ok.state, ids.conversation_id)?;
             return Ok(ok);
         }
-        let mut ok = self.mint_on(state, &ids, TxPayload::Confirm)?;
+        let mut ok = self.mint_on(state, _rng, &ids, TxPayload::Confirm)?;
         self.spawn_child(&mut ok.state, ids.conversation_id)?;
         Ok(ok)
     }
@@ -82,7 +82,7 @@ impl Engine {
                 .fail(ids.conversation_id, HandshakeFailure::ConfirmationRejected);
             return Ok(ok);
         }
-        let mut ok = self.mint_on(state, &ids, TxPayload::Reject)?;
+        let mut ok = self.mint_on(state, _rng, &ids, TxPayload::Reject)?;
         ok.state
             .fail(ids.conversation_id, HandshakeFailure::ConfirmationRejected);
         Ok(ok)
@@ -126,6 +126,7 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         self.mint_on(
             state,
+            _rng,
             &ids,
             TxPayload::GroupAccept {
                 group_id: ids.conversation_id,
@@ -142,6 +143,7 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         self.mint_on(
             state,
+            _rng,
             &ids,
             TxPayload::GroupReject {
                 group_id: ids.conversation_id,
@@ -159,6 +161,7 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         self.mint_on(
             state,
+            _rng,
             &ids,
             TxPayload::GroupKick {
                 signing_pk: signing_pk.to_vec(),
@@ -173,7 +176,7 @@ impl Engine {
         _rng: &dyn Rng,
         ids: ConversationRef,
     ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, &ids, TxPayload::GroupLeave)
+        self.mint_on(state, _rng, &ids, TxPayload::GroupLeave)
     }
 
     /// Set the group name (owner).
@@ -185,7 +188,7 @@ impl Engine {
         name: &str,
     ) -> Result<MutateOk, EngineError> {
         let name = DisplayName::try_from(name).map_err(|_| EngineError::MalformedDisplayName)?;
-        self.mint_on(state, &ids, TxPayload::Name { name })
+        self.mint_on(state, _rng, &ids, TxPayload::Name { name })
     }
 
     /// Set the group photo (owner).
@@ -202,7 +205,7 @@ impl Engine {
                 super::super::ProfilePic::try_from(b).map_err(|_| EngineError::MalformedPayload)?,
             ),
         };
-        self.mint_on(state, &ids, TxPayload::Photo { profile_pic })
+        self.mint_on(state, _rng, &ids, TxPayload::Photo { profile_pic })
     }
 
     /// Send a text message.
@@ -219,6 +222,7 @@ impl Engine {
         }
         self.mint_on(
             state,
+            _rng,
             &ids,
             TxPayload::Text(TxText {
                 body: body.into(),
@@ -271,7 +275,9 @@ impl Engine {
                 expire_at: None,
             }));
         }
-        self.mutate_on(state, &secret, ids.conversation_id, payloads)
+        let mut ok = self.mutate_on(state, &secret, ids.conversation_id, payloads.clone())?;
+        self.deliver_live(&mut ok.state, rng, ids.conversation_id, &secret, &payloads)?;
+        Ok(ok)
     }
 
     /// Edit a text message.
@@ -288,6 +294,7 @@ impl Engine {
         }
         self.mint_on(
             state,
+            _rng,
             &ids,
             TxPayload::Edit(TxEdit {
                 target,
@@ -304,7 +311,7 @@ impl Engine {
         ids: ConversationRef,
         target: Tag,
     ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, &ids, TxPayload::Remove { target })
+        self.mint_on(state, _rng, &ids, TxPayload::Remove { target })
     }
 
     /// Add or remove a reaction.
@@ -322,6 +329,7 @@ impl Engine {
         }
         self.mint_on(
             state,
+            _rng,
             &ids,
             TxPayload::Reaction(TxReaction {
                 target,
@@ -357,7 +365,7 @@ impl Engine {
         ids: ConversationRef,
         up_to: Tag,
     ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, &ids, TxPayload::Read { up_to })
+        self.mint_on(state, _rng, &ids, TxPayload::Read { up_to })
     }
 
     /// Send a delivered marker.
@@ -368,7 +376,7 @@ impl Engine {
         ids: ConversationRef,
         up_to: Tag,
     ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, &ids, TxPayload::Delivered { up_to })
+        self.mint_on(state, _rng, &ids, TxPayload::Delivered { up_to })
     }
 
     /// Send a presence packet.

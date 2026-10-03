@@ -6,6 +6,7 @@ mod heal;
 mod helpers;
 mod identity;
 mod invite;
+mod live;
 mod party;
 mod persist;
 mod poll;

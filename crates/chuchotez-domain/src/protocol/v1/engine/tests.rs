@@ -7391,3 +7391,512 @@ fn heal_searches_then_retransmits_and_falls_back() {
         }
     }
 }
+
+#[test]
+fn live_path_waits_then_falls_back() {
+    use super::super::chain::{eph_mk, join, mk, seal_packet};
+    use super::super::payload::{ConversationSort, PacketPlain, PacketXorAck};
+    use super::{Conversation, ConversationRef, DirectMessageQuery};
+    use crate::protocol::v1::fixtures::sample_durable;
+    use crate::protocol::v1::{
+        Address, Defaults, EphemeralChannel, Kind, NotificationPrivacy, Tag,
+    };
+    let now = 1_700_000_000;
+    let eph = EphemeralChannel::new(
+        Kind::try_from("webrtc").expect("k"),
+        Address::try_from("https://eph.example").expect("a"),
+    );
+    let defaults = Defaults::try_new(
+        vec![sample_durable()],
+        vec![eph.clone()],
+        true,
+        true,
+        true,
+        None,
+        false,
+        NotificationPrivacy::Name,
+    )
+    .expect("def");
+    let mut engine = Engine::new(test_engine().suite.clone(), defaults);
+    let rng = CounterRng::new();
+    engine
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("wrap");
+    let ticked = engine.tick(EngineState::new(), now).expect("tick");
+    let (created, uid) = engine.create_user(ticked.state, &rng).expect("user");
+    let (created, iid) = engine
+        .create_identity(created.state, &rng, uid, Policy::Classic)
+        .expect("id");
+    let named = engine
+        .set_display_name(created.state, &rng, uid, iid, "Ada")
+        .expect("name");
+    let (invited, cid) = engine
+        .create_invite(named.state, &rng, uid, iid, 1_800_000_000, None)
+        .expect("inv");
+    let ids = ConversationRef {
+        user_id: uid,
+        identity_id: iid,
+        conversation_id: cid,
+    };
+    let ticket_s = engine.ticket_host_string(&invited.state, &ids).expect("t");
+    let notice_writes: Vec<_> = engine
+        .poll(&invited.state)
+        .expect("p")
+        .write_durable
+        .into_iter()
+        .map(|w| (w.channel, w.tag, w.body))
+        .collect();
+    let inviter = ack_all(&engine, invited.state);
+    let ie_tick = engine.tick(EngineState::new(), now).expect("it");
+    let (ie_user, ie_uid) = engine.create_user(ie_tick.state, &rng).expect("iu");
+    let (ie_id, ie_iid) = engine
+        .create_identity(ie_user.state, &rng, ie_uid, Policy::Classic)
+        .expect("ii");
+    let ie_named = engine
+        .set_display_name(ie_id.state, &rng, ie_uid, ie_iid, "Bob")
+        .expect("in");
+    let (received, _) = engine
+        .receive_ticket(ie_named.state, &rng, ie_uid, ie_iid, &ticket_s)
+        .expect("recv");
+    let bodies: Vec<Vec<u8>> = notice_writes.iter().map(|w| w.2.clone()).collect();
+    let minted = engine
+        .ingest_list(
+            received.state,
+            &rng,
+            notice_writes[0].0.clone(),
+            notice_writes[0].1,
+            &bodies,
+        )
+        .expect("ing");
+    let intro_writes: Vec<_> = engine
+        .poll(&minted.state)
+        .expect("ip")
+        .write_durable
+        .into_iter()
+        .map(|w| (w.channel, w.tag, w.body))
+        .collect();
+    let sent = ack_all(&engine, minted.state);
+    let intro_bodies: Vec<Vec<u8>> = intro_writes.iter().map(|w| w.2.clone()).collect();
+    let inv_minted = engine
+        .ingest_list(
+            inviter,
+            &rng,
+            intro_writes[0].0.clone(),
+            intro_writes[0].1,
+            &intro_bodies,
+        )
+        .expect("iing");
+    let inv_intro_writes: Vec<_> = engine
+        .poll(&inv_minted.state)
+        .expect("iip")
+        .write_durable
+        .into_iter()
+        .map(|w| (w.channel, w.tag, w.body))
+        .collect();
+    let inv_conf = ack_all(&engine, inv_minted.state);
+    let ie_conf = engine
+        .ingest_list(
+            sent,
+            &rng,
+            inv_intro_writes[0].0.clone(),
+            inv_intro_writes[0].1,
+            &inv_intro_writes
+                .iter()
+                .map(|w| w.2.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("ieing");
+    let ie_ids = ConversationRef {
+        user_id: ie_uid,
+        identity_id: ie_iid,
+        conversation_id: cid,
+    };
+    let confirmed_ie = engine
+        .confirm_established(ie_conf.state, &rng, ie_ids)
+        .expect("ieconf");
+    let confirmed = engine
+        .confirm_established(inv_conf, &rng, ids)
+        .expect("conf");
+    let child = engine
+        .list_conversations(&confirmed.state, uid, iid)
+        .expect("list")
+        .into_iter()
+        .find_map(|row| match row.conversation {
+            Conversation::DirectMessage(DirectMessageQuery::Established) => {
+                Some(row.conversation_id)
+            }
+            _ => None,
+        })
+        .expect("child");
+    let ie_child = engine
+        .list_conversations(&confirmed_ie.state, ie_uid, ie_iid)
+        .expect("ielist")
+        .into_iter()
+        .find_map(|row| match row.conversation {
+            Conversation::DirectMessage(DirectMessageQuery::Established) => {
+                Some(row.conversation_id)
+            }
+            _ => None,
+        })
+        .expect("iechild");
+    let mut ada = confirmed.state;
+    let mut bob = confirmed_ie.state;
+    let ada_ids = ConversationRef {
+        user_id: uid,
+        identity_id: iid,
+        conversation_id: child,
+    };
+    let bob_ids = ConversationRef {
+        user_id: ie_uid,
+        identity_id: ie_iid,
+        conversation_id: ie_child,
+    };
+    assert!(ada.eph_writes.is_empty());
+    let durable_before = ada.writes.len();
+    ada = engine
+        .send_text(ada, &rng, ada_ids, "hi", None)
+        .expect("s1")
+        .state;
+    assert!(ada.writes.len() == durable_before);
+    let first_eph = ada.eph_writes.len();
+    assert!(first_eph >= 2);
+    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
+    ada = engine
+        .send_text(ada, &rng, ada_ids, "second", None)
+        .expect("s2")
+        .state;
+    let text_eph = ada.eph_writes.len() - first_eph;
+    assert!(text_eph < first_eph);
+    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 2);
+    bob = engine
+        .send_text(bob, &rng, bob_ids, "from-bob", None)
+        .expect("sb")
+        .state;
+    assert!(!bob.eph_writes.is_empty());
+    let bob_tag = bob.eph_writes[0].tag;
+    let channel = ada.eph_writes[0].channel.clone();
+    let first_tag = ada.eph_writes[0].tag;
+    let first_body = ada.eph_writes[0].body.clone();
+    for write in ada.eph_writes.clone() {
+        bob = engine
+            .ingest_ephemeral_packet(bob, &rng, write.channel, write.tag, &write.body)
+            .expect("eph")
+            .state;
+    }
+    for write in ada.eph_writes.clone() {
+        bob = engine
+            .ingest_ephemeral_packet(bob, &rng, write.channel, write.tag, &write.body)
+            .expect("eph-again")
+            .state;
+    }
+    assert!(
+        bob.txs
+            .values()
+            .any(|tx| { matches!(&tx.payload, TxPayload::Text(text) if text.body == "hi") })
+    );
+    let bad = engine
+        .ingest_ephemeral_packet(
+            bob.clone(),
+            &rng,
+            channel.clone(),
+            Tag::from_bytes([9; 32]),
+            &first_body,
+        )
+        .unwrap_err();
+    assert_eq!(bad, EngineError::UnknownTag);
+    let bad_body = engine
+        .ingest_ephemeral_packet(
+            bob.clone(),
+            &rng,
+            channel.clone(),
+            first_tag,
+            &vec![0; first_body.len()],
+        )
+        .unwrap_err();
+    assert_eq!(bad_body, EngineError::UnknownTag);
+    let invitee_pk = ada
+        .txs
+        .values()
+        .find_map(|tx| match &tx.payload {
+            TxPayload::InviteeIntro(intro) if tx.conversation_id == cid => {
+                Some(intro.signing_pk.clone())
+            }
+            _ => None,
+        })
+        .expect("pk");
+    let secret = ada.established_secret(child).expect("sec");
+    let peer = join(
+        engine.suite.hmac(),
+        secret.as_bytes(),
+        ConversationSort::DirectMessage,
+        &invitee_pk,
+    )
+    .expect("join");
+    let set_xor = ada.chains(child).expect("c").live_pending[1].set_xor;
+    let ack = seal_packet(
+        &engine.suite,
+        &rng,
+        &eph_mk(engine.suite.hmac(), &peer),
+        &PacketPlain::XorAck(PacketXorAck {
+            actor_id: invitee_pk.clone(),
+            packet_seq: peer.packet_seq.as_u64(),
+            set_xor,
+        }),
+    )
+    .expect("ack");
+    ada = engine
+        .ingest_ephemeral_packet(ada, &rng, channel.clone(), bob_tag, &ack)
+        .expect("live-ack")
+        .state;
+    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
+    assert!(ada.chains(child).expect("c").live_until.is_some());
+    let mut stripped = ada.clone();
+    stripped.txs.retain(|_, body| {
+        !matches!(
+            body.payload,
+            TxPayload::InviterIntro(_) | TxPayload::InviteeIntro(_)
+        )
+    });
+    let stripped_writes = stripped.writes.len();
+    engine
+        .post_live(
+            &mut stripped,
+            &rng,
+            child,
+            &secret,
+            Tag::from_bytes([1; 32]),
+            &TxPayload::Confirm,
+        )
+        .expect("no-route");
+    assert_eq!(stripped.writes.len(), stripped_writes);
+    let flushed_early = engine.tick(stripped, now + 3).expect("strip-tick");
+    assert_eq!(flushed_early.state.writes.len(), stripped_writes);
+    let held = ada.writes.len();
+    ada = engine.tick(ada, now + 2).expect("soon").state;
+    assert_eq!(ada.writes.len(), held);
+    ada = engine.tick(ada, now + 3).expect("due").state;
+    assert!(ada.writes.len() > held);
+    assert!(ada.chains(child).expect("c").live_pending.is_empty());
+    let durable_ch = ada.writes.last().expect("dw").channel.clone();
+    let durable_tag = ada.writes.last().expect("dw").tag;
+    let durable_body = ada.writes.last().expect("dw").body.clone();
+    bob = engine
+        .ingest_packet(bob, &rng, durable_ch.clone(), durable_tag, &durable_body)
+        .expect("durable")
+        .state;
+    let xor = seal_packet(
+        &engine.suite,
+        &rng,
+        &mk(engine.suite.hmac(), &peer),
+        &PacketPlain::XorAck(PacketXorAck {
+            actor_id: invitee_pk,
+            packet_seq: 0,
+            set_xor: super::super::chain::set_xor_for(&ada.txs, child),
+        }),
+    )
+    .expect("dxor");
+    ada = engine
+        .ingest_packet(ada, &rng, durable_ch, durable_tag, &xor)
+        .expect("durable-ack")
+        .state;
+    let live_before = ada.eph_writes.len();
+    ada = engine
+        .send_text(ada, &rng, ada_ids, "while-live", None)
+        .expect("s3")
+        .state;
+    assert_eq!(ada.eph_writes.len(), live_before + text_eph);
+    for tx in ada.txs.values_mut() {
+        if let TxPayload::Notice(notice) = &mut tx.payload {
+            notice.ephemerals.clear();
+        }
+    }
+    let writes_before = ada.writes.len();
+    let eph_before = ada.eph_writes.len();
+    ada = engine
+        .send_text(ada, &rng, ada_ids, "persistent", None)
+        .expect("s4")
+        .state;
+    assert!(ada.writes.len() > writes_before);
+    assert_eq!(ada.eph_writes.len(), eph_before);
+    for write in ada.writes[writes_before..].iter().cloned() {
+        bob = engine
+            .ingest_packet(bob, &rng, write.channel, write.tag, &write.body)
+            .expect("fresh-in")
+            .state;
+    }
+    assert!(
+        bob.txs.values().any(|tx| {
+            matches!(&tx.payload, TxPayload::Text(text) if text.body == "persistent")
+        })
+    );
+    let secret = ada.established_secret(child).expect("sec2");
+    let payload = TxPayload::Advertise {
+        encaps_pk: vec![7; 32],
+    };
+    let (tx_id, _, _) = engine
+        .merge_tx(&mut ada, &secret, child, payload.clone())
+        .expect("adv");
+    for tx in ada.txs.values_mut() {
+        if let TxPayload::Notice(notice) = &mut tx.payload {
+            notice.ephemerals = vec![eph.clone()];
+        }
+    }
+    let writes_before = ada.writes.len();
+    let eph_before = ada.eph_writes.len();
+    engine
+        .post_live(&mut ada, &rng, child, &secret, tx_id, &payload)
+        .expect("post-adv");
+    assert!(ada.writes.len() > writes_before);
+    assert!(ada.eph_writes.len() > eph_before);
+}
+
+#[test]
+fn live_path_sync_uses_device_actor() {
+    use super::{Conversation, ConversationRef, SynchronizationQuery};
+    use crate::protocol::v1::fixtures::sample_durable;
+    use crate::protocol::v1::{
+        Address, Defaults, EphemeralChannel, IdentityId, Kind, NotificationPrivacy, UserId,
+    };
+    let now = 1_700_000_000;
+    let eph = EphemeralChannel::new(
+        Kind::try_from("webrtc").expect("k"),
+        Address::try_from("https://eph.example").expect("a"),
+    );
+    let defaults = Defaults::try_new(
+        vec![sample_durable()],
+        vec![eph],
+        true,
+        true,
+        true,
+        None,
+        false,
+        NotificationPrivacy::Name,
+    )
+    .expect("def");
+    let mut engine = Engine::new(test_engine().suite.clone(), defaults);
+    let rng = CounterRng::new();
+    engine
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("wrap");
+    let ticked = engine.tick(EngineState::new(), now).expect("tick");
+    let (invited, sid) = engine
+        .create_sync_invite(
+            ticked.state,
+            &rng,
+            Policy::Classic,
+            1_800_000_000,
+            "phone",
+            None,
+        )
+        .expect("sinv");
+    let zeros = UserId::from_bytes([0; 32]);
+    let zid = IdentityId::from_bytes([0; 32]);
+    let ids = ConversationRef {
+        user_id: zeros,
+        identity_id: zid,
+        conversation_id: sid,
+    };
+    let ticket_s = engine.ticket_host_string(&invited.state, &ids).expect("t");
+    let notice_writes: Vec<_> = engine
+        .poll(&invited.state)
+        .expect("p")
+        .write_durable
+        .into_iter()
+        .map(|w| (w.channel, w.tag, w.body))
+        .collect();
+    let inviter = ack_all(&engine, invited.state);
+    let ie_tick = engine.tick(EngineState::new(), now).expect("it").state;
+    let (received, _) = engine
+        .receive_sync_ticket(ie_tick, &rng, &ticket_s)
+        .expect("recv");
+    let named_ie = engine
+        .set_device_name(received.state, &rng, "tablet")
+        .expect("dn");
+    let bodies: Vec<Vec<u8>> = notice_writes.iter().map(|w| w.2.clone()).collect();
+    let minted = engine
+        .ingest_list(
+            named_ie.state,
+            &rng,
+            notice_writes[0].0.clone(),
+            notice_writes[0].1,
+            &bodies,
+        )
+        .expect("ing");
+    let intro_writes: Vec<_> = engine
+        .poll(&minted.state)
+        .expect("ip")
+        .write_durable
+        .into_iter()
+        .map(|w| (w.channel, w.tag, w.body))
+        .collect();
+    let sent = ack_all(&engine, minted.state);
+    let intro_bodies: Vec<Vec<u8>> = intro_writes.iter().map(|w| w.2.clone()).collect();
+    let inv_minted = engine
+        .ingest_list(
+            inviter,
+            &rng,
+            intro_writes[0].0.clone(),
+            intro_writes[0].1,
+            &intro_bodies,
+        )
+        .expect("iing");
+    let inv_intro_writes: Vec<_> = engine
+        .poll(&inv_minted.state)
+        .expect("iip")
+        .write_durable
+        .into_iter()
+        .map(|w| (w.channel, w.tag, w.body))
+        .collect();
+    let inv_conf = ack_all(&engine, inv_minted.state);
+    let ie_conf = engine
+        .ingest_list(
+            sent,
+            &rng,
+            inv_intro_writes[0].0.clone(),
+            inv_intro_writes[0].1,
+            &inv_intro_writes
+                .iter()
+                .map(|w| w.2.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("ieing");
+    let confirmed = engine
+        .confirm_established(inv_conf, &rng, ids)
+        .expect("conf");
+    let _ = engine
+        .confirm_established(ie_conf.state, &rng, ids)
+        .expect("ieconf");
+    let child = engine
+        .list_conversations(&confirmed.state, zeros, zid)
+        .expect("list")
+        .into_iter()
+        .find_map(|row| match row.conversation {
+            Conversation::Synchronization(SynchronizationQuery::SyncEstablished) => {
+                Some(row.conversation_id)
+            }
+            _ => None,
+        })
+        .expect("child");
+    let child_ids = ConversationRef {
+        user_id: zeros,
+        identity_id: zid,
+        conversation_id: child,
+    };
+    let mut ada = confirmed.state;
+    let before = ada.writes.len();
+    ada = engine
+        .send_text(ada, &rng, child_ids, "sync-hi", None)
+        .expect("send")
+        .state;
+    assert_eq!(ada.writes.len(), before);
+    assert!(!ada.eph_writes.is_empty());
+    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
+    let write = ada.eph_writes[0].clone();
+    ada = engine
+        .ingest_ephemeral_packet(ada, &rng, write.channel, write.tag, &write.body)
+        .expect("echo")
+        .state;
+    ada = engine.tick(ada, now + 3).expect("due").state;
+    assert!(ada.writes.len() > before);
+    assert!(ada.chains(child).expect("c").live_pending.is_empty());
+}

@@ -290,6 +290,7 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         self.mint_on(
             state,
+            _rng,
             &ids,
             TxPayload::Prefs(OnWirePrefs {
                 read_receipts: prefs.read_receipts,

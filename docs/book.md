@@ -101,6 +101,17 @@ enters the mix FIFO after a watermarked `ratchet_ack` of that `kem_ct`. Every
 `packet_seq` increments on the current epoch. At most 8 unused advertised
 secret keys are kept.
 
+Established DM and Sync sends with a nonempty `ephemerals` list enqueue on
+every EphemeralChannel first, sealed with `eph_mk`. A matching ephemeral
+`PacketXorAck` omits Persistent. `tick` three seconds later enqueues that
+512-byte body on every DurableChannel. `TxAdvertise`, `TxWrap`, and `TxAck`
+are Persistent immediately and may also copy on Ephemeral. An empty
+`ephemerals` list and Group sends are Persistent only. The first such send
+while idle may post `PacketPresenceActive` when `online_visible` is on,
+otherwise `PacketPresence`. The conversation stays live for 30 ticked seconds
+after an ephemeral packet from the other party. On this pairwise Sync, that
+party is the other device.
+
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.
 `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes. `KemSeed` /
@@ -172,8 +183,6 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 
 ## Later slices
 
-- Heal half-xor / want / have.
-- Live path (ephemeral first, persistent after 3 ticked seconds).
 - `create_group` from Established DMs (member cap 32, parallel `TxGroupInvite`).
 - Cover traffic.
 
