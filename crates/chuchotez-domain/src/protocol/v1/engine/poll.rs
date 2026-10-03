@@ -42,6 +42,7 @@ impl Engine {
             state.fail(cid, HandshakeFailure::InviteExpired { expires });
         }
         self.flush_heal(&mut state);
+        self.flush_live(&mut state);
         Ok(MutateOk {
             state,
             persist: Vec::new(),

@@ -103,6 +103,28 @@ impl ConversationSort {
             Self::Engine => return None,
         })
     }
+
+    pub(crate) fn persist_label(self) -> Option<&'static [u8]> {
+        Some(match self {
+            Self::HandshakeDm => b"chuchotez/1/handshake-dm-persist-bin",
+            Self::HandshakeSync => b"chuchotez/1/handshake-sync-persist-bin",
+            Self::DirectMessage => b"chuchotez/1/dm-persist-bin",
+            Self::Group => b"chuchotez/1/group-persist-bin",
+            Self::Synchronization => b"chuchotez/1/sync-persist-bin",
+            Self::Engine => return None,
+        })
+    }
+
+    pub(crate) fn eph_label(self) -> Option<&'static [u8]> {
+        Some(match self {
+            Self::HandshakeDm => b"chuchotez/1/handshake-dm-eph-bin",
+            Self::HandshakeSync => b"chuchotez/1/handshake-sync-eph-bin",
+            Self::DirectMessage => b"chuchotez/1/dm-eph-bin",
+            Self::Group => b"chuchotez/1/group-eph-bin",
+            Self::Synchronization => b"chuchotez/1/sync-eph-bin",
+            Self::Engine => return None,
+        })
+    }
 }
 
 impl core::fmt::Display for ConversationSort {

@@ -13,6 +13,7 @@ use super::super::{
     UnixSeconds, UserId,
 };
 use super::helpers::*;
+use super::live::LiveChannel;
 use super::party::{HandshakeFailure, PhaseKind};
 use super::query::*;
 use super::state::*;
@@ -264,12 +265,20 @@ impl Engine {
     pub(super) fn mint_on(
         &self,
         state: EngineState,
+        rng: &dyn Rng,
         ids: &ConversationRef,
         payload: TxPayload,
     ) -> Result<MutateOk, EngineError> {
-        self.require_ids(&state, ids)?;
+        let established_sync = state.is_sync(ids.conversation_id)
+            && state.established_secret(ids.conversation_id).is_some();
+        if !established_sync {
+            self.require_ids(&state, ids)?;
+        }
         let secret = self.conv_secret(&state, &ids.conversation_id)?;
-        self.mutate_on(state, &secret, ids.conversation_id, vec![payload])
+        let mut ok = self.mutate_on(state, &secret, ids.conversation_id, vec![payload.clone()])?;
+        #[rustfmt::skip]
+        self.deliver_live(&mut ok.state, rng, ids.conversation_id, &secret, std::slice::from_ref(&payload))?;
+        Ok(ok)
     }
 
     pub(super) fn require_confirming(
@@ -568,7 +577,7 @@ impl Engine {
         let _ = self.require_dek()?;
         let hits = self.handshake_hits(&state, HitChannel::Durable(&channel), &tag, now);
         if hits.is_empty() {
-            return Err(EngineError::UnknownTag);
+            return self.finish_established(state, rng, LiveChannel::Durable(&channel), &tag, body);
         }
         self.reseal_due(&mut state, rng)?;
         let persist = self.ingest_known_body(&mut state, rng, &hits, body, true)?;
@@ -593,7 +602,7 @@ impl Engine {
         let _ = self.require_dek()?;
         let hits = self.handshake_hits(&state, HitChannel::Ephemeral(&channel), &tag, now);
         if hits.is_empty() {
-            return Err(EngineError::UnknownTag);
+            return self.finish_established(state, rng, LiveChannel::Eph(&channel), &tag, body);
         }
         self.reseal_due(&mut state, rng)?;
         let persist = self.ingest_known_body(&mut state, rng, &hits, body, false)?;

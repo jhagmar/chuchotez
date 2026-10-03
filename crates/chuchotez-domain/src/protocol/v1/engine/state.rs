@@ -101,6 +101,18 @@ pub(super) enum HealProbe {
     Have { lo: Tag, hi: Tag, ids: Vec<Tag> },
 }
 
+/// Durable packet bodies held until a live XOR-ack or the 3-second fallback.
+#[derive(Clone, Debug)]
+pub(super) struct LivePending {
+    pub(super) set_xor: Tag,
+    pub(super) sent_at: UnixSeconds,
+    pub(super) bodies: Vec<Vec<u8>>,
+    pub(super) sealed_to: SendChain,
+    pub(super) actor: ActorId,
+    pub(super) acks: u8,
+    pub(super) needed: u8,
+}
+
 /// Heal search waiting for an answer, plus durable bodies sealed for fallback.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Heal {
@@ -129,6 +141,10 @@ pub(super) struct ConversationChains {
     pub(super) heal: Heal,
     /// Ticked instant until which this conversation is live. `None` before a live ack.
     pub(super) live_until: Option<UnixSeconds>,
+    /// Durable packet bodies waiting for a live XOR-ack.
+    pub(super) live_pending: Vec<LivePending>,
+    /// A presence probe was sent since this process came online.
+    pub(super) presence_sent: bool,
 }
 
 /// DM conversation row: phase plus packet chains.

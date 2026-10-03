@@ -14,8 +14,8 @@ use super::query::{DurableWrite, EphemeralWrite};
 use super::state::{EngineState, Heal, HealProbe};
 use crate::protocol::Rng;
 
-const FALLBACK_SECS: u64 = 3;
-const LIVE_SECS: u64 = 30;
+pub(super) const FALLBACK_SECS: u64 = 3;
+pub(super) const LIVE_SECS: u64 = 30;
 const ID_CAP: usize = 32;
 
 impl Engine {
@@ -29,6 +29,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let already = state.chains(cid).is_some_and(|c| c.live_until.is_some());
         if let PacketPlain::XorAck(ack) = packet {
+            self.settle_live(state, cid, ack.set_xor, now);
             if set_xor_for(&state.txs, cid) == ack.set_xor {
                 self.note_live(state, cid, now);
             }
