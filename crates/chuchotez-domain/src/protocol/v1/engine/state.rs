@@ -90,6 +90,33 @@ impl core::fmt::Debug for Ratchet {
     }
 }
 
+/// One outstanding heal range. `hi` of all-`0xff` bytes is +∞.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum HealProbe {
+    /// XOR of local ids in `[lo, hi)`.
+    Half { lo: Tag, hi: Tag },
+    /// Ids this device wants in `[lo, hi)`.
+    Want { lo: Tag, hi: Tag, ids: Vec<Tag> },
+    /// Ids this device has in `[lo, hi)`.
+    Have { lo: Tag, hi: Tag, ids: Vec<Tag> },
+}
+
+/// Heal search waiting for an answer, plus durable bodies sealed for fallback.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Heal {
+    pub(super) probes: Vec<HealProbe>,
+    pub(super) sent_at: Option<UnixSeconds>,
+    /// In-flight probes were posted on Ephemeral.
+    pub(super) on_ephemeral: bool,
+    /// Fallback to Persistent already ran for this search.
+    pub(super) fell_back: bool,
+    /// Durable ciphertexts sealed at `sealed_from`, posted when the fallback is due.
+    pub(super) ready: Vec<Vec<u8>>,
+    pub(super) sealed_from: Option<SendChain>,
+    pub(super) sealed_to: Option<SendChain>,
+    pub(super) needs_reseal: bool,
+}
+
 /// Packet chains, skip-ahead `mk`s, last Persistent acks, and ratchet state.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConversationChains {
@@ -98,6 +125,10 @@ pub(super) struct ConversationChains {
     pub(super) skipped_mks: BTreeMap<ActorId, Vec<CachedMk>>,
     pub(super) last_acks: BTreeMap<ActorId, BTreeSet<Tag>>,
     pub(super) ratchet: Ratchet,
+    /// Heal search still waiting for an answer.
+    pub(super) heal: Heal,
+    /// Ticked instant until which this conversation is live. `None` before a live ack.
+    pub(super) live_until: Option<UnixSeconds>,
 }
 
 /// DM conversation row: phase plus packet chains.

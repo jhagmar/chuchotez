@@ -6814,3 +6814,580 @@ fn advertise_wrap_ack_and_mix() {
         EngineError::BodyTooLarge
     );
 }
+
+#[test]
+fn heal_searches_then_retransmits_and_falls_back() {
+    use super::super::chain::{eph_mk, mk, open_skip_ahead, seal_packet};
+    use super::super::payload::{ConversationSort, PacketPlain, PacketXorAck};
+    use crate::protocol::v1::fixtures::sample_durable;
+    use crate::protocol::v1::{
+        ActorId, Address, Defaults, EphemeralChannel, Kind, NotificationPrivacy, Tag,
+    };
+
+    let mut engine = test_engine();
+    let rng = CounterRng::new();
+    engine
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("wrap");
+    let now = 1_700_000_000u64;
+    let ticked = engine.tick(EngineState::new(), now).expect("tick");
+    let (created, uid) = engine.create_user(ticked.state, &rng).expect("user");
+    let (created, iid) = engine
+        .create_identity(created.state, &rng, uid, Policy::Classic)
+        .expect("id");
+    let (invited, cid) = engine
+        .create_invite(created.state, &rng, uid, iid, 1_800_000_000, None)
+        .expect("inv");
+    let ids = ConversationRef {
+        user_id: uid,
+        identity_id: iid,
+        conversation_id: cid,
+    };
+    let ticket_s = engine
+        .ticket_host_string(&invited.state, &ids)
+        .expect("ticket");
+    let poll = engine.poll(&invited.state).expect("poll");
+    let channel = poll.write_durable[0].channel.clone();
+    let tag = poll.write_durable[0].tag;
+    let bodies: Vec<_> = poll.write_durable.iter().map(|w| w.body.clone()).collect();
+    let ie = engine.tick(EngineState::new(), now).expect("ie").state;
+    let (ie_u, ie_uid) = engine.create_user(ie, &rng).expect("ieu");
+    let (ie_i, ie_iid) = engine
+        .create_identity(ie_u.state, &rng, ie_uid, Policy::Classic)
+        .expect("iei");
+    let (recv, _) = engine
+        .receive_ticket(ie_i.state, &rng, ie_uid, ie_iid, &ticket_s)
+        .expect("recv");
+    let mut bob = engine
+        .ingest_list(recv.state, &rng, channel.clone(), tag, &bodies)
+        .expect("ing")
+        .state;
+    let mut ada = invited.state.clone();
+    let extra = Tag::from_bytes([0xab; 32]);
+    ada.txs.insert(
+        extra,
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 1,
+                counter: 0,
+            },
+            payload: TxPayload::Confirm,
+        },
+    );
+    let chain = ada
+        .chains(cid)
+        .expect("c")
+        .send
+        .get(&ActorId::handshake())
+        .expect("send")
+        .clone();
+    let remote = super::super::chain::set_xor_for(&ada.txs, cid);
+    let mismatch = seal_packet(
+        &engine.suite,
+        &rng,
+        &mk(engine.suite.hmac(), &chain),
+        &PacketPlain::XorAck(PacketXorAck {
+            actor_id: Vec::new(),
+            packet_seq: chain.packet_seq.as_u64(),
+            set_xor: remote,
+        }),
+    )
+    .expect("seal");
+    let before = bob.writes.len();
+    bob = engine
+        .ingest_packet(bob, &rng, channel.clone(), tag, &mismatch)
+        .expect("mismatch")
+        .state;
+    assert!(bob.writes.len() > before);
+    assert!(bob.chains(cid).expect("c").heal.probes.len() == 1);
+    let mut next_bob = before;
+    let mut guard = 0;
+    while !bob.txs.contains_key(&extra) && guard < 400 {
+        guard += 1;
+        let batch: Vec<_> = bob.writes[next_bob..]
+            .iter()
+            .map(|w| w.body.clone())
+            .collect();
+        next_bob = bob.writes.len();
+        let mark = ada.writes.len();
+        for body in &batch {
+            ada = engine
+                .ingest_packet(ada, &rng, channel.clone(), tag, body)
+                .expect("to-ada")
+                .state;
+        }
+        let reply: Vec<_> = ada.writes[mark..].iter().map(|w| w.body.clone()).collect();
+        for body in &reply {
+            bob = engine
+                .ingest_packet(bob, &rng, channel.clone(), tag, body)
+                .expect("to-bob")
+                .state;
+        }
+    }
+    assert!(bob.txs.contains_key(&extra), "rounds {guard}");
+    assert!(bob.chains(cid).expect("c").heal.probes.is_empty());
+
+    let eph = EphemeralChannel::new(
+        Kind::try_from("webrtc").expect("k"),
+        Address::try_from("https://eph.example").expect("a"),
+    );
+    let defaults = Defaults::try_new(
+        vec![sample_durable()],
+        vec![eph.clone()],
+        true,
+        true,
+        true,
+        None,
+        false,
+        NotificationPrivacy::Name,
+    )
+    .expect("def");
+    let mut live_engine = Engine::new(engine.suite.clone(), defaults);
+    live_engine
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("lw");
+    let ticked = live_engine.tick(EngineState::new(), now).expect("lt");
+    let (created, uid) = live_engine.create_user(ticked.state, &rng).expect("lu");
+    let (created, iid) = live_engine
+        .create_identity(created.state, &rng, uid, Policy::Classic)
+        .expect("li");
+    let (invited, cid) = live_engine
+        .create_invite(created.state, &rng, uid, iid, 1_800_000_000, None)
+        .expect("linv");
+    let ids = ConversationRef {
+        user_id: uid,
+        identity_id: iid,
+        conversation_id: cid,
+    };
+    let ticket_s = live_engine
+        .ticket_host_string(&invited.state, &ids)
+        .expect("lticket");
+    let poll = live_engine.poll(&invited.state).expect("lp");
+    let channel = poll.write_durable[0].channel.clone();
+    let tag = poll.write_durable[0].tag;
+    let bodies: Vec<_> = poll.write_durable.iter().map(|w| w.body.clone()).collect();
+    let ie = live_engine
+        .tick(EngineState::new(), now)
+        .expect("lie")
+        .state;
+    let (ie_u, ie_uid) = live_engine.create_user(ie, &rng).expect("lieu");
+    let (ie_i, ie_iid) = live_engine
+        .create_identity(ie_u.state, &rng, ie_uid, Policy::Classic)
+        .expect("liei");
+    let (recv, _) = live_engine
+        .receive_ticket(ie_i.state, &rng, ie_uid, ie_iid, &ticket_s)
+        .expect("lrecv");
+    let mut bob = live_engine
+        .ingest_list(recv.state, &rng, channel.clone(), tag, &bodies)
+        .expect("ling")
+        .state;
+    let ada = invited.state;
+    let chain = ada
+        .chains(cid)
+        .expect("lc")
+        .send
+        .get(&ActorId::handshake())
+        .expect("lsend")
+        .clone();
+    let matched = super::super::chain::set_xor_for(&ada.txs, cid);
+    let live_ack = seal_packet(
+        &live_engine.suite,
+        &rng,
+        &eph_mk(live_engine.suite.hmac(), &chain),
+        &PacketPlain::XorAck(PacketXorAck {
+            actor_id: Vec::new(),
+            packet_seq: chain.packet_seq.as_u64(),
+            set_xor: matched,
+        }),
+    )
+    .expect("lseal");
+    bob = live_engine
+        .ingest_ephemeral_packet(bob, &rng, eph.clone(), tag, &live_ack)
+        .expect("live")
+        .state;
+    assert!(bob.chains(cid).expect("c").live_until.is_some());
+    let mut ada = ada;
+    ada.txs.insert(
+        Tag::from_bytes([0xcd; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 2,
+                counter: 0,
+            },
+            payload: TxPayload::Reject,
+        },
+    );
+    let mismatched = super::super::chain::set_xor_for(&ada.txs, cid);
+    let probe = seal_packet(
+        &live_engine.suite,
+        &rng,
+        &eph_mk(live_engine.suite.hmac(), &chain),
+        &PacketPlain::XorAck(PacketXorAck {
+            actor_id: Vec::new(),
+            packet_seq: chain.packet_seq.as_u64(),
+            set_xor: mismatched,
+        }),
+    )
+    .expect("pseal");
+    let durable_before = bob.writes.len();
+    bob = live_engine
+        .ingest_ephemeral_packet(bob, &rng, eph.clone(), tag, &probe)
+        .expect("probe")
+        .state;
+    assert!(!bob.eph_writes.is_empty());
+    assert_eq!(bob.writes.len(), durable_before);
+    let early = live_engine.tick(bob.clone(), now + 2).expect("early").state;
+    assert_eq!(early.writes.len(), durable_before);
+    let later = live_engine.tick(early, now + 3).expect("later").state;
+    assert!(later.writes.len() > durable_before);
+    let origin = super::super::chain::join(
+        live_engine.suite.hmac(),
+        ada.ticket(cid).expect("t").secret.as_bytes(),
+        ConversationSort::HandshakeDm,
+        &[],
+    )
+    .expect("origin");
+    let opened = open_skip_ahead(
+        &live_engine.suite,
+        &origin,
+        &[],
+        now,
+        &later.writes[durable_before].body,
+    );
+    assert!(opened.is_ok());
+    let stale = PacketPlain::HealWant(super::super::payload::PacketHealWant {
+        actor_id: Vec::new(),
+        packet_seq: 0,
+        lo: Tag::from_bytes([0; 32]),
+        hi: Tag::from_bytes([0xff; 32]),
+        ids: vec![Tag::from_bytes([1; 32]); 33],
+    });
+    live_engine
+        .on_heal_packet(&mut bob, &rng, cid, &stale)
+        .expect("ignore");
+    let typing = PacketPlain::Typing(super::super::payload::PacketTyping {
+        actor_id: Vec::new(),
+        packet_seq: 0,
+        conversation_id: cid,
+        composing: true,
+    });
+    let typed = seal_packet(
+        &live_engine.suite,
+        &rng,
+        &eph_mk(live_engine.suite.hmac(), &chain),
+        &typing,
+    )
+    .expect("type");
+    bob = live_engine
+        .ingest_ephemeral_packet(bob, &rng, eph.clone(), tag, &typed)
+        .expect("typed")
+        .state;
+    let lone = Tag::from_bytes([0x11; 32]);
+    let mut hi = *lone.as_bytes();
+    hi[31] = hi[31].wrapping_add(1);
+    let half = PacketPlain::HealHalfXor(super::super::payload::PacketHealHalfXor {
+        actor_id: Vec::new(),
+        packet_seq: 0,
+        lo: lone,
+        hi: Tag::from_bytes(hi),
+        xor: lone,
+    });
+    live_engine
+        .on_heal_packet(&mut bob, &rng, cid, &half)
+        .expect("want-one");
+    let empty = PacketPlain::HealHalfXor(super::super::payload::PacketHealHalfXor {
+        actor_id: Vec::new(),
+        packet_seq: 0,
+        lo: Tag::from_bytes([0x22; 32]),
+        hi: Tag::from_bytes([0x22; 32]),
+        xor: Tag::from_bytes([1; 32]),
+    });
+    live_engine
+        .on_heal_packet(&mut bob, &rng, cid, &empty)
+        .expect("unsplittable");
+    live_engine
+        .on_heal_packet(&mut bob, &rng, cid, &typing)
+        .expect("other");
+    bob.chains_mut(cid).expect("c").heal.needs_reseal = true;
+    bob.chains_mut(cid).expect("c").heal.on_ephemeral = true;
+    bob.chains_mut(cid).expect("c").heal.ready.clear();
+    live_engine.reseal_due(&mut bob, &rng).expect("reseal");
+    let mut moving = bob.clone();
+    moving.chains_mut(cid).expect("c").heal.on_ephemeral = true;
+    moving.chains_mut(cid).expect("c").heal.sent_at = Some(
+        crate::protocol::v1::UnixSeconds::from_u64(now.saturating_sub(3)),
+    );
+    moving
+        .chains_mut(cid)
+        .expect("c")
+        .heal
+        .probes
+        .push(super::state::HealProbe::Half {
+            lo: Tag::from_bytes([0; 32]),
+            hi: Tag::from_bytes([0xff; 32]),
+        });
+    let notice = *ada
+        .txs
+        .iter()
+        .find(|(_, body)| body.conversation_id == cid)
+        .expect("tx")
+        .0;
+    live_engine
+        .write_chain_packets(
+            &mut moving,
+            &rng,
+            cid,
+            ConversationSort::HandshakeDm,
+            std::slice::from_ref(&channel),
+            tag,
+            notice,
+            ActorId::handshake(),
+            false,
+        )
+        .expect("move");
+    live_engine.flush_heal(&mut EngineState::new());
+    live_engine
+        .reseal_heal(&mut EngineState::new(), &rng, cid)
+        .expect("unticked");
+    let have_many = PacketPlain::HealHave(super::super::payload::PacketHealHave {
+        actor_id: Vec::new(),
+        packet_seq: 0,
+        lo: Tag::from_bytes([0; 32]),
+        hi: Tag::from_bytes([0xff; 32]),
+        ids: vec![Tag::from_bytes([1; 32]); 33],
+    });
+    live_engine
+        .on_heal_packet(&mut bob, &rng, cid, &have_many)
+        .expect("many");
+    let known = *bob
+        .txs
+        .iter()
+        .find(|(_, body)| body.conversation_id == cid)
+        .expect("known")
+        .0;
+    let have_known = PacketPlain::HealHave(super::super::payload::PacketHealHave {
+        actor_id: Vec::new(),
+        packet_seq: 0,
+        lo: Tag::from_bytes([0; 32]),
+        hi: Tag::from_bytes([0xff; 32]),
+        ids: vec![known],
+    });
+    live_engine
+        .on_heal_packet(&mut bob, &rng, cid, &have_known)
+        .expect("held");
+    live_engine
+        .observe_ephemeral(
+            &mut bob,
+            &rng,
+            cid,
+            crate::protocol::v1::UnixSeconds::from_u64(now),
+            &half,
+        )
+        .expect("eph-heal");
+    live_engine
+        .note_set_xor(&mut bob, &rng, cid, Tag::from_bytes([7; 32]))
+        .expect("again");
+    let orphan = ConversationId::from_bytes([0x77; 32]);
+    bob.put_dm(
+        ie_uid,
+        ie_iid,
+        orphan,
+        super::state::IdentityNode::direct(Secret::from_bytes([1; 32]), cid),
+    );
+    live_engine
+        .note_set_xor(&mut bob, &rng, orphan, Tag::from_bytes([8; 32]))
+        .expect("no-ticket");
+    bob.chains_mut(orphan).expect("o").heal.probes.clear();
+    bob.chains_mut(orphan).expect("o").heal.needs_reseal = true;
+    bob.chains_mut(orphan).expect("o").heal.on_ephemeral = true;
+    live_engine
+        .reseal_due(&mut bob, &rng)
+        .expect("empty-probes");
+    let sync_cid = ConversationId::from_bytes([0x66; 32]);
+    let ticket = bob.ticket(cid).expect("ticket").clone();
+    bob.put_sync_invitee(
+        sync_cid,
+        super::party::InviteePhase::TicketReceived {
+            ticket: ticket.clone(),
+            list_from: crate::protocol::v1::TimeBin::from_u64(1),
+        },
+    );
+    live_engine
+        .note_set_xor(&mut bob, &rng, sync_cid, Tag::from_bytes([9; 32]))
+        .expect("sync-sort");
+    let mut bare = ticket.clone();
+    bare.persistents.clear();
+    let bare_cid = ConversationId::from_bytes([0x55; 32]);
+    bob.put_sync_invitee(
+        bare_cid,
+        super::party::InviteePhase::TicketReceived {
+            ticket: bare,
+            list_from: crate::protocol::v1::TimeBin::from_u64(1),
+        },
+    );
+    let held = Tag::from_bytes([0x44; 32]);
+    bob.txs.insert(
+        held,
+        DurableBody {
+            conversation_id: bare_cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Confirm,
+        },
+    );
+    live_engine
+        .on_heal_packet(
+            &mut bob,
+            &rng,
+            bare_cid,
+            &PacketPlain::HealWant(super::super::payload::PacketHealWant {
+                actor_id: Vec::new(),
+                packet_seq: 0,
+                lo: Tag::from_bytes([0; 32]),
+                hi: Tag::from_bytes([0xff; 32]),
+                ids: vec![held],
+            }),
+        )
+        .expect("empty-ch");
+    let mut gap = bob.clone();
+    gap.ticked = Some(crate::protocol::v1::UnixSeconds::from_u64(now + 9));
+    {
+        let chains = gap.chains_mut(cid).expect("g");
+        chains.heal.on_ephemeral = true;
+        chains.heal.fell_back = false;
+        chains.heal.sent_at = Some(crate::protocol::v1::UnixSeconds::from_u64(1));
+        chains.heal.ready = vec![vec![1, 2, 3]];
+        chains.heal.sealed_from = None;
+    }
+    live_engine.flush_heal(&mut gap);
+    {
+        let chains = gap.chains_mut(cid).expect("g2");
+        let origin = super::super::chain::join(
+            live_engine.suite.hmac(),
+            ticket.secret.as_bytes(),
+            ConversationSort::HandshakeDm,
+            &[],
+        )
+        .expect("j");
+        chains.heal.on_ephemeral = true;
+        chains.heal.fell_back = false;
+        chains.heal.sent_at = Some(crate::protocol::v1::UnixSeconds::from_u64(1));
+        chains.heal.ready = vec![vec![9]];
+        chains.heal.sealed_from = Some(origin.clone());
+        chains.heal.sealed_to = Some(origin.clone());
+        chains.send.insert(ActorId::handshake(), origin);
+    }
+    live_engine.flush_heal(&mut gap);
+    live_engine
+        .reseal_heal(&mut bob, &rng, ConversationId::from_bytes([0x01; 32]))
+        .expect("not-due");
+    bob.chains_mut(cid).expect("c").heal.probes.clear();
+    bob.chains_mut(cid).expect("c").heal.needs_reseal = true;
+    bob.chains_mut(cid).expect("c").heal.on_ephemeral = true;
+    live_engine.reseal_due(&mut bob, &rng).expect("no-probes");
+    let sync_tx = Tag::from_bytes([0x42; 32]);
+    bob.txs.insert(
+        sync_tx,
+        DurableBody {
+            conversation_id: sync_cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Confirm,
+        },
+    );
+    live_engine
+        .on_heal_packet(
+            &mut bob,
+            &rng,
+            sync_cid,
+            &PacketPlain::HealWant(super::super::payload::PacketHealWant {
+                actor_id: Vec::new(),
+                packet_seq: 0,
+                lo: Tag::from_bytes([0; 32]),
+                hi: Tag::from_bytes([0xff; 32]),
+                ids: vec![sync_tx],
+            }),
+        )
+        .expect("sync-ret");
+    let start = bob
+        .chains(cid)
+        .expect("c")
+        .recv
+        .get(&ActorId::handshake())
+        .expect("recv")
+        .clone();
+    let text = DurableBody {
+        conversation_id: cid,
+        hlc: Hlc {
+            wall_ms: 3,
+            counter: 0,
+        },
+        payload: TxPayload::Text(super::super::payload::TxText {
+            body: "z".repeat(6_000),
+            reply_to: None,
+            expire_at: None,
+        }),
+    };
+    let tx = Tag::from_bytes([0xee; 32]);
+    let xor = super::super::chain::set_xor_for(&bob.txs, cid);
+    let packed = super::super::chain::packed_tx(&live_engine.suite, &text);
+    let frags = super::super::chain::fragment_body(
+        &live_engine.suite,
+        &packed,
+        tx,
+        xor,
+        start.packet_seq.as_u64(),
+        &[],
+    )
+    .expect("frags");
+    assert!(frags.len() > 1);
+    let mut cursor = start;
+    let mut sealed = Vec::new();
+    for frag in &frags {
+        let body = seal_packet(
+            &live_engine.suite,
+            &rng,
+            &mk(live_engine.suite.hmac(), &cursor),
+            frag,
+        )
+        .expect("sfrag");
+        sealed.push((matches!(frag, PacketPlain::TxFragMore(_)), body));
+        cursor = super::super::chain::step(live_engine.suite.hmac(), &cursor);
+    }
+    let last = sealed
+        .iter()
+        .find(|(more, _)| !more)
+        .expect("last")
+        .1
+        .clone();
+    bob = live_engine
+        .ingest_packet(bob, &rng, channel.clone(), tag, &last)
+        .expect("last-first")
+        .state;
+    for (more, body) in &sealed {
+        if *more {
+            bob = live_engine
+                .ingest_packet(bob, &rng, channel.clone(), tag, body)
+                .expect("more")
+                .state;
+        }
+    }
+    bob = live_engine
+        .ingest_packet(bob, &rng, channel.clone(), tag, &last)
+        .expect("last-again")
+        .state;
+    for (more, body) in &sealed {
+        if *more {
+            bob = live_engine
+                .ingest_packet(bob, &rng, channel.clone(), tag, body)
+                .expect("more-again")
+                .state;
+        }
+    }
+}
