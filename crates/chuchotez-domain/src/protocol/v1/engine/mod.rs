@@ -9,6 +9,7 @@ mod party;
 mod persist;
 mod poll;
 mod query;
+mod ratchet;
 mod session;
 mod state;
 mod vault;

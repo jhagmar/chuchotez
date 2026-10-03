@@ -491,13 +491,17 @@ impl Argon2id for EchoArgon {
 }
 
 pub(crate) fn test_suite() -> Suite {
+    suite_with_kem(Arc::new(EchoKem))
+}
+
+pub(crate) fn suite_with_kem(kem: Arc<dyn Kem + Send + Sync>) -> Suite {
     Suite::new(
         Arc::new(XorHmac),
         Arc::new(IdentityCompress),
         Arc::new(HexB64),
         Arc::new(XorAead),
         Arc::new(DetJson),
-        Arc::new(EchoKem),
+        kem,
         Arc::new(EchoSign),
         Arc::new(XorHash),
         Arc::new(EchoArgon),

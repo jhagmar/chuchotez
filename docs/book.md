@@ -89,7 +89,13 @@ conversations on the device. Query `Conversation` is a projection of that
 phase. `WrongPhase` when a
 persist seq's tx is outside the watermark. Fold MAY omit txs with
 `expire_at` ≤ ticked now. Reload is `apply_folded` then `apply` of remaining
-persist records.
+persist records. When 50 durable packets have been sent since the last
+`TxAdvertise`, `TxWrap`, or `TxAck`, the next send mints the one still owed.
+Wrap uses an `encaps_pk` whose advertise tx is in the watermark. A shared
+enters the mix FIFO after a watermarked `ratchet_ack` of that `kem_ct`. Every
+8th durable packet mixes when that FIFO holds 8 agreed shareds; otherwise
+`packet_seq` increments on the current epoch. At most 8 unused advertised
+secret keys are kept.
 
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.

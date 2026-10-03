@@ -5887,3 +5887,930 @@ fn fold_tree_phases_and_parse_errors() {
         .is_err()
     );
 }
+
+#[test]
+fn advertise_wrap_ack_and_mix() {
+    use super::super::chain::{mix, mk, seal_packet};
+    use super::super::payload::{ConversationSort, PacketPlain, PacketXorAck};
+    use super::state::{IdentityNode, KnownShared, UnusedSk};
+    use crate::protocol::v1::fixtures::suite_with_kem;
+    use crate::protocol::v1::kem::Kem;
+    use crate::protocol::v1::{ActorId, KemError, PacketEpoch, PacketSeq, Tag};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    struct BoomKem;
+    impl Kem for BoomKem {
+        fn generate(
+            &self,
+            _policy: Policy,
+            _seed: &crate::protocol::v1::KemSeed,
+        ) -> Result<crate::protocol::v1::KeyPair, KemError> {
+            Err(KemError::KeyGen)
+        }
+        fn wrap(
+            &self,
+            _policy: Policy,
+            _pk: &[u8],
+            _seed: &crate::protocol::v1::KemSeed,
+        ) -> Result<(Vec<u8>, Vec<u8>), KemError> {
+            Err(KemError::Wrap)
+        }
+        fn unwrap(&self, _policy: Policy, _sk: &[u8], _ct: &[u8]) -> Result<Vec<u8>, KemError> {
+            Err(KemError::Wrap)
+        }
+    }
+    struct ShortWrap;
+    impl Kem for ShortWrap {
+        fn generate(
+            &self,
+            policy: Policy,
+            seed: &crate::protocol::v1::KemSeed,
+        ) -> Result<crate::protocol::v1::KeyPair, KemError> {
+            crate::protocol::v1::fixtures::EchoKem.generate(policy, seed)
+        }
+        fn wrap(
+            &self,
+            _policy: Policy,
+            _pk: &[u8],
+            _seed: &crate::protocol::v1::KemSeed,
+        ) -> Result<(Vec<u8>, Vec<u8>), KemError> {
+            Ok((vec![1], vec![1; 32]))
+        }
+        fn unwrap(&self, policy: Policy, sk: &[u8], ct: &[u8]) -> Result<Vec<u8>, KemError> {
+            crate::protocol::v1::fixtures::EchoKem.unwrap(policy, sk, ct)
+        }
+    }
+
+    let _ = BoomKem.unwrap(Policy::Classic, &[], &[]);
+    let _ = ShortWrap.wrap(
+        Policy::Classic,
+        &[],
+        &crate::protocol::v1::KemSeed::from_bytes([1; 64]),
+    );
+    let _ = ShortWrap.unwrap(Policy::Classic, &[], &[1; 32]);
+
+    let mut engine = test_engine();
+    let rng = CounterRng::new();
+    engine
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("wrap");
+    let ticked = engine
+        .tick(EngineState::new(), 1_700_000_000)
+        .expect("tick");
+    let (created, uid) = engine.create_user(ticked.state, &rng).expect("user");
+    let (created, iid) = engine
+        .create_identity(created.state, &rng, uid, Policy::Classic)
+        .expect("id");
+    let (invited, cid) = engine
+        .create_invite(created.state, &rng, uid, iid, 1_800_000_000, None)
+        .expect("inv");
+    let notice_tx = *invited
+        .state
+        .txs
+        .iter()
+        .find(|(_, body)| matches!(body.payload, TxPayload::Notice(_)))
+        .expect("notice")
+        .0;
+    let secret = invited.state.ticket(cid).expect("ticket").secret;
+    let poll = engine.poll(&invited.state).expect("poll");
+    let channel = poll.write_durable[0].channel.clone();
+    let tag = poll.write_durable[0].tag;
+
+    let mut owed = invited.state.clone();
+    owed.chains_mut(cid).expect("chains").ratchet.since = 50;
+    engine
+        .post_handshake_packets(&mut owed, &rng, cid, &secret, notice_tx)
+        .expect("adv");
+    assert!(
+        owed.txs
+            .values()
+            .any(|body| matches!(body.payload, TxPayload::Advertise { .. }))
+    );
+    assert_eq!(owed.chains(cid).expect("c").ratchet.unused.len(), 1);
+    assert!(owed.chains(cid).expect("c").ratchet.since < 50);
+
+    let mut full = owed.clone();
+    {
+        let chains = full.chains_mut(cid).expect("chains");
+        chains.ratchet.unused.clear();
+        for i in 0..8u8 {
+            let id = Tag::from_bytes([i; 32]);
+            chains.ratchet.minted.insert(id);
+            chains.ratchet.unused.push(UnusedSk {
+                tx_id: id,
+                pk: vec![i],
+                sk: vec![i],
+            });
+        }
+        chains.ratchet.since = 50;
+    }
+    engine
+        .post_handshake_packets(&mut full, &rng, cid, &secret, notice_tx)
+        .expect("drop");
+    let unused = &full.chains(cid).expect("c").ratchet.unused;
+    assert_eq!(unused.len(), 8);
+    assert!(unused.iter().all(|sk| sk.tx_id != Tag::from_bytes([0; 32])));
+
+    let mut acks = invited.state.clone();
+    let peer_pk = vec![7u8; 32];
+    let ad_tx = Tag::from_bytes([0x51; 32]);
+    acks.txs.insert(
+        ad_tx,
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Advertise {
+                encaps_pk: peer_pk.clone(),
+            },
+        },
+    );
+    acks.chains_mut(cid).expect("c").ratchet.since = 50;
+    engine
+        .post_handshake_packets(&mut acks, &rng, cid, &secret, notice_tx)
+        .expect("ackad");
+    let pk_hash = Tag::from_bytes(engine.suite.hash().hash(&peer_pk));
+    assert!(acks.txs.values().any(|body| matches!(
+        &body.payload,
+        TxPayload::Ack { ratchet_ack } if *ratchet_ack == pk_hash
+    )));
+    acks.chains_mut(cid).expect("c").ratchet.since = 50;
+    engine
+        .post_handshake_packets(&mut acks, &rng, cid, &secret, notice_tx)
+        .expect("wrap");
+    assert!(
+        acks.chains(cid)
+            .expect("c")
+            .ratchet
+            .known
+            .iter()
+            .any(|row| row.from_us && row.encaps_pk == peer_pk)
+    );
+
+    let mut peer_wrap = invited.state.clone();
+    let sk_tx = Tag::from_bytes([0x41; 32]);
+    {
+        let chains = peer_wrap.chains_mut(cid).expect("c");
+        chains.ratchet.minted.insert(sk_tx);
+        chains.ratchet.unused.push(UnusedSk {
+            tx_id: sk_tx,
+            pk: vec![9; 32],
+            sk: vec![9; 32],
+        });
+        chains.ratchet.known.push(KnownShared {
+            wrap_tx: Tag::from_bytes([0x39; 32]),
+            shared: Secret::from_bytes([1; 32]),
+            ct_hash: Tag::from_bytes([0x38; 32]),
+            from_us: true,
+            encaps_pk: vec![1; 32],
+        });
+        chains.ratchet.since = 50;
+    }
+    let ct = vec![3u8; 32];
+    peer_wrap.txs.insert(
+        Tag::from_bytes([0x50; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Wrap { kem_ct: ct },
+        },
+    );
+    peer_wrap.txs.insert(
+        Tag::from_bytes([0x43; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Wrap { kem_ct: vec![1] },
+        },
+    );
+    let mut reject = vec![0u8; 32];
+    reject[0] = 0xee;
+    reject[1] = 0xfd;
+    peer_wrap.txs.insert(
+        Tag::from_bytes([0x30; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Wrap { kem_ct: reject },
+        },
+    );
+    let mut short_ss = vec![0u8; 32];
+    short_ss[0] = 0xee;
+    short_ss[1] = 0xfe;
+    peer_wrap.txs.insert(
+        Tag::from_bytes([0x31; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Wrap { kem_ct: short_ss },
+        },
+    );
+    engine
+        .post_handshake_packets(&mut peer_wrap, &rng, cid, &secret, notice_tx)
+        .expect("ackwrap");
+    assert!(
+        peer_wrap
+            .chains(cid)
+            .expect("c")
+            .ratchet
+            .known
+            .iter()
+            .any(|row| !row.from_us)
+    );
+    assert!(
+        peer_wrap
+            .txs
+            .values()
+            .any(|body| matches!(body.payload, TxPayload::Ack { .. }))
+    );
+    let mut skipped_ack = invited.state.clone();
+    let wrap_a = Tag::from_bytes([0x21; 32]);
+    let wrap_b = Tag::from_bytes([0x22; 32]);
+    let ack_a = Tag::from_bytes([0x23; 32]);
+    let hash_a = Tag::from_bytes([0x24; 32]);
+    let hash_b = Tag::from_bytes([0x25; 32]);
+    {
+        let chains = skipped_ack.chains_mut(cid).expect("c");
+        chains.ratchet.known.push(KnownShared {
+            wrap_tx: wrap_a,
+            shared: Secret::from_bytes([2; 32]),
+            ct_hash: hash_a,
+            from_us: false,
+            encaps_pk: Vec::new(),
+        });
+        chains.ratchet.known.push(KnownShared {
+            wrap_tx: wrap_b,
+            shared: Secret::from_bytes([3; 32]),
+            ct_hash: hash_b,
+            from_us: false,
+            encaps_pk: Vec::new(),
+        });
+        chains.ratchet.since = 50;
+        chains.last_acks.insert(
+            ActorId::handshake(),
+            BTreeSet::from([wrap_a, wrap_b, ack_a]),
+        );
+    }
+    for (id, payload) in [
+        (
+            wrap_a,
+            TxPayload::Wrap {
+                kem_ct: vec![2; 32],
+            },
+        ),
+        (
+            wrap_b,
+            TxPayload::Wrap {
+                kem_ct: vec![3; 32],
+            },
+        ),
+        (
+            ack_a,
+            TxPayload::Ack {
+                ratchet_ack: hash_a,
+            },
+        ),
+        (
+            Tag::from_bytes([0x26; 32]),
+            TxPayload::Ack {
+                ratchet_ack: hash_b,
+            },
+        ),
+    ] {
+        skipped_ack.txs.insert(
+            id,
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload,
+            },
+        );
+    }
+    engine
+        .post_handshake_packets(&mut skipped_ack, &rng, cid, &secret, notice_tx)
+        .expect("skipack");
+
+    let mut quiet = invited.state.clone();
+    quiet.txs.get_mut(&notice_tx).expect("n").payload = TxPayload::Confirm;
+    quiet.chains_mut(cid).expect("c").ratchet.since = 50;
+    engine
+        .post_handshake_packets(&mut quiet, &rng, cid, &secret, notice_tx)
+        .expect("identity-policy");
+    assert!(
+        quiet
+            .txs
+            .values()
+            .any(|body| matches!(body.payload, TxPayload::Advertise { .. }))
+    );
+    let child = ConversationId::from_bytes([8; 32]);
+    quiet.put_dm(
+        uid,
+        iid,
+        child,
+        IdentityNode::direct(Secret::from_bytes([1; 32]), cid),
+    );
+    let sync_child = ConversationId::from_bytes([3; 32]);
+    quiet.put_sync(
+        sync_child,
+        super::state::DeviceNode::sync(Secret::from_bytes([2; 32]), cid),
+    );
+    assert_eq!(quiet.established_parent(sync_child), Some(cid));
+    let _ = format!("{:?}", quiet.chains(cid).expect("c").ratchet);
+    assert_eq!(
+        super::ratchet::conversation_policy(&quiet, ConversationId::from_bytes([9; 32])),
+        None
+    );
+    assert_eq!(
+        super::ratchet::conversation_policy(&quiet, child),
+        Some(Policy::Classic)
+    );
+    let sync_cid = ConversationId::from_bytes([4; 32]);
+    let ticket = quiet.ticket(cid).expect("t").clone();
+    quiet.put_sync_invitee(
+        sync_cid,
+        super::party::InviteePhase::TicketReceived {
+            ticket: ticket.clone(),
+            list_from: crate::protocol::v1::TimeBin::from_u64(1),
+        },
+    );
+    assert!(super::ratchet::conversation_policy(&quiet, sync_cid).is_none());
+    let sync_tx = Tag::from_bytes([0x11; 32]);
+    quiet.txs.insert(
+        sync_tx,
+        DurableBody {
+            conversation_id: sync_cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Confirm,
+        },
+    );
+    quiet.chains_mut(sync_cid).expect("sc").ratchet.since = 50;
+    let sync_len = quiet.txs.len();
+    engine
+        .post_handshake_packets(&mut quiet, &rng, sync_cid, &ticket.secret, sync_tx)
+        .expect("sync-none");
+    assert_eq!(quiet.txs.len(), sync_len);
+    let notice = invited
+        .state
+        .txs
+        .get(&notice_tx)
+        .expect("orig")
+        .payload
+        .clone();
+    quiet.txs.get_mut(&notice_tx).expect("n").payload = notice;
+    assert_eq!(
+        super::ratchet::conversation_policy(&quiet, child),
+        Some(Policy::Classic)
+    );
+
+    let mut hidden = invited.state.clone();
+    hidden.txs.insert(
+        Tag::from_bytes([0x52; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Advertise {
+                encaps_pk: vec![4; 32],
+            },
+        },
+    );
+    hidden
+        .chains_mut(cid)
+        .expect("c")
+        .last_acks
+        .insert(ActorId::handshake(), BTreeSet::from([notice_tx]));
+    hidden.chains_mut(cid).expect("c").ratchet.since = 50;
+    let ads_before = hidden
+        .txs
+        .values()
+        .filter(|body| matches!(body.payload, TxPayload::Advertise { .. }))
+        .count();
+    engine
+        .post_handshake_packets(&mut hidden, &rng, cid, &secret, notice_tx)
+        .expect("hidden");
+    let ads_after = hidden
+        .txs
+        .values()
+        .filter(|body| matches!(body.payload, TxPayload::Advertise { .. }))
+        .count();
+    assert!(ads_after > ads_before);
+    assert!(hidden.chains(cid).expect("c").ratchet.known.is_empty());
+
+    let mut mix_state = invited.state.clone();
+    {
+        let chains = mix_state.chains_mut(cid).expect("c");
+        let mut chain = chains
+            .send
+            .get(&ActorId::handshake())
+            .expect("send")
+            .clone();
+        chain.packet_seq = PacketSeq::from_u64(8);
+        chains.send.insert(ActorId::handshake(), chain);
+        for i in 0..8u8 {
+            chains.ratchet.known.push(KnownShared {
+                wrap_tx: Tag::from_bytes([0x60 + i; 32]),
+                shared: Secret::from_bytes([i; 32]),
+                ct_hash: Tag::from_bytes([0x70 + i; 32]),
+                from_us: true,
+                encaps_pk: Vec::new(),
+            });
+        }
+    }
+    for i in 0..8u8 {
+        let wrap_tx = Tag::from_bytes([0x60 + i; 32]);
+        let ct_hash = Tag::from_bytes([0x70 + i; 32]);
+        mix_state.txs.insert(
+            wrap_tx,
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Wrap {
+                    kem_ct: vec![i; 32],
+                },
+            },
+        );
+        mix_state.txs.insert(
+            Tag::from_bytes([0x80 + i; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Ack {
+                    ratchet_ack: ct_hash,
+                },
+            },
+        );
+    }
+    engine
+        .post_handshake_packets(&mut mix_state, &rng, cid, &secret, notice_tx)
+        .expect("mix");
+    let mixed_chain = mix_state
+        .chains(cid)
+        .expect("c")
+        .send
+        .get(&ActorId::handshake())
+        .expect("send")
+        .clone();
+    assert_eq!(mixed_chain.epoch, PacketEpoch::from_u64(1));
+
+    let mut few = invited.state.clone();
+    {
+        let chains = few.chains_mut(cid).expect("c");
+        let mut chain = chains
+            .send
+            .get(&ActorId::handshake())
+            .expect("send")
+            .clone();
+        chain.packet_seq = PacketSeq::from_u64(8);
+        chains.send.insert(ActorId::handshake(), chain);
+        chains.ratchet.known.push(KnownShared {
+            wrap_tx: Tag::from_bytes([0x91; 32]),
+            shared: Secret::from_bytes([9; 32]),
+            ct_hash: Tag::from_bytes([0x92; 32]),
+            from_us: true,
+            encaps_pk: Vec::new(),
+        });
+    }
+    few.txs.insert(
+        Tag::from_bytes([0x91; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Wrap {
+                kem_ct: vec![9; 32],
+            },
+        },
+    );
+    few.txs.insert(
+        Tag::from_bytes([0x93; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Ack {
+                ratchet_ack: Tag::from_bytes([0x92; 32]),
+            },
+        },
+    );
+    engine
+        .post_handshake_packets(&mut few, &rng, cid, &secret, notice_tx)
+        .expect("nomix");
+    assert_eq!(
+        few.chains(cid)
+            .expect("c")
+            .send
+            .get(&ActorId::handshake())
+            .expect("send")
+            .epoch,
+        PacketEpoch::from_u64(0)
+    );
+
+    let mut recv_state = invited.state.clone();
+    let start = {
+        let chains = recv_state.chains_mut(cid).expect("c");
+        let mut chain = chains
+            .send
+            .get(&ActorId::handshake())
+            .expect("send")
+            .clone();
+        chain.packet_seq = PacketSeq::from_u64(8);
+        chains.recv.insert(ActorId::handshake(), chain.clone());
+        for i in 0..8u8 {
+            let wrap_tx = Tag::from_bytes([0x60 + i; 32]);
+            let ct_hash = Tag::from_bytes([0x70 + i; 32]);
+            chains.ratchet.known.push(KnownShared {
+                wrap_tx,
+                shared: Secret::from_bytes([i; 32]),
+                ct_hash,
+                from_us: false,
+                encaps_pk: Vec::new(),
+            });
+        }
+        chain
+    };
+    for i in 0..8u8 {
+        let wrap_tx = Tag::from_bytes([0x60 + i; 32]);
+        let ct_hash = Tag::from_bytes([0x70 + i; 32]);
+        recv_state.txs.insert(
+            wrap_tx,
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Wrap {
+                    kem_ct: vec![i; 32],
+                },
+            },
+        );
+        recv_state.txs.insert(
+            Tag::from_bytes([0xa0 + i; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Ack {
+                    ratchet_ack: ct_hash,
+                },
+            },
+        );
+    }
+    let mixed = mix(
+        engine.suite.hmac(),
+        &start,
+        ConversationSort::HandshakeDm,
+        &[0; 32],
+    )
+    .expect("mx");
+    let body = seal_packet(
+        &engine.suite,
+        &rng,
+        &mk(engine.suite.hmac(), &mixed),
+        &PacketPlain::XorAck(PacketXorAck {
+            actor_id: Vec::new(),
+            packet_seq: 0,
+            set_xor: Tag::from_bytes([3; 32]),
+        }),
+    )
+    .expect("seal");
+    let opened = engine
+        .ingest_packet(recv_state, &rng, channel, tag, &body)
+        .expect("recv-mix");
+    assert_eq!(
+        opened
+            .state
+            .chains(cid)
+            .expect("c")
+            .recv
+            .get(&ActorId::handshake())
+            .expect("recv")
+            .epoch,
+        PacketEpoch::from_u64(1)
+    );
+
+    let mut folded = invited.state.clone();
+    {
+        let chains = folded.chains_mut(cid).expect("c");
+        chains.ratchet.since = 4;
+        let id = Tag::from_bytes([1; 32]);
+        chains.ratchet.minted.insert(id);
+        chains.ratchet.unused.push(UnusedSk {
+            tx_id: id,
+            pk: vec![1],
+            sk: vec![2],
+        });
+        chains.ratchet.known.push(KnownShared {
+            wrap_tx: Tag::from_bytes([2; 32]),
+            shared: Secret::from_bytes([3; 32]),
+            ct_hash: Tag::from_bytes([4; 32]),
+            from_us: true,
+            encaps_pk: vec![5],
+        });
+        chains.skipped_mks.insert(
+            ActorId::handshake(),
+            vec![super::super::chain::CachedMk {
+                mk: [6; 32],
+                expires_at: UnixSeconds::from_u64(9),
+                tx_id: None,
+            }],
+        );
+    }
+    folded.cover_last_acks();
+    let snap = engine.fold(folded).expect("fold");
+    let back = engine.apply_folded(&snap.snapshot).expect("apply");
+    assert_eq!(back.chains(cid).expect("c").ratchet.since, 4);
+    assert_eq!(back.chains(cid).expect("c").ratchet.unused.len(), 1);
+    assert_eq!(back.chains(cid).expect("c").ratchet.known.len(), 1);
+    let bare = super::super::chain::join(
+        engine.suite.hmac(),
+        secret.as_bytes(),
+        ConversationSort::HandshakeDm,
+        &[],
+    )
+    .expect("bare");
+    let mut late = bare.clone();
+    late.packet_seq = PacketSeq::from_u64(8);
+    assert!(
+        engine
+            .mixed_chain(
+                &EngineState::new(),
+                cid,
+                ConversationSort::HandshakeDm,
+                &late,
+                true
+            )
+            .is_none()
+    );
+
+    let mut boom = Engine::new(suite_with_kem(Arc::new(BoomKem)), engine.defaults().clone());
+    boom.wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("bwrap");
+    let mut boom_state = invited.state.clone();
+    let peer = vec![6u8; 32];
+    let peer_hash = Tag::from_bytes(engine.suite.hash().hash(&peer));
+    boom_state.txs.insert(
+        Tag::from_bytes([0x55; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Advertise { encaps_pk: peer },
+        },
+    );
+    boom_state.txs.insert(
+        Tag::from_bytes([0x56; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Ack {
+                ratchet_ack: peer_hash,
+            },
+        },
+    );
+    boom_state.chains_mut(cid).expect("c").ratchet.since = 50;
+    let boom_len = boom_state.txs.len();
+    boom.post_handshake_packets(&mut boom_state, &rng, cid, &secret, notice_tx)
+        .expect("boom");
+    assert_eq!(boom_state.txs.len(), boom_len);
+
+    let mut short = Engine::new(
+        suite_with_kem(Arc::new(ShortWrap)),
+        engine.defaults().clone(),
+    );
+    short
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("swrap");
+    let mut short_state = invited.state.clone();
+    let old_pk = vec![8u8; 32];
+    let new_pk = vec![9u8; 32];
+    short_state
+        .chains_mut(cid)
+        .expect("c")
+        .ratchet
+        .known
+        .push(KnownShared {
+            wrap_tx: Tag::from_bytes([0x59; 32]),
+            shared: Secret::from_bytes([8; 32]),
+            ct_hash: Tag::from_bytes([0x5a; 32]),
+            from_us: true,
+            encaps_pk: old_pk.clone(),
+        });
+    short_state.txs.insert(
+        Tag::from_bytes([0x57; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Advertise { encaps_pk: old_pk },
+        },
+    );
+    short_state.txs.insert(
+        Tag::from_bytes([0x58; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Ack {
+                ratchet_ack: Tag::from_bytes(engine.suite.hash().hash(&[8u8; 32])),
+            },
+        },
+    );
+    short_state.txs.insert(
+        Tag::from_bytes([0x5b; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Advertise {
+                encaps_pk: new_pk.clone(),
+            },
+        },
+    );
+    short_state.txs.insert(
+        Tag::from_bytes([0x5c; 32]),
+        DurableBody {
+            conversation_id: cid,
+            hlc: Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: TxPayload::Ack {
+                ratchet_ack: Tag::from_bytes(engine.suite.hash().hash(&new_pk)),
+            },
+        },
+    );
+    short_state.chains_mut(cid).expect("c").ratchet.since = 50;
+    let unused_before = short_state.chains(cid).expect("c").ratchet.unused.len();
+    short
+        .post_handshake_packets(&mut short_state, &rng, cid, &secret, notice_tx)
+        .expect("short");
+    assert!(short_state.chains(cid).expect("c").ratchet.unused.len() > unused_before);
+
+    let b64 = engine.suite.b64u();
+    let z = super::super::codec::bstr(b64, &[0u8; 32]);
+    let mut parsed = EngineState::new();
+    let dm = |ratchet: Json| {
+        Json::Array(vec![Json::Object(vec![
+            ("user_id".into(), z.clone()),
+            (
+                "identities".into(),
+                Json::Array(vec![Json::Object(vec![
+                    ("identity_id".into(), z.clone()),
+                    ("name".into(), Json::Null),
+                    ("pic".into(), Json::Null),
+                    (
+                        "conversations".into(),
+                        Json::Array(vec![Json::Object(vec![
+                            ("conversation_id".into(), z.clone()),
+                            (
+                                "direct_message".into(),
+                                Json::Object(vec![
+                                    ("secret".into(), z.clone()),
+                                    ("parent".into(), z.clone()),
+                                ]),
+                            ),
+                            ("ratchet".into(), ratchet),
+                        ])]),
+                    ),
+                ])]),
+            ),
+        ])])
+    };
+    for ratchet in [
+        Json::Number(1),
+        Json::Object(vec![("since".into(), Json::Bool(true))]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Number(1)),
+        ]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Array(vec![Json::Number(1)])),
+        ]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Array(Vec::new())),
+            ("unused".into(), Json::Number(1)),
+        ]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Array(Vec::new())),
+            ("unused".into(), Json::Array(vec![Json::Number(1)])),
+        ]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Array(Vec::new())),
+            ("unused".into(), Json::Array(vec![Json::Object(vec![])])),
+        ]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Array(Vec::new())),
+            ("unused".into(), Json::Array(Vec::new())),
+            ("known".into(), Json::Number(1)),
+        ]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Array(Vec::new())),
+            ("unused".into(), Json::Array(Vec::new())),
+            ("known".into(), Json::Array(vec![Json::Number(1)])),
+        ]),
+        Json::Object(vec![
+            ("since".into(), Json::Number(1)),
+            ("minted".into(), Json::Array(Vec::new())),
+            ("unused".into(), Json::Array(Vec::new())),
+            (
+                "known".into(),
+                Json::Array(vec![Json::Object(vec![(
+                    "from_us".into(),
+                    Json::Number(1),
+                )])]),
+            ),
+        ]),
+    ] {
+        assert!(super::fold_tree::install_users(b64, &mut parsed, &dm(ratchet)).is_err());
+    }
+    struct HugeCompress;
+    impl crate::protocol::v1::Compress for HugeCompress {
+        fn compress(&self, _data: &[u8]) -> Vec<u8> {
+            vec![0; 10_000]
+        }
+        fn decompress(
+            &self,
+            data: &[u8],
+            _limit: usize,
+        ) -> Result<Vec<u8>, crate::protocol::v1::CompressError> {
+            Ok(data.to_vec())
+        }
+    }
+    let _ = crate::protocol::v1::Compress::decompress(&HugeCompress, &[1, 2], 8).expect("dec");
+    let mut huge = Engine::new(
+        crate::protocol::v1::Suite::new(
+            Arc::new(crate::protocol::v1::fixtures::XorHmac),
+            Arc::new(HugeCompress),
+            Arc::new(crate::protocol::v1::fixtures::HexB64),
+            Arc::new(crate::protocol::v1::fixtures::XorAead),
+            Arc::new(crate::protocol::v1::fixtures::DetJson),
+            Arc::new(crate::protocol::v1::fixtures::EchoKem),
+            Arc::new(crate::protocol::v1::fixtures::EchoSign),
+            Arc::new(crate::protocol::v1::fixtures::XorHash),
+            Arc::new(crate::protocol::v1::fixtures::EchoArgon),
+        ),
+        engine.defaults().clone(),
+    );
+    huge.wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("hwrap");
+    let mut huge_state = invited.state.clone();
+    huge_state.chains_mut(cid).expect("c").ratchet.since = 50;
+    assert_eq!(
+        huge.post_handshake_packets(&mut huge_state, &rng, cid, &secret, notice_tx)
+            .unwrap_err(),
+        EngineError::BodyTooLarge
+    );
+}

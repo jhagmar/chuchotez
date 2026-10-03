@@ -1,6 +1,6 @@
 //! Vault wrap, persist records, and mutation.
 
-use super::super::chain::{fragment_body, join, mk, packed_tx, seal_packet, set_xor_for, step};
+use super::super::chain::{join, mk, next_fragment, packed_tx, seal_packet, set_xor_for, step};
 use super::super::codec::{durable_body_to_json, vault_header_to_json};
 use super::super::hmac::{HmacSha256Key, expand};
 use super::super::payload::{
@@ -292,33 +292,73 @@ impl Engine {
             )
             .into_bytes(),
         );
+        let actor = ActorId::handshake();
+        self.absorb_peer_wraps(state, cid);
+        if let Some(owed) = self.mint_if_owed(state, rng, cid, conv_secret)? {
+            self.write_chain_packets(
+                state,
+                rng,
+                cid,
+                sort,
+                &persistents,
+                tag,
+                owed,
+                actor.clone(),
+                false,
+            )?;
+        }
+        self.write_chain_packets(state, rng, cid, sort, &persistents, tag, tx_id, actor, true)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_chain_packets(
+        &self,
+        state: &mut EngineState,
+        rng: &dyn Rng,
+        conversation_id: ConversationId,
+        sort: super::super::payload::ConversationSort,
+        persistents: &[super::super::DurableChannel],
+        tag: Tag,
+        tx_id: Tag,
+        actor: ActorId,
+        count_since: bool,
+    ) -> Result<(), EngineError> {
+        let secret = state
+            .ticket(conversation_id)
+            .map(|t| t.secret)
+            .ok_or(EngineError::UnknownIds)?;
         let body = state
             .txs
             .get(&tx_id)
             .ok_or(EngineError::UnknownIds)?
             .clone();
-        let packed = packed_tx(&self.suite, &body);
+        let mut packed = packed_tx(&self.suite, &body);
         let set_xor = set_xor_for(&state.txs, conversation_id);
-        let actor = ActorId::handshake();
         let mut chain = match state
             .chains(conversation_id)
             .and_then(|c| c.send.get(&actor))
         {
             Some(c) => c.clone(),
-            None => join(self.suite.hmac(), conv_secret.as_bytes(), sort, &[])?,
+            None => join(self.suite.hmac(), secret.as_bytes(), sort, &[])?,
         };
-        let packets = fragment_body(
-            &self.suite,
-            &packed,
-            tx_id,
-            set_xor,
-            chain.packet_seq.as_u64(),
-            &[],
-        )?;
-        for packet in packets {
+        let mut frag_i = 0u64;
+        loop {
+            if let Some(mixed) = self.mixed_chain(state, conversation_id, sort, &chain, true) {
+                chain = mixed;
+            }
+            let (packet, n) = next_fragment(
+                &self.suite,
+                &packed,
+                tx_id,
+                set_xor,
+                chain.packet_seq.as_u64(),
+                frag_i,
+                actor.as_bytes(),
+            )?;
             let mk_bytes = mk(self.suite.hmac(), &chain);
             let sealed = seal_packet(&self.suite, rng, &mk_bytes, &packet)?;
-            for ch in &persistents {
+            for ch in persistents {
                 state.writes.push(DurableWrite {
                     channel: ch.clone(),
                     tag,
@@ -326,6 +366,15 @@ impl Engine {
                 });
             }
             chain = step(self.suite.hmac(), &chain);
+            if count_since {
+                self.note_sent_packet(state, conversation_id);
+            }
+            let finished = matches!(packet, super::super::payload::PacketPlain::TxFragLast(_));
+            packed = packed.get(n..).unwrap_or_default().to_vec();
+            frag_i = frag_i.saturating_add(1);
+            if finished {
+                break;
+            }
         }
         if let Some(chains) = state.chains_mut(conversation_id) {
             chains.send.insert(actor, chain);

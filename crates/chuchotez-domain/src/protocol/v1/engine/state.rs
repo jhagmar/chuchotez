@@ -49,13 +49,55 @@ pub(super) struct HandshakeHit {
     pub(super) tag_key: TagKey,
 }
 
-/// Packet chains, skip-ahead `mk`s, and last Persistent acks for one conversation.
+/// Advertised encaps secret key not yet used to unwrap a wrap.
+#[derive(Clone)]
+pub(super) struct UnusedSk {
+    pub(super) tx_id: Tag,
+    pub(super) pk: Vec<u8>,
+    pub(super) sk: Vec<u8>,
+}
+
+/// Shared secret from a wrap, waiting to mix or already recorded.
+#[derive(Clone)]
+pub(super) struct KnownShared {
+    pub(super) wrap_tx: Tag,
+    pub(super) shared: Secret,
+    pub(super) ct_hash: Tag,
+    pub(super) from_us: bool,
+    pub(super) encaps_pk: Vec<u8>,
+}
+
+/// Advertise, wrap, ack, and mix bookkeeping for one conversation.
+#[derive(Clone, Default)]
+pub(super) struct Ratchet {
+    /// Durable packets sealed since the last advertise, wrap, or ack we minted.
+    pub(super) since: u64,
+    /// Ratchet txs this device minted.
+    pub(super) minted: BTreeSet<Tag>,
+    /// Unused advertised secret keys, oldest first. Length at most 8.
+    pub(super) unused: Vec<UnusedSk>,
+    /// Shared secrets from wraps this device sent or unwrapped.
+    pub(super) known: Vec<KnownShared>,
+}
+
+impl core::fmt::Debug for Ratchet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Ratchet")
+            .field("since", &self.since)
+            .field("unused", &self.unused.len())
+            .field("known", &self.known.len())
+            .finish()
+    }
+}
+
+/// Packet chains, skip-ahead `mk`s, last Persistent acks, and ratchet state.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConversationChains {
     pub(super) send: BTreeMap<ActorId, SendChain>,
     pub(super) recv: BTreeMap<ActorId, SendChain>,
     pub(super) skipped_mks: BTreeMap<ActorId, Vec<CachedMk>>,
     pub(super) last_acks: BTreeMap<ActorId, BTreeSet<Tag>>,
+    pub(super) ratchet: Ratchet,
 }
 
 /// DM conversation row: phase plus packet chains.
@@ -489,6 +531,22 @@ impl EngineState {
             }
         }
         None
+    }
+
+    pub(super) fn established_parent(&self, cid: ConversationId) -> Option<ConversationId> {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                if let Some(IdentityConversation::DirectMessage { parent, .. }) =
+                    ident.conversations.get(&cid).map(|n| &n.kind)
+                {
+                    return Some(*parent);
+                }
+            }
+        }
+        match self.device.conversations.get(&cid).map(|n| &n.kind) {
+            Some(DeviceConversation::Synchronization { parent, .. }) => Some(*parent),
+            _ => None,
+        }
     }
 
     pub(super) fn owner(&self, cid: ConversationId) -> Option<(UserId, IdentityId)> {
