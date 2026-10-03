@@ -1,9 +1,11 @@
 //! Delete, confirm, group, and send.
 
-use super::super::payload::{TxEdit, TxMedia, TxPayload, TxReaction};
+use super::super::hmac::{HmacSha256, HmacSha256Key, expand};
+use super::super::payload::{PACKET_NONCE_LEN, TxEdit, TxMedia, TxPayload, TxReaction};
+use super::super::unicode::is_combining;
 use super::super::{
-    Address, ConversationId, DisplayName, DurableChannel, EngineError, IdentityId, Kind, Tag,
-    UserId,
+    Address, AeadKey, AeadNonce, ConversationId, DisplayName, DurableChannel, EngineError,
+    IdentityId, Kind, Tag, UserId,
 };
 use super::helpers::*;
 use super::party::HandshakeFailure;
@@ -246,23 +248,33 @@ impl Engine {
         if attachments.is_empty() || attachments.len() > 4 {
             return Err(EngineError::MalformedPayload);
         }
-        self.require_ids(&state, &ids)?;
+        if let Some(caption) = caption {
+            self.chat_text(caption)?;
+        }
+        for att in attachments {
+            self.media_name(&att.mime, 128)?;
+            self.media_name(&att.filename, 256)?;
+        }
+        self.gate_chat(&state, &ids)?;
         let secret = self.conv_secret(&state, &ids.conversation_id)?;
         let mut payloads = Vec::new();
         for att in attachments {
-            if att.mime.is_empty() || att.filename.is_empty() {
-                return Err(EngineError::MalformedPayload);
-            }
             let hash = Tag::from_bytes(self.suite.hash().hash(&att.media_bytes));
             let tag = Tag::from(rng.random32());
-            let kind = Kind::try_from("blossom").map_err(|_| EngineError::MalformedPayload)?;
-            let address = Address::try_from("https://blob.example")
-                .map_err(|_| EngineError::MalformedPayload)?;
+            let kind = Kind::try_from("blossom").expect("kind");
+            let address = Address::try_from("https://blob.example").expect("address");
+            let body = seal_media(
+                &self.suite,
+                rng,
+                secret.as_bytes(),
+                hash.as_bytes(),
+                &att.media_bytes,
+            );
             state.blob_puts.push(BlobPut {
                 kind: kind.clone(),
                 address: address.clone(),
                 tag,
-                body: att.media_bytes.clone(),
+                body,
             });
             payloads.push(TxPayload::Media(TxMedia {
                 mime: att.mime.clone(),
@@ -273,12 +285,49 @@ impl Engine {
                 tag,
                 caption: caption.map(str::to_owned),
                 reply_to,
-                expire_at: None,
+                expire_at: self.expire_at(&state, ids.conversation_id),
             }));
         }
         let mut ok = self.mutate_on(state, &secret, ids.conversation_id, payloads.clone())?;
         self.deliver_live(&mut ok.state, rng, ids.conversation_id, &secret, &payloads)?;
+        for payload in &payloads {
+            let tx_id = self.tx_id(&secret, payload);
+            self.remember_sender(&mut ok.state, ids.conversation_id, tx_id);
+        }
+        ok.pings
+            .extend(self.fill_ping(&ok.state, ids.conversation_id));
         Ok(ok)
+    }
+
+    /// Open a blob body and check it against `hash`.
+    pub fn open_media(
+        &self,
+        state: &EngineState,
+        conversation_id: ConversationId,
+        hash: Tag,
+        blob: &[u8],
+    ) -> Result<Vec<u8>, EngineError> {
+        let secret = self.conv_secret(state, &conversation_id)?;
+        if blob.len() <= PACKET_NONCE_LEN {
+            return Err(EngineError::MalformedPayload);
+        }
+        let mut nonce = [0u8; PACKET_NONCE_LEN];
+        nonce.copy_from_slice(&blob[..PACKET_NONCE_LEN]);
+        let key = media_key(self.suite.hmac(), secret.as_bytes(), hash.as_bytes());
+        #[rustfmt::skip]
+        let plain = self.suite.aead().open(&AeadKey::from_bytes(key), &AeadNonce::from_bytes(nonce), b"", &blob[PACKET_NONCE_LEN..]).map_err(|_| EngineError::MalformedPayload)?;
+        let got = Tag::from_bytes(self.suite.hash().hash(&plain));
+        if got != hash {
+            return Err(EngineError::MalformedPayload);
+        }
+        Ok(plain)
+    }
+
+    fn media_name(&self, value: &str, max: usize) -> Result<(), EngineError> {
+        if value.is_empty() || value.len() > max || value.chars().any(is_combining) {
+            return Err(EngineError::MalformedPayload);
+        }
+        Ok(())
     }
 
     /// Edit a text message.
@@ -470,4 +519,33 @@ impl Engine {
             pings: Vec::new(),
         })
     }
+}
+
+fn media_key(hmac: &dyn HmacSha256, secret: &[u8; 32], hash: &[u8]) -> [u8; 32] {
+    let mut info = b"chuchotez/1/media".to_vec();
+    info.extend_from_slice(hash);
+    expand(hmac, &HmacSha256Key::from_bytes(*secret), &info).into_bytes()
+}
+
+fn seal_media(
+    suite: &super::super::Suite,
+    rng: &dyn crate::protocol::Rng,
+    secret: &[u8; 32],
+    hash: &[u8],
+    plain: &[u8],
+) -> Vec<u8> {
+    let key = media_key(suite.hmac(), secret, hash);
+    let rnd = rng.random32();
+    let mut nonce = [0u8; PACKET_NONCE_LEN];
+    nonce.copy_from_slice(&rnd.as_bytes()[..PACKET_NONCE_LEN]);
+    let ct = suite.aead().seal(
+        &AeadKey::from_bytes(key),
+        &AeadNonce::from_bytes(nonce),
+        b"",
+        plain,
+    );
+    let mut body = Vec::with_capacity(PACKET_NONCE_LEN + ct.len());
+    body.extend_from_slice(&nonce);
+    body.extend_from_slice(&ct);
+    body
 }

@@ -521,20 +521,48 @@ fn library_edges() {
             None,
             Some("cap"),
         )
-        .expect("media");
-    let put = media.state.blob_puts[0].clone();
-    engine
-        .write_blob_ack(
-            media.state.clone(),
-            put.kind.clone(),
-            put.address.clone(),
-            put.tag,
-            &put.body,
-        )
-        .expect("ba");
+        .unwrap_err();
+    assert_eq!(media, EngineError::WrongPhase);
     assert_eq!(
         engine
             .send_media(invited.state.clone(), &rng, ids, &[], None, None)
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    assert_eq!(
+        engine
+            .send_media(
+                invited.state.clone(),
+                &rng,
+                ids,
+                &vec![
+                    super::MediaDraft {
+                        media_bytes: vec![1],
+                        mime: "image/png".into(),
+                        filename: "a.png".into(),
+                    };
+                    5
+                ],
+                None,
+                None,
+            )
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    assert_eq!(
+        engine
+            .send_media(
+                invited.state.clone(),
+                &rng,
+                ids,
+                &[super::MediaDraft {
+                    media_bytes: vec![1],
+                    mime: "image/png".into(),
+                    filename: "a\u{0301}.png".into(),
+                }],
+                None,
+                Some(""),
+            )
             .unwrap_err(),
         EngineError::MalformedPayload
     );
@@ -7938,11 +7966,16 @@ fn live_path_waits_then_falls_back() {
     assert!(view.presence.is_some());
     ada = engine.tick(ada, now + 4).expect("expire").state;
     let view = engine.dm_view(&ada, child);
-    assert!(
-        view.messages
-            .iter()
-            .all(|item| !matches!(&item.payload, TxPayload::Text(text) if text.body == "gone"))
-    );
+    let mut saw_hi = false;
+    for item in &view.messages {
+        if let TxPayload::Text(text) = &item.payload {
+            assert_ne!(text.body, "gone");
+            if text.body == "hi" {
+                saw_hi = true;
+            }
+        }
+    }
+    assert!(saw_hi);
     ada = engine.tick(ada, now + 12).expect("clear").state;
     let view = engine.dm_view(&ada, child);
     assert!(view.typing.is_none());
@@ -7973,6 +8006,77 @@ fn live_path_waits_then_falls_back() {
         .send_text(bob, &rng, bob_ids, "pong", None)
         .expect("pong");
     assert_eq!(bob_ping.pings().len(), 1);
+    let sent = engine
+        .send_media(
+            pinged.state,
+            &rng,
+            ada_ids,
+            &[super::MediaDraft {
+                media_bytes: b"blob".to_vec(),
+                mime: "image/png".into(),
+                filename: "a.png".into(),
+            }],
+            None,
+            Some("cap"),
+        )
+        .expect("media");
+    let put = sent
+        .state
+        .blob_puts
+        .iter()
+        .find(|put| put.body != b"blob")
+        .expect("put")
+        .clone();
+    assert_ne!(put.body, b"blob");
+    let hash = sent
+        .state
+        .txs
+        .values()
+        .find_map(|tx| match &tx.payload {
+            TxPayload::Media(media) if media.filename == "a.png" => Some(media.hash),
+            _ => None,
+        })
+        .expect("hash");
+    let plain = engine
+        .open_media(&sent.state, child, hash, &put.body)
+        .expect("open");
+    assert_eq!(plain, b"blob");
+    assert_eq!(
+        engine
+            .open_media(&sent.state, child, hash, &[0; 4])
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    let mut corrupt = put.body.clone();
+    *corrupt.last_mut().expect("tail") ^= 1;
+    assert_eq!(
+        engine
+            .open_media(&sent.state, child, hash, &corrupt)
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    let mut flipped = put.body.clone();
+    flipped[12] ^= 1;
+    assert_eq!(
+        engine
+            .open_media(&sent.state, child, hash, &flipped)
+            .unwrap_err(),
+        EngineError::MalformedPayload
+    );
+    let before = engine.poll(&sent.state).expect("poll");
+    let put_tag = put.tag;
+    assert!(before.blob_put.iter().any(|item| item.tag == put_tag));
+    let acked = engine
+        .write_blob_ack(
+            sent.state,
+            put.kind.clone(),
+            put.address.clone(),
+            put.tag,
+            &put.body,
+        )
+        .expect("ack");
+    let after = engine.poll(&acked.state).expect("poll2");
+    assert!(after.blob_get.iter().any(|get| get.tag == put.tag));
 }
 
 #[test]
