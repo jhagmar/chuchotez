@@ -2,6 +2,7 @@
 
 mod chat;
 mod fold_tree;
+mod group;
 mod handshake;
 mod heal;
 mod helpers;
@@ -23,9 +24,9 @@ mod tests;
 pub use query::{
     BlobGet, BlobPut, BlockedIdentity, BlockedMissing, Conversation, ConversationListRow,
     ConversationRef, DirectMessageQuery, DmEstablished, DurableLocator, DurableWrite,
-    EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupQuery, Handshake,
-    HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk, PingTarget, Poll,
-    PresenceView, SynchronizationQuery, TypingView, WrapDekOk,
+    EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupEstablishedView, GroupOfferView,
+    GroupQuery, Handshake, HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk,
+    PingTarget, Poll, PresenceView, SynchronizationQuery, TypingView, WrapDekOk,
 };
 pub use state::EngineState;
 

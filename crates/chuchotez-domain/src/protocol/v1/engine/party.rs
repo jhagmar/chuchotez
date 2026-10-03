@@ -648,6 +648,52 @@ pub(super) enum IdentityConversation {
         secret: Secret,
         parent: super::super::ConversationId,
     },
+    Group(GroupPhase),
+}
+
+/// Group row on an identity.
+#[derive(Clone, Debug)]
+pub(super) enum GroupPhase {
+    /// Owner or accepted member.
+    Live(GroupLive),
+    /// Invitee has the wrapped secret and has not accepted.
+    Offer(GroupOffer),
+    /// Terminal group failure.
+    Failed(FailedReason),
+}
+
+/// Established group membership.
+#[derive(Clone, Debug)]
+pub(super) struct GroupLive {
+    pub(super) secret: Secret,
+    pub(super) name: super::super::DisplayName,
+    pub(super) photo: Option<super::super::ProfilePic>,
+    pub(super) owner_signing_pk: Vec<u8>,
+    pub(super) persistents: Vec<super::super::DurableChannel>,
+    pub(super) ephemerals: Vec<super::super::EphemeralChannel>,
+    pub(super) members: Vec<super::super::payload::GroupMember>,
+    pub(super) pending: Vec<GroupPending>,
+    pub(super) epoch: u64,
+}
+
+/// Incoming group offer.
+#[derive(Clone, Debug)]
+pub(super) struct GroupOffer {
+    pub(super) secret: Secret,
+    pub(super) name: super::super::DisplayName,
+    pub(super) photo: Option<super::super::ProfilePic>,
+    pub(super) owner_signing_pk: Vec<u8>,
+    pub(super) from_conversation_id: super::super::ConversationId,
+}
+
+/// Invite not yet accepted.
+#[derive(Clone, Debug)]
+pub(super) struct GroupPending {
+    pub(super) signing_pk: Vec<u8>,
+    pub(super) encryption_pk: Vec<u8>,
+    pub(super) from_conversation_id: super::super::ConversationId,
+    pub(super) name: super::super::DisplayName,
+    pub(super) photo: Option<super::super::ProfilePic>,
 }
 
 /// Conversation stored on this device.

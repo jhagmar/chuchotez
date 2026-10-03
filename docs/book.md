@@ -132,6 +132,18 @@ carries `nonce || seal(media_key, media_bytes)` until `write_blob_ack`.
 `poll.blob_get` lists `TxMedia` locators that are not still being put.
 `open_media` opens that body and checks `hash`.
 
+`create_group` takes 1..=31 established DMs on that identity. The owner is
+`GroupEstablished`, and each of those DMs carries `TxGroupInvite`.
+`group_secret_ct` is the KEM ciphertext, a 12-byte nonce, and an AEAD of
+`group_secret` under `expand(shared, "chuchotez/1/group-secret")`.
+`accept_group` posts `TxGroupAccept`; the owner posts `TxGroupRoster` and one
+`TxGroupWrap` per other member. A roster that omits the local signing key
+stores `Kicked`. `reject_group` stores `OfferRejected`. Leave and delete post
+`TxGroupLeave` and store `Left`. Name, photo, and `disappear_after` are
+owner-only. A durable group transaction pings every member whose latest
+`TxPrefs.wake` is set. The folded snapshot of a live group keeps the secret,
+name, owner, and epoch.
+
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.
 `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes. `KemSeed` /
@@ -203,7 +215,6 @@ forbids third-party crates and host IO (`std::fs`, `std::net`, threads,
 
 ## Later slices
 
-- `create_group` from Established DMs (member cap 32, parallel `TxGroupInvite`).
 - Cover traffic.
 
 Chat and turn-based games remain host mappings onto DurableChannel and

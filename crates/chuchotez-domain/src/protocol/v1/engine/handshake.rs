@@ -55,6 +55,9 @@ impl Engine {
         state: &EngineState,
         conversation_id: ConversationId,
     ) -> Option<Conversation> {
+        if let Some(group) = self.group_view(state, conversation_id) {
+            return Some(group);
+        }
         if state.established_secret(conversation_id).is_some() {
             if state.is_sync(conversation_id) {
                 return Some(Conversation::Synchronization(

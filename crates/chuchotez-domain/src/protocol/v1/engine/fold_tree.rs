@@ -210,6 +210,9 @@ fn identity_conv_json(b64u: &dyn Base64Url, cid: ConversationId, node: &Identity
                     ("parent".into(), bstr(b64u, parent.as_bytes())),
                 ]),
             ),
+            IdentityConversation::Group(phase) => {
+                ("group".into(), super::group::group_json(b64u, phase))
+            }
         },
     ];
     members.extend(chains_json(b64u, cid, &node.chains));
@@ -631,6 +634,8 @@ fn parse_identity_conv(
             secret: Secret::from_bytes(decode_fold32(b64u, field(d, "secret")?)?),
             parent: ConversationId::from_bytes(decode_fold32(b64u, field(d, "parent")?)?),
         }
+    } else if let Some(group) = optional(m, "group") {
+        IdentityConversation::Group(super::group::parse_group(b64u, group)?)
     } else {
         return Err(EngineError::MalformedPersist);
     };

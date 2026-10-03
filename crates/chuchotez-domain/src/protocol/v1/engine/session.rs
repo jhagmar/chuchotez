@@ -20,6 +20,9 @@ impl Engine {
         ids: ConversationRef,
     ) -> Result<MutateOk, EngineError> {
         let cid = ids.conversation_id;
+        if let Some(ok) = self.delete_group(state.clone(), &ids) {
+            return Ok(ok);
+        }
         if state.established_secret(cid).is_some() {
             if !state.is_sync(cid) {
                 self.require_ids(&state, &ids)?;
@@ -90,97 +93,6 @@ impl Engine {
         Ok(ok)
     }
 
-    /// Create a group from Established DMs.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_group(
-        &self,
-        _state: EngineState,
-        _rng: &dyn Rng,
-        _user_id: UserId,
-        _identity_id: IdentityId,
-        contact_conversation_ids: &[ConversationId],
-        _name: &str,
-        _photo: Option<&[u8]>,
-    ) -> Result<(MutateOk, ConversationId), EngineError> {
-        if contact_conversation_ids.is_empty() || contact_conversation_ids.len() > 31 {
-            return Err(EngineError::MemberCap);
-        }
-        Err(EngineError::WrongPhase)
-    }
-
-    /// Invite another contact into a group.
-    pub fn add_group_member(
-        &self,
-        _state: EngineState,
-        _rng: &dyn Rng,
-        _ids: ConversationRef,
-        _contact_conversation_id: ConversationId,
-    ) -> Result<MutateOk, EngineError> {
-        Err(EngineError::WrongPhase)
-    }
-
-    /// Accept a group offer.
-    pub fn accept_group(
-        &self,
-        state: EngineState,
-        _rng: &dyn Rng,
-        ids: ConversationRef,
-    ) -> Result<MutateOk, EngineError> {
-        self.mint_on(
-            state,
-            _rng,
-            &ids,
-            TxPayload::GroupAccept {
-                group_id: ids.conversation_id,
-            },
-        )
-    }
-
-    /// Reject a group offer.
-    pub fn reject_group(
-        &self,
-        state: EngineState,
-        _rng: &dyn Rng,
-        ids: ConversationRef,
-    ) -> Result<MutateOk, EngineError> {
-        self.mint_on(
-            state,
-            _rng,
-            &ids,
-            TxPayload::GroupReject {
-                group_id: ids.conversation_id,
-            },
-        )
-    }
-
-    /// Kick a group member.
-    pub fn kick_group_member(
-        &self,
-        state: EngineState,
-        _rng: &dyn Rng,
-        ids: ConversationRef,
-        signing_pk: &[u8],
-    ) -> Result<MutateOk, EngineError> {
-        self.mint_on(
-            state,
-            _rng,
-            &ids,
-            TxPayload::GroupKick {
-                signing_pk: signing_pk.to_vec(),
-            },
-        )
-    }
-
-    /// Leave a group.
-    pub fn leave_group(
-        &self,
-        state: EngineState,
-        _rng: &dyn Rng,
-        ids: ConversationRef,
-    ) -> Result<MutateOk, EngineError> {
-        self.mint_on(state, _rng, &ids, TxPayload::GroupLeave)
-    }
-
     /// Set the group name (owner).
     pub fn set_group_name(
         &self,
@@ -190,11 +102,7 @@ impl Engine {
         name: &str,
     ) -> Result<MutateOk, EngineError> {
         let name = DisplayName::try_from(name).map_err(|_| EngineError::MalformedDisplayName)?;
-        self.gate_chat(&state, &ids)?;
-        let payload = TxPayload::Name { name };
-        let secret = self.conv_secret(&state, &ids.conversation_id)?;
-        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
-        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
+        self.rename_group(state, _rng, ids, name)
     }
 
     /// Set the group photo (owner).
@@ -211,11 +119,7 @@ impl Engine {
                 super::super::ProfilePic::try_from(b).map_err(|_| EngineError::MalformedPayload)?,
             ),
         };
-        self.gate_chat(&state, &ids)?;
-        let payload = TxPayload::Photo { profile_pic };
-        let secret = self.conv_secret(&state, &ids.conversation_id)?;
-        let ok = self.mint_on(state, _rng, &ids, payload.clone())?;
-        self.finish_chat(ok, ids.conversation_id, &secret, &payload)
+        self.rephoto_group(state, _rng, ids, profile_pic)
     }
 
     /// Send a text message.
@@ -460,7 +364,7 @@ impl Engine {
         })
     }
 
-    fn finish_chat(
+    pub(super) fn finish_chat(
         &self,
         mut ok: MutateOk,
         cid: ConversationId,

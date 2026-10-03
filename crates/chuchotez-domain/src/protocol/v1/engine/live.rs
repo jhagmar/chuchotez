@@ -659,7 +659,8 @@ impl Engine {
         let rec = self.persist_record(seq, &durable)?;
             state.persist_log.insert(seq, part.tx_id);
             state.next_seq = state.next_seq.saturating_add(1);
-            state.txs.insert(part.tx_id, durable);
+            state.txs.insert(part.tx_id, durable.clone());
+            self.on_group_payload(state, rng, cid, &durable.payload)?;
             state
                 .chains_mut(cid)
                 .expect("row")
