@@ -78,6 +78,8 @@ for each `https:` ping row. `nfc` normalizes host strings before the
 engine gates.
 `group_secret_ct` is the KEM ciphertext, a 12-byte nonce, and an AEAD of
 `group_secret` under `expand(shared, "chuchotez/1/group-secret")`.
+A folded snapshot restores a group's members, channels, and photo, along
+with the secret, name, owner, and epoch.
 Group chat, the member list, and each wrap of the group secret are sealed
 512-byte bodies on the group's durable channels and show up in `poll`. A
 member list whose signature does not check is not applied. Invites stay on

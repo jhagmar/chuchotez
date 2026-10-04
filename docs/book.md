@@ -141,8 +141,8 @@ carries `nonce || seal(media_key, media_bytes)` until `write_blob_ack`.
 stores `Kicked`. `reject_group` stores `OfferRejected`. Leave and delete post
 `TxGroupLeave` and store `Left`. Name, photo, and `disappear_after` are
 owner-only. A durable group transaction pings every member whose latest
-`TxPrefs.wake` is set. The folded snapshot of a live group keeps the secret,
-name, owner, and epoch.
+`TxPrefs.wake` is set. A folded snapshot restores a group's members,
+channels, and photo, along with the secret, name, owner, and epoch.
 
 `create_sync_invite` keeps at most 4 peers besides this device. On confirm
 the inviter seals the DEK to the invitee device encryption key as KEM

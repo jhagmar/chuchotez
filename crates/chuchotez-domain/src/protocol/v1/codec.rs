@@ -121,7 +121,7 @@ pub(crate) fn ticket_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tic
     })
 }
 
-fn parse_durable_list(value: &Json) -> Result<Vec<DurableChannel>, ()> {
+pub(crate) fn parse_durable_list(value: &Json) -> Result<Vec<DurableChannel>, ()> {
     let Json::Array(items) = value else {
         return Err(());
     };
@@ -136,7 +136,7 @@ fn parse_durable(value: &Json) -> Result<DurableChannel, ()> {
     Ok(DurableChannel::new(kind, address))
 }
 
-fn parse_ephemeral_list(value: &Json) -> Result<Vec<EphemeralChannel>, ()> {
+pub(crate) fn parse_ephemeral_list(value: &Json) -> Result<Vec<EphemeralChannel>, ()> {
     let Json::Array(items) = value else {
         return Err(());
     };

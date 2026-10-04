@@ -8186,6 +8186,33 @@ fn live_path_waits_then_falls_back() {
     let (grouped, gid) = engine
         .create_group(acked.state, &rng, uid, iid, &[child], "Team", None)
         .expect("group");
+    let group_ids = ConversationRef {
+        user_id: uid,
+        identity_id: iid,
+        conversation_id: gid,
+    };
+    let mut webp = vec![0u8; 12];
+    webp[0..4].copy_from_slice(b"RIFF");
+    webp[8..12].copy_from_slice(b"WEBP");
+    let pictured = engine
+        .set_group_photo(grouped.state.clone(), &rng, group_ids, Some(&webp))
+        .expect("gpic");
+    let before_group = engine
+        .get_conversation(&pictured.state, uid, iid, gid)
+        .expect("before-g");
+    let mut snap_state = pictured.state;
+    snap_state.persist_log.clear();
+    let folded = engine.fold(snap_state).expect("fold-g");
+    let restored = engine.apply_folded(&folded.snapshot).expect("apply-g");
+    assert_eq!(
+        engine
+            .get_conversation(&restored, uid, iid, gid)
+            .expect("after-g"),
+        before_group
+    );
+    engine
+        .send_text(restored, &rng, group_ids, "after-fold", None)
+        .expect("keep");
     assert!(matches!(
         engine
             .get_conversation(&grouped.state, uid, iid, gid)
