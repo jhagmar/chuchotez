@@ -8366,7 +8366,7 @@ fn live_path_waits_then_falls_back() {
         .find(|member| member.signing_pk != owner_pk)
         .map(|member| member.signing_pk.clone())
         .expect("peer");
-    engine
+    let kicked_owner = engine
         .kick_group_member(
             owner.clone(),
             &rng,
@@ -8378,26 +8378,135 @@ fn live_path_waits_then_falls_back() {
             &peer_pk,
         )
         .expect("kick-member");
-    let roster = owner
+    let rosters: Vec<_> = kicked_owner
+        .state
         .txs
         .values()
-        .find(|tx| matches!(tx.payload, TxPayload::GroupRoster(_)))
-        .expect("roster-tx")
-        .payload
-        .clone();
+        .filter_map(|tx| match &tx.payload {
+            TxPayload::GroupRoster(body) => Some(body.clone()),
+            _ => None,
+        })
+        .collect();
+    let full = rosters
+        .iter()
+        .find(|body| {
+            body.members
+                .iter()
+                .any(|member| member.signing_pk == peer_pk)
+        })
+        .cloned()
+        .expect("full-roster");
+    let roster = TxPayload::GroupRoster(full.clone());
+    let without_peer = rosters
+        .iter()
+        .find(|body| {
+            !body
+                .members
+                .iter()
+                .any(|member| member.signing_pk == peer_pk)
+        })
+        .cloned()
+        .expect("kicked-roster");
     let mut member = accepted.state.clone();
     engine
-        .on_group_payload(&mut member, &rng, gid, &roster)
+        .on_group_payload(
+            &mut member,
+            &rng,
+            gid,
+            &TxPayload::GroupRoster(full.clone()),
+        )
         .expect("apply-roster");
     assert!(matches!(
         engine.get_conversation(&member, ie_uid, ie_iid, gid).expect("mem"),
         Conversation::Group(GroupQuery::GroupEstablished(ref view)) if !view.members.is_empty()
     ));
+    let mut bad = full.clone();
+    bad.sig.fill(0);
+    let mut untouched = member.clone();
+    assert!(
+        engine
+            .on_group_payload(&mut untouched, &rng, gid, &TxPayload::GroupRoster(bad))
+            .is_err()
+    );
+    assert!(matches!(
+        engine
+            .get_conversation(&untouched, ie_uid, ie_iid, gid)
+            .expect("kept"),
+        Conversation::Group(GroupQuery::GroupEstablished(_))
+    ));
+    let group_ref = ConversationRef {
+        user_id: uid,
+        identity_id: iid,
+        conversation_id: gid,
+    };
+    let write_before = owner.writes.len();
+    let eph_before = owner.eph_writes.len();
+    let posted = engine
+        .send_text(owner.clone(), &rng, group_ref, "group-hi", None)
+        .expect("gtext");
+    assert!(posted.state.writes.len() > write_before);
+    assert_eq!(posted.state.eph_writes.len(), eph_before);
+    let polled = engine.poll(&posted.state).expect("gpoll");
+    assert!(polled.write_durable.iter().any(|write| {
+        posted.state.writes[write_before..]
+            .iter()
+            .any(|mine| mine.body == write.body)
+    }));
+    assert!(polled.listen_durable.iter().any(|locator| {
+        posted.state.writes[write_before..]
+            .iter()
+            .any(|mine| mine.tag == locator.tag && mine.channel == locator.channel)
+    }));
+    let mut heard = member.clone();
+    for write in posted.state.writes[write_before..].iter().cloned() {
+        heard = engine
+            .ingest_packet(heard, &rng, write.channel, write.tag, &write.body)
+            .expect("g-in")
+            .state;
+    }
+    assert!(
+        heard
+            .txs
+            .values()
+            .any(|tx| { matches!(&tx.payload, TxPayload::Text(text) if text.body == "group-hi") })
+    );
+    assert_eq!(
+        engine
+            .ingest_packet(
+                heard.clone(),
+                &rng,
+                posted.state.writes[write_before].channel.clone(),
+                crate::protocol::v1::Tag::from_bytes([1; 32]),
+                &[9; 512],
+            )
+            .unwrap_err(),
+        EngineError::UnknownTag
+    );
+    let foreign = crate::protocol::v1::DurableChannel::new(
+        Kind::try_from("nostr").expect("fk"),
+        Address::try_from("https://other.example").expect("fa"),
+    );
+    assert_eq!(
+        engine
+            .ingest_packet(
+                heard.clone(),
+                &rng,
+                foreign,
+                Tag::from_bytes([2; 32]),
+                &[8; 512],
+            )
+            .unwrap_err(),
+        EngineError::UnknownTag
+    );
     assert!(super::group::roster_body(&TxPayload::GroupLeave).is_none());
-    let mut body = super::group::roster_body(&roster).expect("roster");
-    body.members.clear();
+    assert!(super::group::roster_body(&TxPayload::GroupRoster(full.clone())).is_some());
     engine
-        .on_group_payload(&mut member, &rng, gid, &TxPayload::GroupRoster(body))
+        .on_group_payload(
+            &mut member,
+            &rng,
+            gid,
+            &TxPayload::GroupRoster(without_peer),
+        )
         .expect("kick-roster");
     assert!(matches!(
         engine

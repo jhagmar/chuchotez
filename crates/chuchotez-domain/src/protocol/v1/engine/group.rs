@@ -546,6 +546,22 @@ impl Engine {
         let Some((user, identity)) = self.owner_ids(state, cid) else {
             return Ok(());
         };
+        let (owner_signing_pk, secret, name, photo) = match group_phase(state, cid) {
+            Some(GroupPhase::Live(live)) => (
+                live.owner_signing_pk.clone(),
+                live.secret,
+                live.name.clone(),
+                live.photo.clone(),
+            ),
+            Some(GroupPhase::Offer(offer)) => (
+                offer.owner_signing_pk.clone(),
+                offer.secret,
+                offer.name.clone(),
+                offer.photo.clone(),
+            ),
+            _ => return Ok(()),
+        };
+        self.verify_roster(&owner_signing_pk, roster)?;
         let (_, _, sign_pk, _, _) = self.identity_secret(state, &user, &identity)?;
         if !roster.members.iter().any(|m| m.signing_pk == sign_pk) {
             if let Some(phase) = group_phase_mut(state, cid) {
@@ -553,21 +569,6 @@ impl Engine {
             }
             return Ok(());
         }
-        let (secret, name, photo, owner_signing_pk) = match group_phase(state, cid) {
-            Some(GroupPhase::Live(live)) => (
-                live.secret,
-                live.name.clone(),
-                live.photo.clone(),
-                live.owner_signing_pk.clone(),
-            ),
-            Some(GroupPhase::Offer(offer)) => (
-                offer.secret,
-                offer.name.clone(),
-                offer.photo.clone(),
-                offer.owner_signing_pk.clone(),
-            ),
-            _ => return Ok(()),
-        };
         if let Some(phase) = group_phase_mut(state, cid) {
             *phase = GroupPhase::Live(GroupLive {
                 secret,
@@ -611,12 +612,16 @@ impl Engine {
             .sign(policy, &sign_sk, &bytes, &rng.random32())
             .map_err(|_| EngineError::MalformedPayload)?;
         #[rustfmt::skip]
-        self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupRoster(roster))?;
+        let (tx_id, body, _) = self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupRoster(roster))?;
+        #[rustfmt::skip]
+        self.post_live(state, rng, ids.conversation_id, &secret, tx_id, &body.payload)?;
         for member in members.into_iter().filter(|m| m.signing_pk != owner_pk) {
             #[rustfmt::skip]
             let kem_ct = seal_group_secret(self, rng, policy, &member.encryption_pk, secret.as_bytes())?;
             #[rustfmt::skip]
-            self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupWrap(TxGroupWrap { to: member.signing_pk, from: owner_pk.clone(), kem_ct }))?;
+            let (tx_id, body, _) = self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupWrap(TxGroupWrap { to: member.signing_pk, from: owner_pk.clone(), kem_ct }))?;
+            #[rustfmt::skip]
+            self.post_live(state, rng, ids.conversation_id, &secret, tx_id, &body.payload)?;
         }
         Ok(())
     }
@@ -624,6 +629,23 @@ impl Engine {
     fn roster_bytes(&self, roster: &TxGroupRoster) -> Result<Vec<u8>, EngineError> {
         let json = payload_to_json(self.suite.b64u(), &TxPayload::GroupRoster(roster.clone()));
         Ok(self.suite.canonical_json().encode(&json))
+    }
+
+    fn verify_roster(&self, owner_pk: &[u8], roster: &TxGroupRoster) -> Result<(), EngineError> {
+        for policy in [Policy::Classic, Policy::PostQuantum, Policy::Hybrid] {
+            let mut body = roster.clone();
+            body.sig = vec![0; sign_sig_len(policy)];
+            let bytes = self.roster_bytes(&body)?;
+            if self
+                .suite
+                .sign()
+                .verify(policy, owner_pk, &bytes, &roster.sig)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        Err(EngineError::MalformedPayload)
     }
 
     fn identity_secret(

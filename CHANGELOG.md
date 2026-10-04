@@ -75,3 +75,7 @@ established DM, group, and sync omit ticket secrets, the DEK, secret keys,
 tag keys, and Wake `p256dh` / `auth`. `ping_posts` is an empty-body POST
 for each `https:` ping row. `nfc` normalizes host strings before the
 engine gates.
+Group chat, the member list, and each wrap of the group secret are sealed
+512-byte bodies on the group's durable channels and show up in `poll`. A
+member list whose signature does not check is not applied. Invites stay on
+the direct message.

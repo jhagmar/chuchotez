@@ -163,6 +163,11 @@ A host cycle is `tick`, then `poll`, then mapper post, list, listen, and blob
 transfer, then `ingest_packet` / `ingest_list`, `write_ack`, and
 `write_blob_ack`.
 
+Group chat, the member list, and each wrap of the group secret are sealed
+512-byte bodies on the group's durable channels. They appear in `poll`. A
+member list whose signature does not check is not applied. Invites stay on
+the direct message.
+
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.
 `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes. `KemSeed` /
