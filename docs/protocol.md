@@ -1142,7 +1142,7 @@ TxGroupInvite = {
   name: DisplayName,
   photo: ProfilePic / nil,
   invitee_signing_pk: SigningPublicKey,
-  group_secret_ct: KemCiphertext,
+  group_secret_ct: bstr,
 }
 
 TxGroupAccept = {
@@ -1176,8 +1176,9 @@ GroupMember = {
 }
 ```
 
-`group_secret_ct` is `wrap` of `group_secret` to the invitee
-`encryption_pk`. `TxGroupRoster.sig` is `sign(owner_sk, canonical(roster_body))`
+`group_secret_ct` is the KEM ciphertext, a 12-byte nonce, and an AEAD of
+`group_secret` under `expand(shared, "chuchotez/1/group-secret")`.
+`TxGroupRoster.sig` is `sign(owner_sk, canonical(roster_body))`
 where `roster_body` is `TxGroupRoster` with `sig` empty bytes of the Policy
 `sig` length. Creator mints `group_secret` and `group_id` with `random32()`, genesis
 Persistent/Ephemeral lists (omitted copies `Defaults`), and the creator
