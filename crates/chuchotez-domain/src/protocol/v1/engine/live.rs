@@ -70,7 +70,7 @@ fn presence_plain(
     }
 }
 
-fn bin_tag(hmac: &dyn HmacSha256, key: TagKey, label: &[u8], bin: TimeBin) -> Tag {
+pub(super) fn bin_tag(hmac: &dyn HmacSha256, key: TagKey, label: &[u8], bin: TimeBin) -> Tag {
     let mut info = label.to_vec();
     info.extend_from_slice(&bin.as_u64().to_be_bytes());
     Tag::from_bytes(expand(hmac, &HmacSha256Key::from_bytes(*key.as_bytes()), &info).into_bytes())
@@ -416,6 +416,9 @@ impl Engine {
     }
 
     fn live_route(&self, state: &EngineState, cid: ConversationId) -> Option<LiveRoute> {
+        if let Some(route) = self.group_route(state, cid) {
+            return Some(route);
+        }
         let parent = state.established_parent(cid)?;
         let notice = notice_for(state, parent)?;
         let (actor_bytes, signing) = local_material(self, state, cid)?;
@@ -456,6 +459,23 @@ impl Engine {
         Err(EngineError::UnknownTag)
     }
 
+    fn group_route(&self, state: &EngineState, cid: ConversationId) -> Option<LiveRoute> {
+        let live = super::group::group_live(state, cid)?;
+        let (actor_bytes, signing) = local_material(self, state, cid)?;
+        let member = live
+            .members
+            .iter()
+            .find(|member| member.signing_pk == signing)?;
+        Some(LiveRoute {
+            sort: ConversationSort::Group,
+            persistents: live.persistents.clone(),
+            ephemerals: Vec::new(),
+            send_tag_key: member.send_tag_key,
+            eph_send_tag_key: member.eph_send_tag_key,
+            actor: ActorId::from_bytes(actor_bytes),
+        })
+    }
+
     fn established_match(
         &self,
         state: &EngineState,
@@ -463,6 +483,9 @@ impl Engine {
         tag: &Tag,
         now: UnixSeconds,
     ) -> Option<(ConversationId, Secret, ConversationSort)> {
+        if let Some(hit) = self.group_match(state, channel, tag, now) {
+            return Some(hit);
+        }
         for cid in established_cids(state) {
             let parent = state.established_parent(cid)?;
             let notice = notice_for(state, parent)?;
@@ -478,6 +501,43 @@ impl Engine {
             let persistent = matches!(channel, LiveChannel::Durable(_));
             if matches_ch && self.tag_hits(state, parent, sort, persistent, tag, now) {
                 return Some((cid, state.established_secret(cid)?, sort));
+            }
+        }
+        None
+    }
+
+    fn group_match(
+        &self,
+        state: &EngineState,
+        channel: &LiveChannel<'_>,
+        tag: &Tag,
+        now: UnixSeconds,
+    ) -> Option<(ConversationId, Secret, ConversationSort)> {
+        let LiveChannel::Durable(durable) = channel else {
+            return None;
+        };
+        let label = ConversationSort::Group.persist_label()?;
+        let bins = listen_bins(time_bin(now));
+        for user in state.users.values() {
+            for ident in user.identities.values() {
+                for (cid, node) in &ident.conversations {
+                    let live = match &node.kind {
+                        super::party::IdentityConversation::Group(
+                            super::party::GroupPhase::Live(live),
+                        ) => live,
+                        _ => continue,
+                    };
+                    if !live.persistents.iter().any(|item| item == *durable) {
+                        continue;
+                    }
+                    for member in &live.members {
+                        for bin in bins {
+                            if bin_tag(self.suite.hmac(), member.send_tag_key, label, bin) == *tag {
+                                return Some((*cid, live.secret, ConversationSort::Group));
+                            }
+                        }
+                    }
+                }
             }
         }
         None
@@ -536,8 +596,13 @@ impl Engine {
         persistent: bool,
         now: UnixSeconds,
     ) -> Result<Option<Vec<Vec<u8>>>, EngineError> {
-        let parent = state.established_parent(cid).expect("parent");
-        for actor_bytes in open_actors(state, parent, sort) {
+        let actors = if sort == ConversationSort::Group {
+            group_member_actors(state, cid)
+        } else {
+            let parent = state.established_parent(cid).expect("parent");
+            open_actors(state, parent, sort)
+        };
+        for actor_bytes in actors {
             let actor = ActorId::from_bytes(actor_bytes.clone());
             #[rustfmt::skip]
             let joined = join(self.suite.hmac(), secret.as_bytes(), sort, &actor_bytes)?;
@@ -715,6 +780,17 @@ fn intro_tag_keys(
     }
     let intro = invitee_intro_for(state, parent)?;
     (intro.signing_pk == signing).then_some((intro.send_tag_key, intro.eph_send_tag_key))
+}
+
+fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
+    super::group::group_live(state, cid)
+        .map(|live| {
+            live.members
+                .iter()
+                .map(|member| member.signing_pk.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn open_actors(
