@@ -889,6 +889,49 @@ pub(super) fn group_json(
             ("name".into(), Json::String(live.name.as_str().into())),
             ("owner".into(), bstr(&live.owner_signing_pk)),
             ("epoch".into(), Json::Number(live.epoch)),
+            (
+                "photo".into(),
+                match &live.photo {
+                    Some(pic) => bstr(pic.as_bytes()),
+                    None => Json::Null,
+                },
+            ),
+            (
+                "persistents".into(),
+                Json::Array(
+                    live.persistents
+                        .iter()
+                        .map(super::super::codec::durable_json)
+                        .collect(),
+                ),
+            ),
+            (
+                "ephemerals".into(),
+                Json::Array(
+                    live.ephemerals
+                        .iter()
+                        .map(super::super::codec::ephemeral_json)
+                        .collect(),
+                ),
+            ),
+            (
+                "members".into(),
+                Json::Array(
+                    live.members
+                        .iter()
+                        .map(|member| member_json(b64u, member))
+                        .collect(),
+                ),
+            ),
+            (
+                "pending".into(),
+                Json::Array(
+                    live.pending
+                        .iter()
+                        .map(|row| pending_json(b64u, row))
+                        .collect(),
+                ),
+            ),
         ]),
     }
 }
@@ -935,14 +978,154 @@ pub(super) fn parse_group(
     Ok(GroupPhase::Live(GroupLive {
         secret,
         name,
-        photo: None,
+        photo: match optional_field(m, "photo") {
+            Some(Json::Null) | None => None,
+            Some(other) => Some(
+                ProfilePic::try_from(decode_vec(b64u, other)?.as_slice())
+                    .map_err(|_| EngineError::MalformedPersist)?,
+            ),
+        },
         owner_signing_pk: owner,
-        persistents: Vec::new(),
-        ephemerals: Vec::new(),
-        members: Vec::new(),
-        pending: Vec::new(),
+        persistents: match optional_field(m, "persistents") {
+            Some(value) => super::super::codec::parse_durable_list(value)
+                .map_err(|_| EngineError::MalformedPersist)?,
+            None => Vec::new(),
+        },
+        ephemerals: match optional_field(m, "ephemerals") {
+            Some(value) => super::super::codec::parse_ephemeral_list(value)
+                .map_err(|_| EngineError::MalformedPersist)?,
+            None => Vec::new(),
+        },
+        members: match optional_field(m, "members") {
+            Some(value) => parse_members(b64u, value)?,
+            None => Vec::new(),
+        },
+        pending: match optional_field(m, "pending") {
+            Some(value) => parse_pending(b64u, value)?,
+            None => Vec::new(),
+        },
         epoch,
     }))
+}
+
+fn optional_field<'a>(
+    m: &'a [(String, super::super::Json)],
+    key: &str,
+) -> Option<&'a super::super::Json> {
+    m.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn member_json(
+    b64u: &dyn super::super::Base64Url,
+    member: &super::super::payload::GroupMember,
+) -> super::super::Json {
+    use super::super::Json;
+    let bstr = |bytes: &[u8]| Json::String(b64u.encode(bytes));
+    Json::Object(vec![
+        ("signing_pk".into(), bstr(&member.signing_pk)),
+        ("encryption_pk".into(), bstr(&member.encryption_pk)),
+        ("send_tag_key".into(), bstr(member.send_tag_key.as_bytes())),
+        (
+            "eph_send_tag_key".into(),
+            bstr(member.eph_send_tag_key.as_bytes()),
+        ),
+    ])
+}
+
+fn pending_json(b64u: &dyn super::super::Base64Url, row: &GroupPending) -> super::super::Json {
+    use super::super::Json;
+    let bstr = |bytes: &[u8]| Json::String(b64u.encode(bytes));
+    Json::Object(vec![
+        ("signing_pk".into(), bstr(&row.signing_pk)),
+        ("encryption_pk".into(), bstr(&row.encryption_pk)),
+        ("from".into(), bstr(row.from_conversation_id.as_bytes())),
+        ("name".into(), Json::String(row.name.as_str().into())),
+        (
+            "photo".into(),
+            match &row.photo {
+                Some(pic) => bstr(pic.as_bytes()),
+                None => Json::Null,
+            },
+        ),
+    ])
+}
+
+fn parse_members(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<Vec<super::super::payload::GroupMember>, EngineError> {
+    let super::super::Json::Array(items) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    items.iter().map(|item| parse_member(b64u, item)).collect()
+}
+
+fn parse_member(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<super::super::payload::GroupMember, EngineError> {
+    use super::super::payload::GroupMember;
+    let super::super::Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let field = |name: &str| {
+        m.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+            .ok_or(EngineError::MalformedPersist)
+    };
+    Ok(GroupMember {
+        signing_pk: decode_vec(b64u, field("signing_pk")?)?,
+        encryption_pk: decode_vec(b64u, field("encryption_pk")?)?,
+        send_tag_key: super::super::TagKey::from_bytes(decode32(b64u, field("send_tag_key")?)?),
+        #[rustfmt::skip]
+        eph_send_tag_key: super::super::TagKey::from_bytes(decode32(b64u, field("eph_send_tag_key")?)?),
+    })
+}
+
+fn parse_pending(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<Vec<GroupPending>, EngineError> {
+    let super::super::Json::Array(items) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    items
+        .iter()
+        .map(|item| parse_one_pending(b64u, item))
+        .collect()
+}
+
+fn parse_one_pending(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<GroupPending, EngineError> {
+    let super::super::Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let field = |name: &str| {
+        m.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+            .ok_or(EngineError::MalformedPersist)
+    };
+    let name = match field("name")? {
+        super::super::Json::String(s) => {
+            DisplayName::try_from(s.as_str()).map_err(|_| EngineError::MalformedPersist)?
+        }
+        _ => return Err(EngineError::MalformedPersist),
+    };
+    Ok(GroupPending {
+        signing_pk: decode_vec(b64u, field("signing_pk")?)?,
+        encryption_pk: decode_vec(b64u, field("encryption_pk")?)?,
+        from_conversation_id: ConversationId::from_bytes(decode32(b64u, field("from")?)?),
+        name,
+        photo: match optional_field(m, "photo") {
+            Some(super::super::Json::Null) | None => None,
+            #[rustfmt::skip]
+            Some(other) => Some(ProfilePic::try_from(decode_vec(b64u, other)?.as_slice()).map_err(|_| EngineError::MalformedPersist)?),
+        },
+    })
 }
 
 fn decode32(
@@ -1020,6 +1203,100 @@ mod tests {
             )
             .is_err()
         );
+        let bare = parse_group(
+            b64,
+            &Json::Object(vec![
+                ("secret".into(), Json::String(b64.encode(&[1; 32]))),
+                ("name".into(), Json::String("G".into())),
+                ("owner".into(), Json::String(b64.encode(&[2; 32]))),
+                ("epoch".into(), Json::Number(1)),
+            ]),
+        )
+        .expect("bare");
+        assert!(matches!(
+            bare,
+            super::GroupPhase::Live(ref live)
+                if live.members.is_empty()
+                    && live.photo.is_none()
+                    && live.persistents.is_empty()
+                    && live.ephemerals.is_empty()
+                    && live.pending.is_empty()
+        ));
+        let row = |extra: Vec<(String, Json)>| {
+            let mut members = vec![
+                ("secret".into(), Json::String(b64.encode(&[1; 32]))),
+                ("name".into(), Json::String("G".into())),
+                ("owner".into(), Json::String(b64.encode(&[2; 32]))),
+                ("epoch".into(), Json::Number(1)),
+            ];
+            members.extend(extra);
+            Json::Object(members)
+        };
+        assert!(parse_group(b64, &row(vec![("photo".into(), Json::Null)])).is_ok());
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("photo".into(), Json::String(b64.encode(&[1])))])
+            )
+            .is_err()
+        );
+        assert!(parse_group(b64, &row(vec![("persistents".into(), Json::Null)])).is_err());
+        assert!(parse_group(b64, &row(vec![("ephemerals".into(), Json::Null)])).is_err());
+        assert!(parse_group(b64, &row(vec![("members".into(), Json::Null)])).is_err());
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("members".into(), Json::Array(vec![Json::Null]))])
+            )
+            .is_err()
+        );
+        assert!(parse_group(b64, &row(vec![("pending".into(), Json::Null)])).is_err());
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("pending".into(), Json::Array(vec![Json::Null]))])
+            )
+            .is_err()
+        );
+        let mut webp = vec![0u8; 12];
+        webp[0..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        let pending = Json::Object(vec![
+            ("signing_pk".into(), Json::String(b64.encode(&[4]))),
+            ("encryption_pk".into(), Json::String(b64.encode(&[5]))),
+            ("from".into(), Json::String(b64.encode(&[6; 32]))),
+            ("name".into(), Json::String("Pat".into())),
+            ("photo".into(), Json::String(b64.encode(&webp))),
+        ]);
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("pending".into(), Json::Array(vec![pending]))])
+            )
+            .is_ok()
+        );
+        let bad_name = Json::Object(vec![
+            ("signing_pk".into(), Json::String(b64.encode(&[4]))),
+            ("encryption_pk".into(), Json::String(b64.encode(&[5]))),
+            ("from".into(), Json::String(b64.encode(&[6; 32]))),
+            ("name".into(), Json::Number(1)),
+        ]);
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("pending".into(), Json::Array(vec![bad_name]))])
+            )
+            .is_err()
+        );
+        let pic = crate::protocol::v1::ProfilePic::try_from(webp.as_slice()).expect("pic");
+        let with_photo = super::GroupPending {
+            signing_pk: vec![4],
+            encryption_pk: vec![5],
+            from_conversation_id: crate::protocol::v1::ConversationId::from_bytes([6; 32]),
+            name: crate::protocol::v1::DisplayName::try_from("Pat").expect("n"),
+            photo: Some(pic),
+        };
+        let _ = super::pending_json(b64, &with_photo);
         assert!(parse_group(b64, &Json::Object(vec![("secret".into(), Json::Null)])).is_err());
         assert!(
             parse_group(
