@@ -26,20 +26,23 @@ impl Engine {
         let now = state.ticked.unwrap_or_default();
         let mut txs = Vec::new();
         let mut kept: BTreeSet<Tag> = BTreeSet::new();
-        for (id, body) in &state.txs {
-            if !tx_watermarked(&state, *id) {
+        for (id, body) in state.body_pairs() {
+            if !tx_watermarked(&state, id) {
                 continue;
             }
             if payload_expire_at(&body.payload).is_some_and(|expires| expires <= now) {
                 continue;
             }
-            kept.insert(*id);
+            kept.insert(id);
             txs.push(Json::Object(vec![
                 (
                     "tx_id".into(),
                     super::super::codec::bstr(self.suite.b64u(), id.as_bytes()),
                 ),
-                ("body".into(), durable_body_to_json(self.suite.b64u(), body)),
+                (
+                    "body".into(),
+                    durable_body_to_json(self.suite.b64u(), &body),
+                ),
             ]));
         }
         let mut frags = Vec::new();
@@ -205,14 +208,14 @@ impl Engine {
                 .unwrap_or(Secret::from_bytes(*body.conversation_id.as_bytes())),
         };
         let tx_id = self.tx_id(&secret, &body.payload);
-        if let Some(existing) = state.txs.get(&tx_id)
+        if let Some(existing) = state.body(&tx_id)
             && existing.payload != body.payload
         {
             return Err(EngineError::Equivocation);
         }
         let is_confirm = matches!(body.payload, TxPayload::Confirm);
         let conversation_id = body.conversation_id;
-        state.txs.insert(tx_id, body);
+        state.insert_body(tx_id, body)?;
         if is_confirm {
             let _ = self.spawn_child(&mut state, conversation_id);
         }
@@ -281,6 +284,7 @@ impl Engine {
         let mut state = EngineState::new();
         state.next_seq = PersistSeq::from_u64(*next_seq);
         state.ticked = ticked;
+        let mut pending_txs = Vec::new();
         if let Some(Json::Array(txs)) = get("txs") {
             for item in txs {
                 let Json::Object(m) = item else {
@@ -302,7 +306,7 @@ impl Engine {
                     getm("body").ok_or(EngineError::MalformedPersist)?,
                 )
                 .map_err(|_| EngineError::MalformedPersist)?;
-                state.txs.insert(tx_id, body);
+                pending_txs.push((tx_id, body));
             }
         }
         if let Some(Json::Array(items)) = get("frags") {
@@ -438,6 +442,11 @@ impl Engine {
         }
         if let Some(device) = get("device") {
             super::fold_tree::install_device(self.suite.b64u(), &mut state, device)?;
+        }
+        for (tx_id, body) in pending_txs {
+            state
+                .insert_body(tx_id, body)
+                .map_err(|_| EngineError::MalformedPersist)?;
         }
         Ok(state)
     }

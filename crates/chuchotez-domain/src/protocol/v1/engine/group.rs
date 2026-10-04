@@ -114,6 +114,7 @@ impl Engine {
                     members: vec![owner],
                     pending,
                     epoch: 0,
+                    log: std::collections::BTreeMap::new(),
                 })),
                 chains: Default::default(),
             },
@@ -225,6 +226,7 @@ impl Engine {
                 members: vec![member],
                 pending: Vec::new(),
                 epoch: 0,
+                log: std::collections::BTreeMap::new(),
             });
         }
         let _ = sign_pk;
@@ -555,18 +557,20 @@ impl Engine {
         let Some((user, identity)) = self.owner_ids(state, cid) else {
             return Ok(());
         };
-        let (owner_signing_pk, secret, name, photo) = match group_phase(state, cid) {
+        let (owner_signing_pk, secret, name, photo, log) = match group_phase(state, cid) {
             Some(GroupPhase::Live(live)) => (
                 live.owner_signing_pk.clone(),
                 live.secret,
                 live.name.clone(),
                 live.photo.clone(),
+                live.log.clone(),
             ),
             Some(GroupPhase::Offer(offer)) => (
                 offer.owner_signing_pk.clone(),
                 offer.secret,
                 offer.name.clone(),
                 offer.photo.clone(),
+                std::collections::BTreeMap::new(),
             ),
             _ => return Ok(()),
         };
@@ -593,6 +597,7 @@ impl Engine {
                 members: roster.members.clone(),
                 pending: Vec::new(),
                 epoch: roster.epoch,
+                log,
             });
         }
         Ok(())
@@ -668,8 +673,8 @@ impl Engine {
         identity_id: &IdentityId,
     ) -> Result<IdentityKeys, EngineError> {
         state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .find_map(|tx| match &tx.payload {
                 TxPayload::EngineCreateIdentity {
                     user_id: u,
@@ -694,7 +699,7 @@ impl Engine {
         state: &EngineState,
         signing_pk: &[u8],
     ) -> Option<(UserId, IdentityId)> {
-        state.txs.values().find_map(|tx| match &tx.payload {
+        state.bodies().iter().find_map(|tx| match &tx.payload {
             TxPayload::EngineCreateIdentity {
                 user_id,
                 identity_id,
@@ -1022,6 +1027,7 @@ pub(super) fn parse_group(
             None => Vec::new(),
         },
         epoch,
+        log: std::collections::BTreeMap::new(),
     }))
 }
 

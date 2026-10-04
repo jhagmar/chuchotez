@@ -33,7 +33,7 @@ fn fingerprint_payloads(
     let (inviter_payload, invitee_payload) = if state.is_sync(conversation_id) {
         let mut inviter_payload = None;
         let mut invitee_payload = None;
-        for tx in state.txs.values() {
+        for tx in state.bodies().iter() {
             if tx.conversation_id != conversation_id {
                 continue;
             }
@@ -404,7 +404,7 @@ impl Engine {
             | Some(Conversation::HandshakeSync(Handshake::Invitee(
                 HandshakeInvitee::Confirming { .. },
             ))) => {
-                let decided = state.txs.values().any(|t| {
+                let decided = state.bodies().iter().any(|t| {
                     matches!(t.payload, TxPayload::Confirm | TxPayload::Reject)
                         && t.conversation_id == ids.conversation_id
                 });
@@ -434,7 +434,7 @@ impl Engine {
         user_id: &UserId,
         identity_id: &IdentityId,
     ) -> Option<(Policy, Vec<u8>, Vec<u8>)> {
-        state.txs.values().find_map(|tx| match &tx.payload {
+        state.bodies().iter().find_map(|tx| match &tx.payload {
             TxPayload::EngineCreateIdentity {
                 user_id: u,
                 identity_id: i,
@@ -1016,17 +1016,11 @@ impl Engine {
         if durable.conversation_id != hit.cid {
             rekey_conversation(state, hit.cid, durable.conversation_id);
         }
-        if let Some(existing) = state.txs.get(&part.tx_id) {
+        if let Some(existing) = state.body(&part.tx_id) {
             if existing.payload == durable.payload {
-                if persistent && let PacketPlain::TxFragLast(last) = &opened.packet {
-                    store_durable_last_ack(
-                        state,
-                        durable.conversation_id,
-                        &last.actor_id,
-                        last.set_xor,
-                    );
-                    self.note_set_xor(state, rng, durable.conversation_id, last.set_xor)?;
-                }
+                #[allow(clippy::let_unit_value)]
+                #[rustfmt::skip]
+                let () = self.ack_completed_last(state, rng, persistent, &opened.packet, durable.conversation_id)?;
                 prune_cached_mks(state);
                 return Ok(Vec::new());
             }
@@ -1043,11 +1037,8 @@ impl Engine {
         let persist = self.persist_record(seq, &durable)?;
         state.persist_log.insert(seq, part.tx_id);
         state.next_seq = state.next_seq.saturating_add(1);
-        state.txs.insert(part.tx_id, durable);
-        if persistent && let PacketPlain::TxFragLast(last) = &opened.packet {
-            store_durable_last_ack(state, cid, &last.actor_id, last.set_xor);
-            self.note_set_xor(state, rng, cid, last.set_xor)?;
-        }
+        state.insert_body(part.tx_id, durable)?;
+        self.ack_completed_last(state, rng, persistent, &opened.packet, cid)?;
         prune_cached_mks(state);
         let conversation_id = cid;
         let mut out = vec![persist];
@@ -1189,6 +1180,12 @@ impl Engine {
             }
             Ok(None)
         }
+    }
+
+    #[rustfmt::skip]
+    fn ack_completed_last(&self, state: &mut EngineState, rng: &dyn Rng, persistent: bool, packet: &PacketPlain, cid: ConversationId) -> Result<(), EngineError> {
+        if persistent && let PacketPlain::TxFragLast(last) = packet { store_durable_last_ack(state, cid, &last.actor_id, last.set_xor); self.note_set_xor(state, rng, cid, last.set_xor)?; }
+        Ok(())
     }
 
     pub(super) fn complete_list_bin(

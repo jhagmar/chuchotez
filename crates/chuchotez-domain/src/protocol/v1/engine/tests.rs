@@ -864,19 +864,21 @@ fn library_edges() {
         .tick(EngineState::new(), 2_100_000_000)
         .expect("t3")
         .state;
-    collided.txs.insert(
-        init_id,
-        DurableBody {
-            conversation_id: engine.engine_conversation_id().expect("eid"),
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    collided
+        .insert_body(
+            init_id,
+            DurableBody {
+                conversation_id: engine.engine_conversation_id().expect("eid"),
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::EngineCreateUser {
+                    user_id: UserId::from_bytes([0; 32]),
+                },
             },
-            payload: TxPayload::EngineCreateUser {
-                user_id: UserId::from_bytes([0; 32]),
-            },
-        },
-    );
+        )
+        .expect("tx");
     assert_eq!(
         engine
             .set_defaults(
@@ -886,23 +888,30 @@ fn library_edges() {
             .unwrap_err(),
         EngineError::Equivocation
     );
-    let fresh = engine.tick(EngineState::new(), 2_200_000_000).expect("t4");
     let rec0 = invited.persist()[0].clone();
-    let applied = engine.apply(fresh.state, &rec0).expect("ap0");
+    let mut host = invited.state.clone();
+    let notice_id = host
+        .body_pairs()
+        .into_iter()
+        .find(|(_, body)| matches!(body.payload, TxPayload::Notice(_)))
+        .expect("notice")
+        .0;
+    host.remove_body(&notice_id);
+    let applied = engine.apply(host, &rec0).expect("ap0");
     assert!(applied.tx_count() > 0);
     let mut collide_apply = applied.clone();
-    let body = collide_apply.txs.values().next().expect("b").clone();
-    let tx_id = *collide_apply.txs.keys().next().expect("k");
-    collide_apply.txs.insert(
-        tx_id,
-        DurableBody {
-            conversation_id: body.conversation_id,
-            hlc: body.hlc,
-            payload: TxPayload::EngineDeleteUser {
-                user_id: UserId::from_bytes([0; 32]),
+    let body = collide_apply.bodies().into_iter().next().expect("b");
+    let tx_id = collide_apply.body_pairs()[0].0;
+    collide_apply
+        .insert_body(
+            tx_id,
+            DurableBody {
+                conversation_id: body.conversation_id,
+                hlc: body.hlc,
+                payload: TxPayload::Confirm,
             },
-        },
-    );
+        )
+        .expect("tx");
     assert_eq!(
         engine.apply(collide_apply, &rec0).unwrap_err(),
         EngineError::Equivocation
@@ -2252,10 +2261,10 @@ fn invite_packets_open_from_ticket_secret() {
     )
     .expect("open");
     assert!(!opened.from_cache);
-    let tx_id = *invited
+    let tx_id = invited
         .state
-        .txs
-        .iter()
+        .body_pairs()
+        .into_iter()
         .find(|(_, b)| b.conversation_id == cid)
         .expect("tx")
         .0;
@@ -2380,28 +2389,26 @@ fn invite_packets_open_from_ticket_secret() {
         )
         .expect("ghosthit");
     let mut huge = invited.state.clone();
-    huge.txs.insert(
-        tx_id,
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::Text(crate::protocol::v1::TxText {
-                body: (0..400_000)
-                    .map(|i| char::from(((i * 31) % 95 + 32) as u8))
-                    .collect(),
-                reply_to: None,
-                expire_at: None,
-            }),
-        },
-    );
     assert_eq!(
-        engine
-            .post_handshake_packets(&mut huge, &rng, cid, &ticket.secret, tx_id)
-            .unwrap_err(),
-        EngineError::BodyTooLarge
+        huge.insert_body(
+            tx_id,
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Text(crate::protocol::v1::TxText {
+                    body: (0..400_000)
+                        .map(|i| char::from(((i * 31) % 95 + 32) as u8))
+                        .collect(),
+                    reply_to: None,
+                    expire_at: None,
+                }),
+            },
+        )
+        .unwrap_err(),
+        EngineError::WrongPhase
     );
     let dropped = engine.delete_conversation(state, ids).expect("dc");
     assert!(dropped.state.send_chain_seq(&cid).is_none());
@@ -2529,24 +2536,26 @@ fn ingest_list_merges_notice_and_completes_bin() {
     ));
     let mut outside = ingested.state.clone();
     let extra = Tag::from_bytes([0x11; 32]);
-    outside.txs.insert(
-        extra,
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    outside
+        .insert_body(
+            extra,
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Confirm,
             },
-            payload: TxPayload::Confirm,
-        },
-    );
+        )
+        .expect("tx");
     outside.persist_log.insert(outside.next_seq, extra);
     outside.next_seq = outside.next_seq.saturating_add(1);
     assert_eq!(engine.fold(outside).unwrap_err(), EngineError::WrongPhase);
     let xor_match = PacketPlain::XorAck(PacketXorAck {
         actor_id: vec![9],
         packet_seq: ingested.state.recv_chain_seq(&cid).expect("rseq"),
-        set_xor: super::super::chain::set_xor_for(&ingested.state.txs, cid),
+        set_xor: super::super::chain::set_xor_for(ingested.state.body_pairs(), cid),
     });
     let packed_t = engine.suite.b64u().decode(&ticket_s).expect("dect");
     let canonical_t = engine
@@ -2599,23 +2608,25 @@ fn ingest_list_merges_notice_and_completes_bin() {
         EngineError::UnknownTag
     );
     let mut collide = ingested.state.clone();
-    let notice_id = *collide
-        .txs
-        .iter()
+    let notice_id = collide
+        .body_pairs()
+        .into_iter()
         .find(|(_, b)| matches!(b.payload, TxPayload::Notice(_)))
         .expect("nid")
         .0;
-    collide.txs.insert(
-        notice_id,
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    collide
+        .insert_body(
+            notice_id,
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Confirm,
             },
-            payload: TxPayload::Confirm,
-        },
-    );
+        )
+        .expect("tx");
     assert_eq!(
         engine
             .ingest_list(collide, &rng, w.channel.clone(), w.tag, &bodies)
@@ -3077,7 +3088,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
         .tick(cached_second.state, 1_700_000_000 + 172_801)
         .expect("texp");
     let mut named = ingested.state.clone();
-    named.txs.insert(
+    let _ = named.insert_body(
         Tag::from_bytes([0; 32]),
         DurableBody {
             conversation_id: cid,
@@ -3375,8 +3386,8 @@ fn handshake_intros_confirming_and_failures() {
         .collect();
     let intro_payload = inv_minted
         .state
-        .txs
-        .values()
+        .bodies()
+        .iter()
         .find(|body| matches!(body.payload, TxPayload::InviterIntro(_)))
         .expect("minted intro")
         .payload
@@ -3393,25 +3404,27 @@ fn handshake_intros_confirming_and_failures() {
     ));
     let inv_digest = engine.confirmation_digest(&inv_conf, &ids).expect("invcd");
     let mut swapped = inv_conf.clone();
-    for tx in swapped.txs.values_mut() {
-        match &mut tx.payload {
-            TxPayload::InviterIntro(i) => {
-                i.signing_pk = crate::protocol::v1::SigningPublicKey::from_bytes(vec![
+    swapped.edit_bodies(|txs| {
+        for tx in txs.values_mut() {
+            match &mut tx.payload {
+                TxPayload::InviterIntro(i) => {
+                    i.signing_pk = crate::protocol::v1::SigningPublicKey::from_bytes(vec![
                     0xff;
                     i.signing_pk
                         .len()
                 ])
-            }
-            TxPayload::InviteeIntro(i) => {
-                i.signing_pk = crate::protocol::v1::SigningPublicKey::from_bytes(vec![
+                }
+                TxPayload::InviteeIntro(i) => {
+                    i.signing_pk = crate::protocol::v1::SigningPublicKey::from_bytes(vec![
                     0x00;
                     i.signing_pk
                         .len()
                 ])
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
+    });
     let _ = engine.confirmation_digest(&swapped, &ids).expect("swap");
     let ie_conf = engine
         .ingest_list(
@@ -3547,7 +3560,7 @@ fn handshake_intros_confirming_and_failures() {
     assert!(applied.established_secret(child).is_some());
     let _ = engine.apply(applied, &persist).expect("applyc2");
     let mut missing = inv_conf.clone();
-    missing.txs.retain(|_, body| {
+    missing.retain_bodies(|_, body| {
         !matches!(
             body.payload,
             TxPayload::InviterIntro(_) | TxPayload::InviteeIntro(_)
@@ -3683,17 +3696,19 @@ fn handshake_intros_confirming_and_failures() {
         ephemerals: Vec::new(),
         expires: UnixSeconds::from_u64(1_800_000_000),
     });
-    policy_mint.txs.insert(
-        Tag::from_bytes([0x22; 32]),
-        DurableBody {
-            conversation_id: mcid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    policy_mint
+        .insert_body(
+            Tag::from_bytes([0x22; 32]),
+            DurableBody {
+                conversation_id: mcid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: stored_notice.clone(),
             },
-            payload: stored_notice.clone(),
-        },
-    );
+        )
+        .expect("tx");
     engine
         .handshake_ingest_gate(&mut policy_mint, mcid, &stored_notice)
         .expect("pm");
@@ -4059,50 +4074,57 @@ fn handshake_intros_confirming_and_failures() {
         Some(FailedReason::IntroVerifyFailed)
     );
     let mut wrap_fail = pinned.clone();
-    wrap_fail.txs.insert(
-        Tag::from_bytes([0x11; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::InviteeIntro(TxInviteeIntro {
-                name: DisplayName::try_from("W").expect("dnw"),
-                profile_pic: None,
-                send_tag_key: TagKey::from_bytes([12; 32]),
-                eph_send_tag_key: TagKey::from_bytes([13; 32]),
-                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
-                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
-                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
-                seed_ct: vec![1; 32],
-                prefs: OnWirePrefs {
-                    read_receipts: true,
-                    online_visible: true,
-                    send_typing: true,
-                    disappear_after: None,
-                    wake: None,
+    wrap_fail
+        .insert_body(
+            Tag::from_bytes([0x11; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
                 },
-            }),
-        },
-    );
+                payload: TxPayload::InviteeIntro(TxInviteeIntro {
+                    name: DisplayName::try_from("W").expect("dnw"),
+                    profile_pic: None,
+                    send_tag_key: TagKey::from_bytes([12; 32]),
+                    eph_send_tag_key: TagKey::from_bytes([13; 32]),
+                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                        1;
+                        32
+                    ]),
+                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
+                    seed_ct: vec![1; 32],
+                    prefs: OnWirePrefs {
+                        read_receipts: true,
+                        online_visible: true,
+                        send_typing: true,
+                        disappear_after: None,
+                        wake: None,
+                    },
+                }),
+            },
+        )
+        .expect("tx");
     let extra = engine
         .try_mint_inviter_intro(&mut wrap_fail, &rng, cid)
         .expect("wrapf");
     assert!(extra.is_empty());
     assert_eq!(wrap_fail.failed(cid), Some(FailedReason::IntroVerifyFailed));
     let mut already = pinned.clone();
-    already.txs.insert(
-        Tag::from_bytes([0x21; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    already
+        .insert_body(
+            Tag::from_bytes([0x21; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: ok_inviter.clone(),
             },
-            payload: ok_inviter.clone(),
-        },
-    );
+        )
+        .expect("tx");
     assert!(
         engine
             .try_mint_inviter_intro(&mut already, &rng, cid)
@@ -4118,33 +4140,38 @@ fn handshake_intros_confirming_and_failures() {
         .public_bytes()
         .to_vec();
     let mut unwrap_mint = pinned.clone();
-    unwrap_mint.txs.insert(
-        Tag::from_bytes([0x22; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::InviteeIntro(TxInviteeIntro {
-                name: DisplayName::try_from("U").expect("dnu"),
-                profile_pic: None,
-                send_tag_key: TagKey::from_bytes([16; 32]),
-                eph_send_tag_key: TagKey::from_bytes([17; 32]),
-                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
-                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
-                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(intake_pk),
-                seed_ct: vec![0xee, 0xfd],
-                prefs: OnWirePrefs {
-                    read_receipts: true,
-                    online_visible: true,
-                    send_typing: true,
-                    disappear_after: None,
-                    wake: None,
+    unwrap_mint
+        .insert_body(
+            Tag::from_bytes([0x22; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
                 },
-            }),
-        },
-    );
+                payload: TxPayload::InviteeIntro(TxInviteeIntro {
+                    name: DisplayName::try_from("U").expect("dnu"),
+                    profile_pic: None,
+                    send_tag_key: TagKey::from_bytes([16; 32]),
+                    eph_send_tag_key: TagKey::from_bytes([17; 32]),
+                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                        1;
+                        32
+                    ]),
+                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(intake_pk),
+                    seed_ct: vec![0xee, 0xfd],
+                    prefs: OnWirePrefs {
+                        read_receipts: true,
+                        online_visible: true,
+                        send_typing: true,
+                        disappear_after: None,
+                        wake: None,
+                    },
+                }),
+            },
+        )
+        .expect("tx");
     assert!(
         engine
             .try_mint_inviter_intro(&mut unwrap_mint, &rng, cid)
@@ -4165,7 +4192,7 @@ fn handshake_intros_confirming_and_failures() {
         engine.conv_secret(&no_ticket, &cid).unwrap_err(),
         EngineError::UnknownIds
     );
-    no_ticket.txs.insert(
+    let _ = no_ticket.insert_body(
         Tag::from_bytes([0x33; 32]),
         DurableBody {
             conversation_id: cid,
@@ -4198,33 +4225,38 @@ fn handshake_intros_confirming_and_failures() {
             .expect("nt")
             .is_empty()
     );
-    pending_inviter.txs.insert(
-        Tag::from_bytes([0x34; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::InviteeIntro(TxInviteeIntro {
-                name: DisplayName::try_from("P").expect("dnp"),
-                profile_pic: None,
-                send_tag_key: TagKey::from_bytes([16; 32]),
-                eph_send_tag_key: TagKey::from_bytes([17; 32]),
-                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
-                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
-                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
-                seed_ct: vec![1; 32],
-                prefs: OnWirePrefs {
-                    read_receipts: true,
-                    online_visible: true,
-                    send_typing: true,
-                    disappear_after: None,
-                    wake: None,
+    pending_inviter
+        .insert_body(
+            Tag::from_bytes([0x34; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
                 },
-            }),
-        },
-    );
+                payload: TxPayload::InviteeIntro(TxInviteeIntro {
+                    name: DisplayName::try_from("P").expect("dnp"),
+                    profile_pic: None,
+                    send_tag_key: TagKey::from_bytes([16; 32]),
+                    eph_send_tag_key: TagKey::from_bytes([17; 32]),
+                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                        1;
+                        32
+                    ]),
+                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+                    seed_ct: vec![1; 32],
+                    prefs: OnWirePrefs {
+                        read_receipts: true,
+                        online_visible: true,
+                        send_typing: true,
+                        disappear_after: None,
+                        wake: None,
+                    },
+                }),
+            },
+        )
+        .expect("tx");
     engine
         .try_mint_inviter_intro(&mut pending_inviter, &rng, cid)
         .expect("pw");
@@ -4572,7 +4604,7 @@ fn handshake_sync_intros() {
         })) if !d.is_empty()
     ));
     let mut missing_sync = ie_conf.state.clone();
-    missing_sync.txs.retain(|_, body| {
+    missing_sync.retain_bodies(|_, body| {
         !matches!(
             body.payload,
             TxPayload::InviterIntro(_)
@@ -4691,13 +4723,19 @@ fn watermark_expire_live_ack_and_fold_fields() {
         .tick(EngineState::new(), 1_700_000_000)
         .expect("tick");
     let (created, uid) = engine.create_user(ticked.state, &rng).expect("user");
-    let eid = engine.engine_conversation_id().expect("eid");
     let mut exp = created.state.clone();
     let expired_tx = Tag::from_bytes([0x22; 32]);
-    exp.txs.insert(
+    let expired_cid = ConversationId::from_bytes([0x22; 32]);
+    exp.put_dm(
+        uid,
+        crate::protocol::v1::IdentityId::from_bytes([1; 32]),
+        expired_cid,
+        super::state::IdentityNode::direct(Secret::from_bytes([2; 32]), expired_cid),
+    );
+    exp.insert_body(
         expired_tx,
         DurableBody {
-            conversation_id: eid,
+            conversation_id: expired_cid,
             hlc: Hlc {
                 wall_ms: 0,
                 counter: 0,
@@ -4708,12 +4746,13 @@ fn watermark_expire_live_ack_and_fold_fields() {
                 expire_at: Some(UnixSeconds::from_u64(1)),
             }),
         },
-    );
+    )
+    .expect("tx");
     exp.persist_log.insert(exp.next_seq, expired_tx);
     exp.next_seq = exp.next_seq.saturating_add(1);
     let snap_e = engine.fold(exp).expect("fexp");
     let restored_e = engine.apply_folded(&snap_e.snapshot).expect("aexp");
-    assert!(!restored_e.txs.contains_key(&expired_tx));
+    assert!(!restored_e.contains_body(&expired_tx));
     let (created, iid) = engine
         .create_identity(created.state, &rng, uid, Policy::Classic)
         .expect("id");
@@ -4796,17 +4835,19 @@ fn watermark_expire_live_ack_and_fold_fields() {
         )
         .expect("ty");
     let mut ghost = ingested.state.clone();
-    ghost.txs.insert(
-        Tag::from_bytes([0x33; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    ghost
+        .insert_body(
+            Tag::from_bytes([0x33; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Confirm,
             },
-            payload: TxPayload::Confirm,
-        },
-    );
+        )
+        .expect("tx");
     engine.fold(ghost).expect("ghost");
     let mut empty_actors = ingested.state.clone();
     empty_actors.put_last_ack(cid, Actor::handshake(), Default::default());
@@ -4818,27 +4859,36 @@ fn watermark_expire_live_ack_and_fold_fields() {
     );
     engine.fold(orphan).expect("orph");
     let mut media = ingested.state.clone();
-    media.txs.insert(
-        Tag::from_bytes([0x55; 32]),
-        DurableBody {
-            conversation_id: eid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::Media(TxMedia {
-                mime: "image/png".into(),
-                filename: "a.png".into(),
-                hash: Tag::from_bytes([3; 32]),
-                kind: Kind::try_from("nostr").expect("mk"),
-                address: Address::try_from("https://blob.example").expect("ma"),
-                tag: Tag::from_bytes([4; 32]),
-                caption: None,
-                reply_to: None,
-                expire_at: Some(UnixSeconds::from_u64(1)),
-            }),
-        },
+    let media_cid = ConversationId::from_bytes([0x55; 32]);
+    media.put_dm(
+        uid,
+        crate::protocol::v1::IdentityId::from_bytes([7; 32]),
+        media_cid,
+        super::state::IdentityNode::direct(Secret::from_bytes([8; 32]), media_cid),
     );
+    media
+        .insert_body(
+            Tag::from_bytes([0x55; 32]),
+            DurableBody {
+                conversation_id: media_cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Media(TxMedia {
+                    mime: "image/png".into(),
+                    filename: "a.png".into(),
+                    hash: Tag::from_bytes([3; 32]),
+                    kind: Kind::try_from("nostr").expect("mk"),
+                    address: Address::try_from("https://blob.example").expect("ma"),
+                    tag: Tag::from_bytes([4; 32]),
+                    caption: None,
+                    reply_to: None,
+                    expire_at: Some(UnixSeconds::from_u64(1)),
+                }),
+            },
+        )
+        .expect("tx");
     engine.fold(media).expect("fmedia");
     fn seal_fold(engine: &Engine, json: Json, seq: u64) -> Vec<u8> {
         let dek = engine.dek.as_ref().expect("dek");
@@ -5282,58 +5332,68 @@ fn fold_tree_phases_and_parse_errors() {
             policy: Policy::Hybrid,
         },
     );
-    mismatch.txs.insert(
-        Tag::from_bytes([0x71; 32]),
-        crate::protocol::v1::payload::DurableBody {
-            conversation_id: cid,
-            hlc: crate::protocol::v1::payload::Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: crate::protocol::v1::payload::TxPayload::Notice(
-                crate::protocol::v1::payload::TxNotice {
-                    policy: Policy::Hybrid,
-                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![0; 32]),
-                    persistents: ticket.persistents.clone(),
-                    ephemerals: Vec::new(),
-                    expires: UnixSeconds::from_u64(9),
+    mismatch
+        .insert_body(
+            Tag::from_bytes([0x71; 32]),
+            crate::protocol::v1::payload::DurableBody {
+                conversation_id: cid,
+                hlc: crate::protocol::v1::payload::Hlc {
+                    wall_ms: 0,
+                    counter: 0,
                 },
-            ),
-        },
-    );
-    let mut duplicate = mismatch.clone();
-    duplicate.txs.insert(
-        Tag::from_bytes([0x72; 32]),
-        crate::protocol::v1::payload::DurableBody {
-            conversation_id: cid,
-            hlc: crate::protocol::v1::payload::Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: crate::protocol::v1::payload::TxPayload::InviteeIntro(
-                crate::protocol::v1::payload::TxInviteeIntro {
-                    name: crate::protocol::v1::DisplayName::try_from("A").expect("a"),
-                    profile_pic: None,
-                    send_tag_key: crate::protocol::v1::TagKey::from_bytes([1; 32]),
-                    eph_send_tag_key: crate::protocol::v1::TagKey::from_bytes([2; 32]),
-                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
-                        1;
-                        32
-                    ]),
-                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
-                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
-                    seed_ct: vec![1; 32],
-                    prefs: crate::protocol::v1::OnWirePrefs {
-                        read_receipts: true,
-                        online_visible: true,
-                        send_typing: true,
-                        disappear_after: None,
-                        wake: None,
+                payload: crate::protocol::v1::payload::TxPayload::Notice(
+                    crate::protocol::v1::payload::TxNotice {
+                        policy: Policy::Hybrid,
+                        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                            0;
+                            32
+                        ]),
+                        persistents: ticket.persistents.clone(),
+                        ephemerals: Vec::new(),
+                        expires: UnixSeconds::from_u64(9),
                     },
+                ),
+            },
+        )
+        .expect("tx");
+    let mut duplicate = mismatch.clone();
+    duplicate
+        .insert_body(
+            Tag::from_bytes([0x72; 32]),
+            crate::protocol::v1::payload::DurableBody {
+                conversation_id: cid,
+                hlc: crate::protocol::v1::payload::Hlc {
+                    wall_ms: 0,
+                    counter: 0,
                 },
-            ),
-        },
-    );
+                payload: crate::protocol::v1::payload::TxPayload::InviteeIntro(
+                    crate::protocol::v1::payload::TxInviteeIntro {
+                        name: crate::protocol::v1::DisplayName::try_from("A").expect("a"),
+                        profile_pic: None,
+                        send_tag_key: crate::protocol::v1::TagKey::from_bytes([1; 32]),
+                        eph_send_tag_key: crate::protocol::v1::TagKey::from_bytes([2; 32]),
+                        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                            1;
+                            32
+                        ]),
+                        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                            1;
+                            32
+                        ]),
+                        seed_ct: vec![1; 32],
+                        prefs: crate::protocol::v1::OnWirePrefs {
+                            read_receipts: true,
+                            online_visible: true,
+                            send_typing: true,
+                            disappear_after: None,
+                            wake: None,
+                        },
+                    },
+                ),
+            },
+        )
+        .expect("tx");
     assert!(
         engine
             .try_mint_invitee_intro(&mut duplicate, &rng, cid)
@@ -5354,54 +5414,64 @@ fn fold_tree_phases_and_parse_errors() {
             list_from,
         },
     );
-    wrap_fail.txs.insert(
-        Tag::from_bytes([0x73; 32]),
-        crate::protocol::v1::payload::DurableBody {
-            conversation_id: cid,
-            hlc: crate::protocol::v1::payload::Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: crate::protocol::v1::payload::TxPayload::Notice(
-                crate::protocol::v1::payload::TxNotice {
-                    policy: Policy::Classic,
-                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![0; 32]),
-                    persistents: ticket.persistents.clone(),
-                    ephemerals: Vec::new(),
-                    expires: UnixSeconds::from_u64(9),
+    wrap_fail
+        .insert_body(
+            Tag::from_bytes([0x73; 32]),
+            crate::protocol::v1::payload::DurableBody {
+                conversation_id: cid,
+                hlc: crate::protocol::v1::payload::Hlc {
+                    wall_ms: 0,
+                    counter: 0,
                 },
-            ),
-        },
-    );
-    wrap_fail.txs.insert(
-        Tag::from_bytes([0x74; 32]),
-        crate::protocol::v1::payload::DurableBody {
-            conversation_id: cid,
-            hlc: crate::protocol::v1::payload::Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: crate::protocol::v1::payload::TxPayload::InviteeIntro(
-                crate::protocol::v1::payload::TxInviteeIntro {
-                    name: crate::protocol::v1::DisplayName::try_from("B").expect("b"),
-                    profile_pic: None,
-                    send_tag_key: crate::protocol::v1::TagKey::from_bytes([3; 32]),
-                    eph_send_tag_key: crate::protocol::v1::TagKey::from_bytes([4; 32]),
-                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 8]),
-                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 8]),
-                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 8]),
-                    seed_ct: vec![1; 8],
-                    prefs: crate::protocol::v1::OnWirePrefs {
-                        read_receipts: true,
-                        online_visible: true,
-                        send_typing: true,
-                        disappear_after: None,
-                        wake: None,
+                payload: crate::protocol::v1::payload::TxPayload::Notice(
+                    crate::protocol::v1::payload::TxNotice {
+                        policy: Policy::Classic,
+                        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                            0;
+                            32
+                        ]),
+                        persistents: ticket.persistents.clone(),
+                        ephemerals: Vec::new(),
+                        expires: UnixSeconds::from_u64(9),
                     },
+                ),
+            },
+        )
+        .expect("tx");
+    wrap_fail
+        .insert_body(
+            Tag::from_bytes([0x74; 32]),
+            crate::protocol::v1::payload::DurableBody {
+                conversation_id: cid,
+                hlc: crate::protocol::v1::payload::Hlc {
+                    wall_ms: 0,
+                    counter: 0,
                 },
-            ),
-        },
-    );
+                payload: crate::protocol::v1::payload::TxPayload::InviteeIntro(
+                    crate::protocol::v1::payload::TxInviteeIntro {
+                        name: crate::protocol::v1::DisplayName::try_from("B").expect("b"),
+                        profile_pic: None,
+                        send_tag_key: crate::protocol::v1::TagKey::from_bytes([3; 32]),
+                        eph_send_tag_key: crate::protocol::v1::TagKey::from_bytes([4; 32]),
+                        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                            1;
+                            8
+                        ]),
+                        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 8]),
+                        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 8]),
+                        seed_ct: vec![1; 8],
+                        prefs: crate::protocol::v1::OnWirePrefs {
+                            read_receipts: true,
+                            online_visible: true,
+                            send_typing: true,
+                            disappear_after: None,
+                            wake: None,
+                        },
+                    },
+                ),
+            },
+        )
+        .expect("tx");
     assert!(
         engine
             .try_mint_inviter_intro(&mut wrap_fail, &rng, cid)
@@ -6181,10 +6251,10 @@ fn advertise_wrap_ack_and_mix() {
     let (invited, cid) = engine
         .create_invite(created.state, &rng, uid, iid, 1_800_000_000, None)
         .expect("inv");
-    let notice_tx = *invited
+    let notice_tx = invited
         .state
-        .txs
-        .iter()
+        .body_pairs()
+        .into_iter()
         .find(|(_, body)| matches!(body.payload, TxPayload::Notice(_)))
         .expect("notice")
         .0;
@@ -6199,12 +6269,11 @@ fn advertise_wrap_ack_and_mix() {
         .post_handshake_packets(&mut owed, &rng, cid, &secret, notice_tx)
         .expect("adv");
     assert!(
-        owed.txs
-            .values()
-            .any(|body| matches!(body.payload, TxPayload::Advertise { .. }))
+        owed.bodies()
+            .iter()
+            .all(|body| !matches!(body.payload, TxPayload::Advertise { .. }))
     );
-    assert_eq!(owed.chains(cid).expect("c").ratchet.unused.len(), 1);
-    assert!(owed.chains(cid).expect("c").ratchet.since < 50);
+    assert!(owed.chains(cid).expect("c").ratchet.since >= 50);
 
     let mut full = owed.clone();
     {
@@ -6226,15 +6295,23 @@ fn advertise_wrap_ack_and_mix() {
         .expect("drop");
     let unused = &full.chains(cid).expect("c").ratchet.unused;
     assert_eq!(unused.len(), 8);
-    assert!(unused.iter().all(|sk| sk.tx_id != Tag::from_bytes([0; 32])));
+    assert!(unused.iter().any(|sk| sk.tx_id == Tag::from_bytes([0; 32])));
 
+    let dm = ConversationId::from_bytes([0xd1; 32]);
+    let dm_secret = Secret::from_bytes([0xd2; 32]);
     let mut acks = invited.state.clone();
+    acks.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
+    );
     let peer_pk = vec![7u8; 32];
     let ad_tx = Tag::from_bytes([0x51; 32]);
-    acks.txs.insert(
+    acks.insert_body(
         ad_tx,
         DurableBody {
-            conversation_id: cid,
+            conversation_id: dm,
             hlc: Hlc {
                 wall_ms: 0,
                 counter: 0,
@@ -6243,22 +6320,23 @@ fn advertise_wrap_ack_and_mix() {
                 encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(peer_pk.clone()),
             },
         },
-    );
-    acks.chains_mut(cid).expect("c").ratchet.since = 50;
+    )
+    .expect("tx");
+    acks.chains_mut(dm).expect("c").ratchet.since = 50;
     engine
-        .post_handshake_packets(&mut acks, &rng, cid, &secret, notice_tx)
+        .mint_if_owed(&mut acks, &rng, dm, &dm_secret)
         .expect("ackad");
     let pk_hash = Tag::from_bytes(engine.suite.hash().hash(&peer_pk));
-    assert!(acks.txs.values().any(|body| matches!(
+    assert!(acks.bodies().iter().any(|body| matches!(
         &body.payload,
         TxPayload::Ack { ratchet_ack } if *ratchet_ack == pk_hash
     )));
-    acks.chains_mut(cid).expect("c").ratchet.since = 50;
+    acks.chains_mut(dm).expect("c").ratchet.since = 50;
     engine
-        .post_handshake_packets(&mut acks, &rng, cid, &secret, notice_tx)
+        .mint_if_owed(&mut acks, &rng, dm, &dm_secret)
         .expect("wrap");
     assert!(
-        acks.chains(cid)
+        acks.chains(dm)
             .expect("c")
             .ratchet
             .known
@@ -6267,9 +6345,15 @@ fn advertise_wrap_ack_and_mix() {
     );
 
     let mut peer_wrap = invited.state.clone();
+    peer_wrap.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
+    );
     let sk_tx = Tag::from_bytes([0x41; 32]);
     {
-        let chains = peer_wrap.chains_mut(cid).expect("c");
+        let chains = peer_wrap.chains_mut(dm).expect("c");
         chains.ratchet.minted.insert(sk_tx);
         chains.ratchet.unused.push(UnusedSk {
             tx_id: sk_tx,
@@ -6286,62 +6370,71 @@ fn advertise_wrap_ack_and_mix() {
         chains.ratchet.since = 50;
     }
     let ct = vec![3u8; 32];
-    peer_wrap.txs.insert(
-        Tag::from_bytes([0x50; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    peer_wrap
+        .insert_body(
+            Tag::from_bytes([0x50; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Wrap { kem_ct: ct },
             },
-            payload: TxPayload::Wrap { kem_ct: ct },
-        },
-    );
-    peer_wrap.txs.insert(
-        Tag::from_bytes([0x43; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+        )
+        .expect("tx");
+    peer_wrap
+        .insert_body(
+            Tag::from_bytes([0x43; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Wrap { kem_ct: vec![1] },
             },
-            payload: TxPayload::Wrap { kem_ct: vec![1] },
-        },
-    );
+        )
+        .expect("tx");
     let mut reject = vec![0u8; 32];
     reject[0] = 0xee;
     reject[1] = 0xfd;
-    peer_wrap.txs.insert(
-        Tag::from_bytes([0x30; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    peer_wrap
+        .insert_body(
+            Tag::from_bytes([0x30; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Wrap { kem_ct: reject },
             },
-            payload: TxPayload::Wrap { kem_ct: reject },
-        },
-    );
+        )
+        .expect("tx");
     let mut short_ss = vec![0u8; 32];
     short_ss[0] = 0xee;
     short_ss[1] = 0xfe;
-    peer_wrap.txs.insert(
-        Tag::from_bytes([0x31; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    peer_wrap
+        .insert_body(
+            Tag::from_bytes([0x31; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Wrap { kem_ct: short_ss },
             },
-            payload: TxPayload::Wrap { kem_ct: short_ss },
-        },
-    );
+        )
+        .expect("tx");
+    engine.absorb_peer_wraps(&mut peer_wrap, dm);
     engine
-        .post_handshake_packets(&mut peer_wrap, &rng, cid, &secret, notice_tx)
+        .mint_if_owed(&mut peer_wrap, &rng, dm, &dm_secret)
         .expect("ackwrap");
     assert!(
         peer_wrap
-            .chains(cid)
+            .chains(dm)
             .expect("c")
             .ratchet
             .known
@@ -6350,8 +6443,8 @@ fn advertise_wrap_ack_and_mix() {
     );
     assert!(
         peer_wrap
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .any(|body| matches!(body.payload, TxPayload::Ack { .. }))
     );
     let mut skipped_ack = invited.state.clone();
@@ -6407,7 +6500,7 @@ fn advertise_wrap_ack_and_mix() {
             },
         ),
     ] {
-        skipped_ack.txs.insert(
+        let _ = skipped_ack.insert_body(
             id,
             DurableBody {
                 conversation_id: cid,
@@ -6424,15 +6517,27 @@ fn advertise_wrap_ack_and_mix() {
         .expect("skipack");
 
     let mut quiet = invited.state.clone();
-    quiet.txs.get_mut(&notice_tx).expect("n").payload = TxPayload::Confirm;
+    quiet.edit_bodies(|txs| {
+        txs.get_mut(&notice_tx).expect("n").payload = TxPayload::Confirm;
+    });
     quiet.chains_mut(cid).expect("c").ratchet.since = 50;
     engine
         .post_handshake_packets(&mut quiet, &rng, cid, &secret, notice_tx)
         .expect("identity-policy");
+    quiet.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
+    );
+    quiet.chains_mut(dm).expect("c").ratchet.since = 50;
+    engine
+        .mint_if_owed(&mut quiet, &rng, dm, &dm_secret)
+        .expect("quiet-ad");
     assert!(
         quiet
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .any(|body| matches!(body.payload, TxPayload::Advertise { .. }))
     );
     let child = ConversationId::from_bytes([8; 32]);
@@ -6472,76 +6577,99 @@ fn advertise_wrap_ack_and_mix() {
     );
     assert!(super::ratchet::conversation_policy(&quiet, sync_cid).is_none());
     let sync_tx = Tag::from_bytes([0x11; 32]);
-    quiet.txs.insert(
-        sync_tx,
-        DurableBody {
-            conversation_id: sync_cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    quiet
+        .insert_body(
+            sync_tx,
+            DurableBody {
+                conversation_id: sync_cid,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Confirm,
             },
-            payload: TxPayload::Confirm,
-        },
-    );
+        )
+        .expect("tx");
     quiet.chains_mut(sync_cid).expect("sc").ratchet.since = 50;
-    let sync_len = quiet.txs.len();
+    let sync_len = quiet.tx_count();
     engine
         .post_handshake_packets(&mut quiet, &rng, sync_cid, &ticket.secret, sync_tx)
         .expect("sync-none");
-    assert_eq!(quiet.txs.len(), sync_len);
+    assert_eq!(quiet.tx_count(), sync_len);
     let notice = invited
         .state
-        .txs
-        .get(&notice_tx)
+        .body(&notice_tx)
         .expect("orig")
         .payload
         .clone();
-    quiet.txs.get_mut(&notice_tx).expect("n").payload = notice;
+    quiet.edit_bodies(|txs| {
+        txs.get_mut(&notice_tx).expect("n").payload = notice;
+    });
     assert_eq!(
         super::ratchet::conversation_policy(&quiet, child),
         Some(Policy::Classic)
     );
 
     let mut hidden = invited.state.clone();
-    hidden.txs.insert(
-        Tag::from_bytes([0x52; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::Advertise {
-                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![4; 32]),
-            },
-        },
+    hidden.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
     );
     hidden
-        .chains_mut(cid)
+        .insert_body(
+            Tag::from_bytes([0x52; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Advertise {
+                    encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![4; 32]),
+                },
+            },
+        )
+        .expect("tx");
+    hidden
+        .chains_mut(dm)
         .expect("c")
         .last_acks
         .insert(Actor::handshake(), BTreeSet::from([notice_tx]));
-    hidden.chains_mut(cid).expect("c").ratchet.since = 50;
+    hidden.chains_mut(dm).expect("c").ratchet.since = 50;
     let ads_before = hidden
-        .txs
-        .values()
+        .bodies()
+        .iter()
         .filter(|body| matches!(body.payload, TxPayload::Advertise { .. }))
         .count();
     engine
-        .post_handshake_packets(&mut hidden, &rng, cid, &secret, notice_tx)
+        .mint_if_owed(&mut hidden, &rng, dm, &dm_secret)
         .expect("hidden");
     let ads_after = hidden
-        .txs
-        .values()
+        .bodies()
+        .iter()
         .filter(|body| matches!(body.payload, TxPayload::Advertise { .. }))
         .count();
     assert!(ads_after > ads_before);
-    assert!(hidden.chains(cid).expect("c").ratchet.known.is_empty());
+    assert!(hidden.chains(dm).expect("c").ratchet.known.is_empty());
 
     let mut mix_state = invited.state.clone();
+    mix_state.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
+    );
     {
-        let chains = mix_state.chains_mut(cid).expect("c");
-        let mut chain = chains.send.get(&Actor::handshake()).expect("send").clone();
+        let chains = mix_state.chains_mut(dm).expect("c");
+        let mut chain = super::super::chain::join(
+            engine.suite.hmac(),
+            dm_secret.as_bytes(),
+            ConversationSort::DirectMessage,
+            &[],
+        )
+        .expect("join");
         chain.packet_seq = PacketSeq::from_u64(8);
         chains.send.insert(Actor::handshake(), chain);
         for i in 0..8u8 {
@@ -6557,43 +6685,53 @@ fn advertise_wrap_ack_and_mix() {
     for i in 0..8u8 {
         let wrap_tx = Tag::from_bytes([0x60 + i; 32]);
         let ct_hash = Tag::from_bytes([0x70 + i; 32]);
-        mix_state.txs.insert(
-            wrap_tx,
-            DurableBody {
-                conversation_id: cid,
-                hlc: Hlc {
-                    wall_ms: 0,
-                    counter: 0,
+        mix_state
+            .insert_body(
+                wrap_tx,
+                DurableBody {
+                    conversation_id: dm,
+                    hlc: Hlc {
+                        wall_ms: 0,
+                        counter: 0,
+                    },
+                    payload: TxPayload::Wrap {
+                        kem_ct: vec![i; 32],
+                    },
                 },
-                payload: TxPayload::Wrap {
-                    kem_ct: vec![i; 32],
+            )
+            .expect("tx");
+        mix_state
+            .insert_body(
+                Tag::from_bytes([0x80 + i; 32]),
+                DurableBody {
+                    conversation_id: dm,
+                    hlc: Hlc {
+                        wall_ms: 0,
+                        counter: 0,
+                    },
+                    payload: TxPayload::Ack {
+                        ratchet_ack: ct_hash,
+                    },
                 },
-            },
-        );
-        mix_state.txs.insert(
-            Tag::from_bytes([0x80 + i; 32]),
-            DurableBody {
-                conversation_id: cid,
-                hlc: Hlc {
-                    wall_ms: 0,
-                    counter: 0,
-                },
-                payload: TxPayload::Ack {
-                    ratchet_ack: ct_hash,
-                },
-            },
-        );
+            )
+            .expect("tx");
     }
-    engine
-        .post_handshake_packets(&mut mix_state, &rng, cid, &secret, notice_tx)
-        .expect("mix");
-    let mixed_chain = mix_state
-        .chains(cid)
+    let before = mix_state
+        .chains(dm)
         .expect("c")
         .send
         .get(&Actor::handshake())
         .expect("send")
         .clone();
+    let mixed_chain = engine
+        .mixed_chain(
+            &mix_state,
+            dm,
+            ConversationSort::DirectMessage,
+            &before,
+            true,
+        )
+        .expect("mix");
     assert_eq!(mixed_chain.epoch, PacketEpoch::from_u64(1));
 
     let mut few = invited.state.clone();
@@ -6610,7 +6748,7 @@ fn advertise_wrap_ack_and_mix() {
             encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
         });
     }
-    few.txs.insert(
+    let _ = few.insert_body(
         Tag::from_bytes([0x91; 32]),
         DurableBody {
             conversation_id: cid,
@@ -6623,7 +6761,7 @@ fn advertise_wrap_ack_and_mix() {
             },
         },
     );
-    few.txs.insert(
+    let _ = few.insert_body(
         Tag::from_bytes([0x93; 32]),
         DurableBody {
             conversation_id: cid,
@@ -6671,7 +6809,7 @@ fn advertise_wrap_ack_and_mix() {
     for i in 0..8u8 {
         let wrap_tx = Tag::from_bytes([0x60 + i; 32]);
         let ct_hash = Tag::from_bytes([0x70 + i; 32]);
-        recv_state.txs.insert(
+        let _ = recv_state.insert_body(
             wrap_tx,
             DurableBody {
                 conversation_id: cid,
@@ -6684,7 +6822,7 @@ fn advertise_wrap_ack_and_mix() {
                 },
             },
         );
-        recv_state.txs.insert(
+        let _ = recv_state.insert_body(
             Tag::from_bytes([0xa0 + i; 32]),
             DurableBody {
                 conversation_id: cid,
@@ -6728,7 +6866,7 @@ fn advertise_wrap_ack_and_mix() {
             .get(&Actor::handshake())
             .expect("recv")
             .epoch,
-        PacketEpoch::from_u64(1)
+        PacketEpoch::from_u64(0)
     );
 
     let mut folded = invited.state.clone();
@@ -6791,7 +6929,7 @@ fn advertise_wrap_ack_and_mix() {
     let mut boom_state = invited.state.clone();
     let peer = vec![6u8; 32];
     let peer_hash = Tag::from_bytes(engine.suite.hash().hash(&peer));
-    boom_state.txs.insert(
+    let _ = boom_state.insert_body(
         Tag::from_bytes([0x55; 32]),
         DurableBody {
             conversation_id: cid,
@@ -6804,7 +6942,7 @@ fn advertise_wrap_ack_and_mix() {
             },
         },
     );
-    boom_state.txs.insert(
+    let _ = boom_state.insert_body(
         Tag::from_bytes([0x56; 32]),
         DurableBody {
             conversation_id: cid,
@@ -6818,10 +6956,54 @@ fn advertise_wrap_ack_and_mix() {
         },
     );
     boom_state.chains_mut(cid).expect("c").ratchet.since = 50;
-    let boom_len = boom_state.txs.len();
+    let boom_len = boom_state.tx_count();
     boom.post_handshake_packets(&mut boom_state, &rng, cid, &secret, notice_tx)
         .expect("boom");
-    assert_eq!(boom_state.txs.len(), boom_len);
+    assert_eq!(boom_state.tx_count(), boom_len);
+    boom_state.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
+    );
+    let boom_pk = vec![6u8; 32];
+    let boom_hash = Tag::from_bytes(boom.suite.hash().hash(&boom_pk));
+    boom_state
+        .insert_body(
+            Tag::from_bytes([0x55; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Advertise {
+                    encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(boom_pk),
+                },
+            },
+        )
+        .expect("boom-ad");
+    boom_state
+        .insert_body(
+            Tag::from_bytes([0x56; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Ack {
+                    ratchet_ack: boom_hash,
+                },
+            },
+        )
+        .expect("boom-ack");
+    boom_state.chains_mut(dm).expect("c").ratchet.since = 50;
+    assert!(
+        boom.mint_if_owed(&mut boom_state, &rng, dm, &dm_secret)
+            .expect("boom-mint")
+            .is_none()
+    );
 
     let mut short = Engine::new(
         suite_with_kem(Arc::new(ShortWrap)),
@@ -6831,6 +7013,12 @@ fn advertise_wrap_ack_and_mix() {
         .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
         .expect("swrap");
     let mut short_state = invited.state.clone();
+    short_state.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
+    );
     let old_pk = vec![8u8; 32];
     let new_pk = vec![9u8; 32];
     short_state
@@ -6845,64 +7033,72 @@ fn advertise_wrap_ack_and_mix() {
             from_us: true,
             encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(old_pk.clone()),
         });
-    short_state.txs.insert(
-        Tag::from_bytes([0x57; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+    short_state
+        .insert_body(
+            Tag::from_bytes([0x57; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Advertise {
+                    encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(old_pk),
+                },
             },
-            payload: TxPayload::Advertise {
-                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(old_pk),
+        )
+        .expect("tx");
+    short_state
+        .insert_body(
+            Tag::from_bytes([0x58; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Ack {
+                    ratchet_ack: Tag::from_bytes(engine.suite.hash().hash(&[8u8; 32])),
+                },
             },
-        },
-    );
-    short_state.txs.insert(
-        Tag::from_bytes([0x58; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
+        )
+        .expect("tx");
+    short_state
+        .insert_body(
+            Tag::from_bytes([0x5b; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Advertise {
+                    encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(new_pk.clone()),
+                },
             },
-            payload: TxPayload::Ack {
-                ratchet_ack: Tag::from_bytes(engine.suite.hash().hash(&[8u8; 32])),
+        )
+        .expect("tx");
+    short_state
+        .insert_body(
+            Tag::from_bytes([0x5c; 32]),
+            DurableBody {
+                conversation_id: dm,
+                hlc: Hlc {
+                    wall_ms: 0,
+                    counter: 0,
+                },
+                payload: TxPayload::Ack {
+                    ratchet_ack: Tag::from_bytes(engine.suite.hash().hash(&new_pk)),
+                },
             },
-        },
-    );
-    short_state.txs.insert(
-        Tag::from_bytes([0x5b; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::Advertise {
-                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(new_pk.clone()),
-            },
-        },
-    );
-    short_state.txs.insert(
-        Tag::from_bytes([0x5c; 32]),
-        DurableBody {
-            conversation_id: cid,
-            hlc: Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: TxPayload::Ack {
-                ratchet_ack: Tag::from_bytes(engine.suite.hash().hash(&new_pk)),
-            },
-        },
-    );
-    short_state.chains_mut(cid).expect("c").ratchet.since = 50;
-    let unused_before = short_state.chains(cid).expect("c").ratchet.unused.len();
+        )
+        .expect("tx");
+    short_state.chains_mut(dm).expect("c").ratchet.since = 50;
+    let unused_before = short_state.chains(dm).expect("c").ratchet.unused.len();
     short
-        .post_handshake_packets(&mut short_state, &rng, cid, &secret, notice_tx)
+        .mint_if_owed(&mut short_state, &rng, dm, &dm_secret)
         .expect("short");
-    assert!(short_state.chains(cid).expect("c").ratchet.unused.len() > unused_before);
+    assert!(short_state.chains(dm).expect("c").ratchet.unused.len() > unused_before);
 
     let b64 = engine.suite.b64u();
     let z = super::super::codec::bstr(b64, &[0u8; 32]);
@@ -7075,7 +7271,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         .state;
     let mut ada = invited.state.clone();
     let extra = Tag::from_bytes([0xab; 32]);
-    ada.txs.insert(
+    ada.insert_body(
         extra,
         DurableBody {
             conversation_id: cid,
@@ -7085,7 +7281,8 @@ fn heal_searches_then_retransmits_and_falls_back() {
             },
             payload: TxPayload::Confirm,
         },
-    );
+    )
+    .expect("tx");
     let chain = ada
         .chains(cid)
         .expect("c")
@@ -7093,7 +7290,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         .get(&Actor::handshake())
         .expect("send")
         .clone();
-    let remote = super::super::chain::set_xor_for(&ada.txs, cid);
+    let remote = super::super::chain::set_xor_for(ada.body_pairs(), cid);
     let mismatch = seal_packet(
         &engine.suite,
         &rng,
@@ -7114,7 +7311,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
     assert!(bob.chains(cid).expect("c").heal.probes.len() == 1);
     let mut next_bob = before;
     let mut guard = 0;
-    while !bob.txs.contains_key(&extra) && guard < 400 {
+    while !bob.contains_body(&extra) && guard < 400 {
         guard += 1;
         let batch: Vec<_> = bob.writes[next_bob..]
             .iter()
@@ -7136,7 +7333,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
                 .state;
         }
     }
-    assert!(bob.txs.contains_key(&extra), "rounds {guard}");
+    assert!(bob.contains_body(&extra), "rounds {guard}");
     assert!(bob.chains(cid).expect("c").heal.probes.is_empty());
 
     let eph = EphemeralChannel::new(
@@ -7201,7 +7398,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         .get(&Actor::handshake())
         .expect("lsend")
         .clone();
-    let matched = super::super::chain::set_xor_for(&ada.txs, cid);
+    let matched = super::super::chain::set_xor_for(ada.body_pairs(), cid);
     let live_ack = seal_packet(
         &live_engine.suite,
         &rng,
@@ -7219,7 +7416,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         .state;
     assert!(bob.chains(cid).expect("c").live_until.is_some());
     let mut ada = ada;
-    ada.txs.insert(
+    ada.insert_body(
         Tag::from_bytes([0xcd; 32]),
         DurableBody {
             conversation_id: cid,
@@ -7229,8 +7426,9 @@ fn heal_searches_then_retransmits_and_falls_back() {
             },
             payload: TxPayload::Reject,
         },
-    );
-    let mismatched = super::super::chain::set_xor_for(&ada.txs, cid);
+    )
+    .expect("tx");
+    let mismatched = super::super::chain::set_xor_for(ada.body_pairs(), cid);
     let probe = seal_packet(
         &live_engine.suite,
         &rng,
@@ -7339,9 +7537,9 @@ fn heal_searches_then_retransmits_and_falls_back() {
             lo: Tag::from_bytes([0; 32]),
             hi: Tag::from_bytes([0xff; 32]),
         });
-    let notice = *ada
-        .txs
-        .iter()
+    let notice = ada
+        .body_pairs()
+        .into_iter()
         .find(|(_, body)| body.conversation_id == cid)
         .expect("tx")
         .0;
@@ -7372,9 +7570,9 @@ fn heal_searches_then_retransmits_and_falls_back() {
     live_engine
         .on_heal_packet(&mut bob, &rng, cid, &have_many)
         .expect("many");
-    let known = *bob
-        .txs
-        .iter()
+    let known = bob
+        .body_pairs()
+        .into_iter()
         .find(|(_, body)| body.conversation_id == cid)
         .expect("known")
         .0;
@@ -7439,7 +7637,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         },
     );
     let held = Tag::from_bytes([0x44; 32]);
-    bob.txs.insert(
+    bob.insert_body(
         held,
         DurableBody {
             conversation_id: bare_cid,
@@ -7449,7 +7647,8 @@ fn heal_searches_then_retransmits_and_falls_back() {
             },
             payload: TxPayload::Confirm,
         },
-    );
+    )
+    .expect("tx");
     live_engine
         .on_heal_packet(
             &mut bob,
@@ -7501,7 +7700,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
     bob.chains_mut(cid).expect("c").heal.on_ephemeral = true;
     live_engine.reseal_due(&mut bob, &rng).expect("no-probes");
     let sync_tx = Tag::from_bytes([0x42; 32]);
-    bob.txs.insert(
+    bob.insert_body(
         sync_tx,
         DurableBody {
             conversation_id: sync_cid,
@@ -7511,7 +7710,8 @@ fn heal_searches_then_retransmits_and_falls_back() {
             },
             payload: TxPayload::Confirm,
         },
-    );
+    )
+    .expect("tx");
     live_engine
         .on_heal_packet(
             &mut bob,
@@ -7539,14 +7739,26 @@ fn heal_searches_then_retransmits_and_falls_back() {
             wall_ms: 3,
             counter: 0,
         },
-        payload: TxPayload::Text(super::super::payload::TxText {
-            body: "z".repeat(6_000),
-            reply_to: None,
-            expire_at: None,
+        payload: TxPayload::InviteeIntro(super::super::payload::TxInviteeIntro {
+            name: crate::protocol::v1::DisplayName::try_from("A").expect("n"),
+            profile_pic: None,
+            send_tag_key: crate::protocol::v1::TagKey::from_bytes([1; 32]),
+            eph_send_tag_key: crate::protocol::v1::TagKey::from_bytes([2; 32]),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![3; 32]),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![4; 32]),
+            intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![5; 32]),
+            seed_ct: vec![6; 2_000],
+            prefs: crate::protocol::v1::OnWirePrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake: None,
+            },
         }),
     };
     let tx = Tag::from_bytes([0xee; 32]);
-    let xor = super::super::chain::set_xor_for(&bob.txs, cid);
+    let xor = super::super::chain::set_xor_for(bob.body_pairs(), cid);
     let packed = super::super::chain::packed_tx(&live_engine.suite, &text);
     let frags = super::super::chain::fragment_body(
         &live_engine.suite,
@@ -7801,8 +8013,8 @@ fn live_path_waits_then_falls_back() {
             .state;
     }
     assert!(
-        bob.txs
-            .values()
+        bob.bodies()
+            .iter()
             .any(|tx| { matches!(&tx.payload, TxPayload::Text(text) if text.body == "hi") })
     );
     let bad = engine
@@ -7826,8 +8038,8 @@ fn live_path_waits_then_falls_back() {
         .unwrap_err();
     assert_eq!(bad_body, EngineError::UnknownTag);
     let invitee_pk = ada
-        .txs
-        .values()
+        .bodies()
+        .iter()
         .find_map(|tx| match &tx.payload {
             TxPayload::InviteeIntro(intro) if tx.conversation_id == cid => {
                 Some(intro.signing_pk.clone())
@@ -7862,7 +8074,7 @@ fn live_path_waits_then_falls_back() {
     assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
     assert!(ada.chains(child).expect("c").live_until.is_some());
     let mut stripped = ada.clone();
-    stripped.txs.retain(|_, body| {
+    stripped.retain_bodies(|_, body| {
         !matches!(
             body.payload,
             TxPayload::InviterIntro(_) | TxPayload::InviteeIntro(_)
@@ -7902,7 +8114,7 @@ fn live_path_waits_then_falls_back() {
         &PacketPlain::XorAck(PacketXorAck {
             actor_id: invitee_pk.as_bytes().to_vec(),
             packet_seq: 0,
-            set_xor: super::super::chain::set_xor_for(&ada.txs, child),
+            set_xor: super::super::chain::set_xor_for(ada.body_pairs(), child),
         }),
     )
     .expect("dxor");
@@ -7916,11 +8128,13 @@ fn live_path_waits_then_falls_back() {
         .expect("s3")
         .state;
     assert_eq!(ada.eph_writes.len(), live_before + text_eph);
-    for tx in ada.txs.values_mut() {
-        if let TxPayload::Notice(notice) = &mut tx.payload {
-            notice.ephemerals.clear();
+    ada.edit_bodies(|txs| {
+        for tx in txs.values_mut() {
+            if let TxPayload::Notice(notice) = &mut tx.payload {
+                notice.ephemerals.clear();
+            }
         }
-    }
+    });
     let writes_before = ada.writes.len();
     let eph_before = ada.eph_writes.len();
     ada = engine
@@ -7936,7 +8150,7 @@ fn live_path_waits_then_falls_back() {
             .state;
     }
     assert!(
-        bob.txs.values().any(|tx| {
+        bob.bodies().iter().any(|tx| {
             matches!(&tx.payload, TxPayload::Text(text) if text.body == "persistent")
         })
     );
@@ -7947,11 +8161,13 @@ fn live_path_waits_then_falls_back() {
     let (tx_id, _, _) = engine
         .merge_tx(&mut ada, &secret, child, payload.clone())
         .expect("adv");
-    for tx in ada.txs.values_mut() {
-        if let TxPayload::Notice(notice) = &mut tx.payload {
-            notice.ephemerals = vec![eph.clone()];
+    ada.edit_bodies(|txs| {
+        for tx in txs.values_mut() {
+            if let TxPayload::Notice(notice) = &mut tx.payload {
+                notice.ephemerals = vec![eph.clone()];
+            }
         }
-    }
+    });
     let writes_before = ada.writes.len();
     let eph_before = ada.eph_writes.len();
     engine
@@ -8126,11 +8342,13 @@ fn live_path_waits_then_falls_back() {
         Some(vec![9, 9, 9]),
     )
     .expect("wake");
-    for tx in ada.txs.values_mut() {
-        if let TxPayload::InviteeIntro(intro) = &mut tx.payload {
-            intro.prefs.wake = Some(wake.clone());
+    ada.edit_bodies(|txs| {
+        for tx in txs.values_mut() {
+            if let TxPayload::InviteeIntro(intro) = &mut tx.payload {
+                intro.prefs.wake = Some(wake.clone());
+            }
         }
-    }
+    });
     let pinged = engine
         .send_text(ada, &rng, ada_ids, "ping", None)
         .expect("ping");
@@ -8148,11 +8366,13 @@ fn live_path_waits_then_falls_back() {
         }])
         .is_empty()
     );
-    for tx in bob.txs.values_mut() {
-        if let TxPayload::InviterIntro(intro) = &mut tx.payload {
-            intro.prefs.wake = Some(wake.clone());
+    bob.edit_bodies(|txs| {
+        for tx in txs.values_mut() {
+            if let TxPayload::InviterIntro(intro) = &mut tx.payload {
+                intro.prefs.wake = Some(wake.clone());
+            }
         }
-    }
+    });
     let bob_ping = engine
         .send_text(bob, &rng, bob_ids, "pong", None)
         .expect("pong");
@@ -8186,7 +8406,7 @@ fn live_path_waits_then_falls_back() {
     assert_eq!(put.address.as_str(), "https://files.example");
     let mut hash = None;
     let mut saw_other = false;
-    for tx in sent.state.txs.values() {
+    for tx in sent.state.bodies().iter() {
         match &tx.payload {
             TxPayload::Media(media) if media.filename == "a.png" => hash = Some(media.hash),
             _ => saw_other = true,
@@ -8398,8 +8618,8 @@ fn live_path_waits_then_falls_back() {
     }
     assert!(
         owner
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .any(|tx| matches!(tx.payload, TxPayload::GroupRoster(_))),
         "roster posted"
     );
@@ -8459,8 +8679,8 @@ fn live_path_waits_then_falls_back() {
         .expect("kick-member");
     let rosters: Vec<_> = kicked_owner
         .state
-        .txs
-        .values()
+        .bodies()
+        .iter()
         .filter_map(|tx| match &tx.payload {
             TxPayload::GroupRoster(body) => Some(body.clone()),
             _ => None,
@@ -8545,8 +8765,8 @@ fn live_path_waits_then_falls_back() {
     }
     assert!(
         heard
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .any(|tx| { matches!(&tx.payload, TxPayload::Text(text) if text.body == "group-hi") })
     );
     assert_eq!(
@@ -8681,8 +8901,8 @@ fn live_path_waits_then_falls_back() {
         .expect("apply-f");
     let invite = grouped
         .state
-        .txs
-        .values()
+        .bodies()
+        .iter()
         .find_map(|tx| match &tx.payload {
             TxPayload::GroupInvite(inv) => Some(inv.clone()),
             _ => None,
@@ -9045,11 +9265,9 @@ fn live_path_sync_uses_device_actor() {
         EngineError::WrongPhase
     );
     let secret = ada.established_secret(child).expect("sec");
-    let payload = TxPayload::Text(crate::protocol::v1::payload::TxText {
-        body: "sync-hi".into(),
-        reply_to: None,
-        expire_at: None,
-    });
+    let payload = TxPayload::Name {
+        name: crate::protocol::v1::DisplayName::try_from("Phone").expect("name"),
+    };
     let (tx_id, _, _) = engine
         .merge_tx(&mut ada, &secret, child, payload.clone())
         .expect("merge");
@@ -9081,10 +9299,9 @@ fn live_path_sync_uses_device_actor() {
             .state;
     }
     assert!(
-        peer_state
-            .txs
-            .values()
-            .any(|tx| { matches!(&tx.payload, TxPayload::Text(text) if text.body == "sync-hi") })
+        peer_state.bodies().iter().any(|tx| {
+            matches!(&tx.payload, TxPayload::Name { name } if name.as_str() == "Phone")
+        })
     );
     assert!(ada.chains(child).expect("c").live_pending.is_empty());
     let eph_before = ada.eph_writes.len();
@@ -9354,7 +9571,7 @@ fn host_cycle_acks_a_post_and_a_blob() {
 #[test]
 fn actor_sort_and_watermark_edges() {
     use super::super::payload::ConversationSort;
-    use super::helpers::{actor_for, store_durable_last_ack, watermark_of};
+    use super::helpers::{actor_for, watermark_of};
     use super::party::{GroupPhase, IdentityConversation};
     use super::state::{DeviceNode, IdentityNode};
     use crate::protocol::v1::{ConversationId, IdentityId, Secret, Tag, UserId};
@@ -9365,18 +9582,6 @@ fn actor_sort_and_watermark_edges() {
     let cid = ConversationId::from_bytes([1; 32]);
     assert!(state.sort_of(cid).is_none());
     let tx = Tag::from_bytes([2; 32]);
-    state.txs.insert(
-        tx,
-        super::super::payload::DurableBody {
-            conversation_id: cid,
-            hlc: super::super::payload::Hlc {
-                wall_ms: 0,
-                counter: 0,
-            },
-            payload: super::super::payload::TxPayload::Confirm,
-        },
-    );
-    store_durable_last_ack(&mut state, cid, &[], tx);
     let user = UserId::from_bytes([3; 32]);
     state.ensure_identity(user, IdentityId::from_bytes([0; 32]));
     state.put_dm(
@@ -9413,4 +9618,401 @@ fn actor_sort_and_watermark_edges() {
     state.put_last_ack(cid, super::super::Actor::signing(vec![1]), [tx].into());
     state.put_last_ack(cid, super::super::Actor::signing(vec![2]), [tx].into());
     assert!(watermark_of(&state, cid).contains(&tx));
+}
+
+#[test]
+fn a_row_rejects_another_phases_transaction() {
+    use super::party::{GroupLive, GroupPhase, IdentityConversation};
+    use super::row_log::{
+        ChatTx, DmHandshakeTx, DmTx, EngineTx, GroupTx, LiveGroupTx, RatchetTx, SyncHandshakeTx,
+        SyncTx,
+    };
+    use super::state::{DeviceNode, IdentityNode};
+    use crate::protocol::v1::payload::TxText;
+    use crate::protocol::v1::{
+        ConversationId, DeviceId, DisplayName, EncryptionPublicKey, IdentityId, Secret,
+        SigningPublicKey, Tag, UserId,
+    };
+    let text = TxPayload::Text(TxText {
+        body: "x".into(),
+        reply_to: None,
+        expire_at: None,
+    });
+    assert!(DmHandshakeTx::from_payload(text.clone()).is_none());
+    assert!(SyncHandshakeTx::from_payload(text.clone()).is_none());
+    assert!(ChatTx::from_payload(TxPayload::Confirm).is_none());
+    assert!(RatchetTx::from_payload(TxPayload::Confirm).is_none());
+    assert!(GroupTx::from_payload(TxPayload::Confirm).is_none());
+    assert!(DmTx::from_payload(TxPayload::Confirm).is_none());
+    assert!(LiveGroupTx::from_payload(TxPayload::Confirm).is_none());
+    assert!(EngineTx::from_payload(TxPayload::Confirm).is_none());
+    assert!(SyncTx::from_payload(TxPayload::Confirm).is_none());
+    let mut engine = test_engine();
+    let rng = CounterRng::new();
+    engine
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("wrap");
+    let ticked = engine
+        .tick(EngineState::new(), 1_700_000_000)
+        .expect("tick");
+    let (sync_ok, sync_hs) = engine
+        .create_sync_invite(
+            ticked.state,
+            &rng,
+            Policy::Classic,
+            1_800_000_000,
+            "phone",
+            None,
+        )
+        .expect("sync");
+    let mut state = sync_ok.state;
+    let ticket = engine
+        .ticket_host_string(
+            &state,
+            &ConversationRef {
+                user_id: UserId::from_bytes([0; 32]),
+                identity_id: IdentityId::from_bytes([0; 32]),
+                conversation_id: sync_hs,
+            },
+        )
+        .expect("ticket");
+    let writes = state.writes.clone();
+    let ie = engine
+        .tick(EngineState::new(), 1_700_000_000)
+        .expect("ie")
+        .state;
+    let (ie, _) = engine.receive_sync_ticket(ie, &rng, &ticket).expect("recv");
+    let mut ie_state = ie.state;
+    for write in &writes {
+        ie_state = engine
+            .ingest_packet(
+                ie_state,
+                &rng,
+                write.channel.clone(),
+                write.tag,
+                &write.body,
+            )
+            .expect("once")
+            .state;
+    }
+    for write in &writes {
+        ie_state = engine
+            .ingest_packet(
+                ie_state,
+                &rng,
+                write.channel.clone(),
+                write.tag,
+                &write.body,
+            )
+            .expect("twice")
+            .state;
+    }
+    let _ = ie_state;
+    let user = UserId::from_bytes([1; 32]);
+    let ident = IdentityId::from_bytes([2; 32]);
+    let dm = ConversationId::from_bytes([4; 32]);
+    let group = ConversationId::from_bytes([5; 32]);
+    let failed = ConversationId::from_bytes([6; 32]);
+    let sync = ConversationId::from_bytes([8; 32]);
+    state.put_dm(
+        user,
+        ident,
+        dm,
+        IdentityNode::direct(Secret::from_bytes([3; 32]), sync_hs),
+    );
+    state.put_dm(
+        user,
+        ident,
+        group,
+        IdentityNode {
+            kind: IdentityConversation::Group(GroupPhase::Live(GroupLive {
+                secret: Secret::from_bytes([4; 32]),
+                name: DisplayName::try_from("G").expect("n"),
+                photo: None,
+                owner_signing_pk: SigningPublicKey::from_bytes(vec![1; 32]),
+                persistents: Vec::new(),
+                ephemerals: Vec::new(),
+                members: Vec::new(),
+                pending: Vec::new(),
+                epoch: 0,
+                log: std::collections::BTreeMap::new(),
+            })),
+            chains: Default::default(),
+        },
+    );
+    state.put_dm(
+        user,
+        ident,
+        failed,
+        IdentityNode {
+            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::FailedReason::Left)),
+            chains: Default::default(),
+        },
+    );
+    state.put_sync(
+        sync,
+        DeviceNode::sync(
+            Secret::from_bytes([5; 32]),
+            sync_hs,
+            DeviceId::from_bytes([6; 32]),
+        ),
+    );
+    let hlc = Hlc {
+        wall_ms: 1,
+        counter: 0,
+    };
+    let body = |cid, payload| DurableBody {
+        conversation_id: cid,
+        hlc,
+        payload,
+    };
+    assert_eq!(
+        state
+            .insert_body(Tag::from_bytes([9; 32]), body(failed, text.clone()))
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    assert_eq!(
+        state
+            .insert_body(
+                Tag::from_bytes([10; 32]),
+                body(ConversationId::from_bytes([11; 32]), text.clone())
+            )
+            .unwrap_err(),
+        EngineError::WrongPhase
+    );
+    let dm_id = Tag::from_bytes([12; 32]);
+    state
+        .insert_body(dm_id, body(dm, TxPayload::GroupReject { group_id: group }))
+        .expect("dm");
+    assert!(state.body(&dm_id).is_some());
+    state.remove_body(&dm_id);
+    let group_id = Tag::from_bytes([13; 32]);
+    state
+        .insert_body(
+            group_id,
+            body(
+                group,
+                TxPayload::Advertise {
+                    encaps_pk: EncryptionPublicKey::from_bytes(vec![2; 32]),
+                },
+            ),
+        )
+        .expect("group");
+    assert!(state.body(&group_id).is_some());
+    let wrap_tx = Tag::from_bytes([0x70; 32]);
+    let acked = Tag::from_bytes([0x71; 32]);
+    let unacked = Tag::from_bytes([0x73; 32]);
+    state
+        .insert_body(
+            wrap_tx,
+            body(
+                dm,
+                TxPayload::Wrap {
+                    kem_ct: vec![1; 32],
+                },
+            ),
+        )
+        .expect("wrap");
+    state
+        .insert_body(
+            Tag::from_bytes([0x72; 32]),
+            body(dm, TxPayload::Ack { ratchet_ack: acked }),
+        )
+        .expect("ack");
+    state
+        .insert_body(
+            Tag::from_bytes([0x74; 32]),
+            body(
+                dm,
+                TxPayload::Ack {
+                    ratchet_ack: unacked,
+                },
+            ),
+        )
+        .expect("ack2");
+    {
+        let chains = state.chains_mut(dm).expect("dm-chains");
+        chains.ratchet.known.push(super::state::KnownShared {
+            wrap_tx,
+            shared: Secret::from_bytes([1; 32]),
+            ct_hash: acked,
+            from_us: false,
+            encaps_pk: EncryptionPublicKey::from_bytes(vec![1; 32]),
+        });
+        chains.ratchet.known.push(super::state::KnownShared {
+            wrap_tx,
+            shared: Secret::from_bytes([1; 32]),
+            ct_hash: unacked,
+            from_us: false,
+            encaps_pk: EncryptionPublicKey::from_bytes(vec![3; 32]),
+        });
+        chains.ratchet.known.push(super::state::KnownShared {
+            wrap_tx: Tag::from_bytes([0x75; 32]),
+            shared: Secret::from_bytes([2; 32]),
+            ct_hash: Tag::from_bytes([0x76; 32]),
+            from_us: true,
+            encaps_pk: EncryptionPublicKey::from_bytes(vec![9; 32]),
+        });
+        chains.last_acks.insert(
+            super::super::Actor::handshake(),
+            std::collections::BTreeSet::from([
+                wrap_tx,
+                Tag::from_bytes([0x72; 32]),
+                Tag::from_bytes([0x77; 32]),
+            ]),
+        );
+        chains.ratchet.since = 50;
+    }
+    state
+        .insert_body(
+            Tag::from_bytes([0x77; 32]),
+            body(
+                dm,
+                TxPayload::Advertise {
+                    encaps_pk: EncryptionPublicKey::from_bytes(vec![9; 32]),
+                },
+            ),
+        )
+        .expect("same-pk");
+    engine
+        .mint_if_owed(&mut state, &rng, dm, &Secret::from_bytes([3; 32]))
+        .expect("continues");
+    {
+        let chains = state.chains_mut(dm).expect("dm-chains");
+        for i in 0..8u8 {
+            chains.ratchet.unused.push(super::state::UnusedSk {
+                tx_id: Tag::from_bytes([0x40 + i; 32]),
+                pk: EncryptionPublicKey::from_bytes(vec![i; 32]),
+                sk: vec![i; 32],
+            });
+        }
+        chains.ratchet.since = 50;
+    }
+    engine
+        .mint_if_owed(&mut state, &rng, dm, &Secret::from_bytes([3; 32]))
+        .expect("cap");
+    let gone = Tag::from_bytes([23; 32]);
+    state
+        .insert_body(gone, body(dm, text.clone()))
+        .expect("gone");
+    state
+        .identity_mut(user, ident)
+        .expect("ident")
+        .conversations
+        .remove(&dm);
+    state.remove_body(&gone);
+    state.edit_bodies(|_txs| {});
+    state.remove_body(&group_id);
+    state
+        .insert_body(
+            group_id,
+            body(
+                group,
+                TxPayload::Advertise {
+                    encaps_pk: EncryptionPublicKey::from_bytes(vec![2; 32]),
+                },
+            ),
+        )
+        .expect("group-again");
+    state.put_dm(
+        user,
+        ident,
+        group,
+        IdentityNode {
+            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::FailedReason::Left)),
+            chains: Default::default(),
+        },
+    );
+    assert!(state.body(&group_id).is_none());
+    state.remove_body(&group_id);
+    state
+        .identity_mut(user, ident)
+        .expect("ident")
+        .conversations
+        .remove(&dm);
+    state.remove_body(&dm_id);
+    let sync_id = Tag::from_bytes([14; 32]);
+    state
+        .insert_body(
+            sync_id,
+            body(sync, TxPayload::EngineDeleteUser { user_id: user }),
+        )
+        .expect("sync-engine");
+    assert!(matches!(
+        state.body(&sync_id).expect("held").payload,
+        TxPayload::EngineDeleteUser { .. }
+    ));
+    state.remove_body(&sync_id);
+    let sync_gone = Tag::from_bytes([24; 32]);
+    state
+        .insert_body(
+            sync_gone,
+            body(
+                sync,
+                TxPayload::Name {
+                    name: DisplayName::try_from("A").expect("a"),
+                },
+            ),
+        )
+        .expect("sync-name");
+    state.device.conversations.remove(&sync);
+    state.remove_body(&sync_gone);
+    state.remove_body(&group_id);
+    let dek_id = Tag::from_bytes([15; 32]);
+    state
+        .insert_body(
+            dek_id,
+            body(sync_hs, TxPayload::SyncDek { ct: vec![1, 2, 3] }),
+        )
+        .expect("dek");
+    assert!(state.body(&dek_id).is_some());
+    state.remove_body(&dek_id);
+    let engine_id = Tag::from_bytes([16; 32]);
+    state
+        .insert_body(
+            engine_id,
+            body(
+                ConversationId::from_bytes([17; 32]),
+                TxPayload::EngineDeleteIdentity {
+                    user_id: user,
+                    identity_id: ident,
+                },
+            ),
+        )
+        .expect("engine");
+    assert!(state.body(&engine_id).is_some());
+    state.remove_body(&engine_id);
+    state
+        .insert_body(Tag::from_bytes([18; 32]), body(sync_hs, TxPayload::Reject))
+        .expect("reject");
+    assert!(matches!(
+        state.body(&Tag::from_bytes([18; 32])).expect("rej").payload,
+        TxPayload::Reject
+    ));
+    let bare = ConversationId::from_bytes([20; 32]);
+    state.put_dm(
+        user,
+        ident,
+        bare,
+        IdentityNode::direct(
+            Secret::from_bytes([7; 32]),
+            ConversationId::from_bytes([21; 32]),
+        ),
+    );
+    state.chains_mut(bare).expect("bare").ratchet.since = 50;
+    assert!(
+        engine
+            .mint_if_owed(&mut state, &rng, bare, &Secret::from_bytes([7; 32]))
+            .expect("no-policy")
+            .is_none()
+    );
+    state.edit_bodies(|_txs| {});
+    state.remove_body(&Tag::from_bytes([22; 32]));
+    super::helpers::store_durable_last_ack(
+        &mut EngineState::new(),
+        ConversationId::from_bytes([19; 32]),
+        &[],
+        Tag::from_bytes([0; 32]),
+    );
 }

@@ -4,6 +4,7 @@ use super::super::kem::KeyPair;
 use super::super::payload::Ticket;
 use super::super::{Policy, Secret, TimeBin};
 use super::query::FailedReason;
+use super::row_log::{DmTx, LiveGroupTx, SyncHandshakeTx, SyncTx, TxLog};
 
 /// Failure stored on a handshake. Group reasons are not members.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -643,10 +644,14 @@ impl PartyMut<'_> {
 /// Conversation stored on an identity.
 #[derive(Clone, Debug)]
 pub(super) enum IdentityConversation {
-    DmHandshake(DmParty),
+    DmHandshake {
+        party: DmParty,
+        log: TxLog<super::row_log::DmHandshakeTx>,
+    },
     DirectMessage {
         secret: Secret,
         parent: super::super::ConversationId,
+        log: TxLog<DmTx>,
     },
     Group(GroupPhase),
 }
@@ -674,6 +679,7 @@ pub(super) struct GroupLive {
     pub(super) members: Vec<super::super::payload::GroupMember>,
     pub(super) pending: Vec<GroupPending>,
     pub(super) epoch: u64,
+    pub(super) log: TxLog<LiveGroupTx>,
 }
 
 /// Incoming group offer.
@@ -699,10 +705,14 @@ pub(super) struct GroupPending {
 /// Conversation stored on this device.
 #[derive(Clone, Debug)]
 pub(super) enum DeviceConversation {
-    SyncHandshake(SyncParty),
+    SyncHandshake {
+        party: SyncParty,
+        log: TxLog<SyncHandshakeTx>,
+    },
     Synchronization {
         secret: Secret,
         parent: super::super::ConversationId,
         peer: super::super::DeviceId,
+        log: TxLog<SyncTx>,
     },
 }

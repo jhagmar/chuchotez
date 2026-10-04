@@ -15,7 +15,7 @@ use super::party::{
     InviterPhase, SyncParty,
 };
 use super::state::{ConversationChains, Device, DeviceKeys, DeviceNode, EngineState, IdentityNode};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn users_json(b64u: &dyn Base64Url, state: &EngineState) -> Json {
     let mut users = Vec::new();
@@ -211,10 +211,10 @@ fn identity_conv_json(b64u: &dyn Base64Url, cid: ConversationId, node: &Identity
     let mut members = vec![
         ("conversation_id".into(), bstr(b64u, cid.as_bytes())),
         match &node.kind {
-            IdentityConversation::DmHandshake(party) => {
+            IdentityConversation::DmHandshake { party, .. } => {
                 ("handshake".into(), party_json(b64u, party_of_dm(party)))
             }
-            IdentityConversation::DirectMessage { secret, parent } => (
+            IdentityConversation::DirectMessage { secret, parent, .. } => (
                 "direct_message".into(),
                 Json::Object(vec![
                     ("secret".into(), bstr(b64u, secret.as_bytes())),
@@ -234,13 +234,14 @@ fn device_conv_json(b64u: &dyn Base64Url, cid: ConversationId, node: &DeviceNode
     let mut members = vec![
         ("conversation_id".into(), bstr(b64u, cid.as_bytes())),
         match &node.kind {
-            DeviceConversation::SyncHandshake(party) => {
+            DeviceConversation::SyncHandshake { party, .. } => {
                 ("handshake".into(), party_json(b64u, party_of_sync(party)))
             }
             DeviceConversation::Synchronization {
                 secret,
                 parent,
                 peer,
+                ..
             } => (
                 "synchronization".into(),
                 Json::Object(vec![
@@ -643,7 +644,10 @@ fn parse_identity_conv(
     let cid = ConversationId::from_bytes(decode_fold32(b64u, field(m, "conversation_id")?)?);
     let chains = parse_chains(b64u, m)?;
     let kind = if let Some(hs) = optional(m, "handshake") {
-        IdentityConversation::DmHandshake(parse_dm_party(b64u, hs)?)
+        IdentityConversation::DmHandshake {
+            party: parse_dm_party(b64u, hs)?,
+            log: BTreeMap::new(),
+        }
     } else if let Some(dm) = optional(m, "direct_message") {
         let Json::Object(d) = dm else {
             return Err(EngineError::MalformedPersist);
@@ -651,6 +655,7 @@ fn parse_identity_conv(
         IdentityConversation::DirectMessage {
             secret: Secret::from_bytes(decode_fold32(b64u, field(d, "secret")?)?),
             parent: ConversationId::from_bytes(decode_fold32(b64u, field(d, "parent")?)?),
+            log: BTreeMap::new(),
         }
     } else if let Some(group) = optional(m, "group") {
         IdentityConversation::Group(super::group::parse_group(b64u, group)?)
@@ -670,7 +675,10 @@ fn parse_device_conv(
     let cid = ConversationId::from_bytes(decode_fold32(b64u, field(m, "conversation_id")?)?);
     let chains = parse_chains(b64u, m)?;
     let kind = if let Some(hs) = optional(m, "handshake") {
-        DeviceConversation::SyncHandshake(parse_sync_party(b64u, hs)?)
+        DeviceConversation::SyncHandshake {
+            party: parse_sync_party(b64u, hs)?,
+            log: BTreeMap::new(),
+        }
     } else if let Some(sync) = optional(m, "synchronization") {
         let Json::Object(d) = sync else {
             return Err(EngineError::MalformedPersist);
@@ -680,6 +688,7 @@ fn parse_device_conv(
             parent: ConversationId::from_bytes(decode_fold32(b64u, field(d, "parent")?)?),
             #[rustfmt::skip]
             peer: super::super::DeviceId::from_bytes(decode_fold32(b64u, field(d, "peer")?)?),
+            log: BTreeMap::new(),
         }
     } else {
         return Err(EngineError::MalformedPersist);

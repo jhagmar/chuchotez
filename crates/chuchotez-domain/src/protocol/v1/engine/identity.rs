@@ -27,8 +27,8 @@ impl Engine {
         let mut payloads = Vec::new();
         payloads.extend(
             (!state
-                .txs
-                .values()
+                .bodies()
+                .iter()
                 .any(|t| matches!(t.payload, TxPayload::EngineInit)))
             .then_some(TxPayload::EngineInit),
         );
@@ -46,8 +46,8 @@ impl Engine {
         let user_id = UserId::from(rng.random32());
         let mut payloads = Vec::new();
         if !state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .any(|t| matches!(t.payload, TxPayload::EngineInit))
         {
             payloads.push(TxPayload::EngineInit);
@@ -67,7 +67,7 @@ impl Engine {
         policy: Policy,
     ) -> Result<(MutateOk, IdentityId), EngineError> {
         let secret = self.engine_secret()?;
-        if !state.txs.values().any(
+        if !state.bodies().iter().any(
             |t| matches!(&t.payload, TxPayload::EngineCreateUser { user_id: u } if u == &user_id),
         ) {
             return Err(EngineError::UnknownIds);
@@ -426,8 +426,8 @@ impl Engine {
     /// Open a sync DEK wrap with this device encryption key and hold that DEK.
     pub fn open_sync_dek(&mut self, state: &EngineState, ct: &[u8]) -> Result<(), EngineError> {
         let policy = state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .find_map(|tx| match &tx.payload {
                 TxPayload::Notice(notice) => Some(notice.policy),
                 _ => None,

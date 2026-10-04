@@ -31,7 +31,7 @@ impl Engine {
                 continue;
             }
             let conversation_id = cid;
-            let confirmed = state.txs.values().any(|t| {
+            let confirmed = state.bodies().iter().any(|t| {
                 matches!(t.payload, TxPayload::Confirm) && t.conversation_id == conversation_id
             });
             if !confirmed {
@@ -101,7 +101,7 @@ impl Engine {
         let mut write_ephemeral = state.eph_writes.clone();
         sort_ephemeral_writes(&mut write_ephemeral);
         let mut blocked = Vec::new();
-        for tx in state.txs.values() {
+        for tx in state.bodies().iter() {
             if let TxPayload::EngineCreateIdentity {
                 user_id,
                 identity_id,
@@ -118,8 +118,8 @@ impl Engine {
         }
         if state.device.name.is_none()
             && state
-                .txs
-                .values()
+                .bodies()
+                .iter()
                 .all(|t| !matches!(t.payload, TxPayload::EngineCreateUser { .. }))
             && state.has_sync_handshake()
         {
@@ -184,7 +184,7 @@ impl Engine {
 
 fn blob_gets(state: &EngineState) -> Vec<BlobGet> {
     let mut out = Vec::new();
-    for tx in state.txs.values() {
+    for tx in state.bodies().iter() {
         let TxPayload::Media(media) = &tx.payload else {
             continue;
         };
