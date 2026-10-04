@@ -10,6 +10,7 @@ mod hash;
 mod hmac;
 mod json;
 mod kem;
+mod nfc;
 mod sign;
 pub mod v1;
 
@@ -21,4 +22,5 @@ pub use hash::LibcruxSha256;
 pub use hmac::LibcruxHmac;
 pub use json::Rfc8785;
 pub use kem::LibcruxKem;
+pub use nfc::nfc;
 pub use sign::LibcruxSign;

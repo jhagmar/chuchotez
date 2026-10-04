@@ -153,6 +153,16 @@ another device drops it from membership and rekeys Sync sending chains.
 `leave_sync` clears this device's Sync rows. Once a Synchronization exists,
 engine transactions also post on that live path.
 
+`get_conversation` fills handshake, DM, group, and sync rows. The DM, group,
+and sync views omit ticket secrets, the DEK, secret keys, tag keys, and Wake
+`p256dh` / `auth`. `list_conversations` includes those rows for the identity,
+including Sync on this device. `Engine::ping_posts` keeps `https:` rows and
+gives each an empty body for RFC 8291. `nfc` normalizes display names,
+addresses, ticket text, passphrases, and chat text before the engine gates.
+A host cycle is `tick`, then `poll`, then mapper post, list, listen, and blob
+transfer, then `ingest_packet` / `ingest_list`, `write_ack`, and
+`write_blob_ack`.
+
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.
 `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes. `KemSeed` /

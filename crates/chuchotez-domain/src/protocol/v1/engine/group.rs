@@ -411,6 +411,8 @@ impl Engine {
                         encryption_pk: m.encryption_pk.clone(),
                         name: live.name.clone(),
                         photo: live.photo.clone(),
+                        typing: None,
+                        presence: None,
                     })
                     .collect(),
                 pending: live
@@ -425,6 +427,8 @@ impl Engine {
                     .collect(),
                 persistents: live.persistents.clone(),
                 ephemerals: live.ephemerals.clone(),
+                last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                local_prefs: super::chat::local_prefs(self, state, cid),
                 messages: self.dm_view(state, cid).messages,
             }),
             GroupPhase::Failed(reason) => GroupQuery::GroupFailed(*reason),

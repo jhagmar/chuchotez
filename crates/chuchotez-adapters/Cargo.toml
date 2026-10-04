@@ -21,6 +21,7 @@ libcrux-ed25519.workspace = true
 libcrux-ml-dsa.workspace = true
 libcrux-sha2.workspace = true
 argon2.workspace = true
+unicode-normalization.workspace = true
 
 [lints]
 workspace = true

@@ -354,17 +354,100 @@ pub struct PresenceView {
 }
 
 /// Established DM query.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DmEstablished {
-    /// Most recent durable chat items.
-    pub messages: Vec<HistoryItem>,
+    /// Peer display name.
+    pub name: DisplayName,
+    /// Peer profile picture.
+    pub profile_pic: Option<super::super::ProfilePic>,
+    /// Peer encryption public key.
+    pub encryption_pk: Vec<u8>,
+    /// Peer signing public key.
+    pub signing_pk: Vec<u8>,
+    /// Persistent channels.
+    pub persistents: Vec<super::super::DurableChannel>,
+    /// Ephemeral channels.
+    pub ephemerals: Vec<super::super::EphemeralChannel>,
+    /// `text(fingerprint)`.
+    pub confirmation_digest: String,
+    /// Latest presence time.
+    pub last_active: Option<UnixSeconds>,
     /// Peer composing signal.
     pub typing: Option<TypingView>,
     /// Peer liveness signal.
     pub presence: Option<PresenceView>,
+    /// Latest read marker.
+    pub read_up_to: Option<Tag>,
+    /// Latest delivered marker.
+    pub delivered_up_to: Option<Tag>,
+    /// This member's prefs. Wake key material is omitted.
+    pub local_prefs: QueryLocalPrefs,
+    /// Peer prefs. Wake key material is omitted.
+    pub peer_prefs: QueryPeerPrefs,
+    /// Most recent durable chat items.
+    pub messages: Vec<HistoryItem>,
+}
+
+/// Peer prefs shown by query. `p256dh` and `auth` stay off this view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryPeerPrefs {
+    /// Read receipts.
+    pub read_receipts: bool,
+    /// Online visible.
+    pub online_visible: bool,
+    /// Send typing.
+    pub send_typing: bool,
+    /// Disappear after seconds, or never.
+    pub disappear_after: Option<u64>,
+    /// Wake endpoint, or unpublished.
+    pub wake_endpoint: Option<String>,
+    /// VAPID public key, or unpublished.
+    pub vapid_pk: Option<Vec<u8>>,
+}
+
+/// Local prefs shown by query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryLocalPrefs {
+    /// Read receipts.
+    pub read_receipts: bool,
+    /// Online visible.
+    pub online_visible: bool,
+    /// Send typing.
+    pub send_typing: bool,
+    /// Disappear after seconds, or never.
+    pub disappear_after: Option<u64>,
+    /// Wake endpoint, or unpublished.
+    pub wake_endpoint: Option<String>,
+    /// VAPID public key, or unpublished.
+    pub vapid_pk: Option<Vec<u8>>,
+    /// Notification privacy. Local only.
+    pub notification_privacy: super::super::NotificationPrivacy,
+}
+
+/// RFC 8291 target. `body` is empty plaintext.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PingPost {
+    /// `https:` endpoint.
+    pub endpoint: String,
+    /// Empty plaintext body.
+    pub body: Vec<u8>,
+}
+
+/// Empty-body POST targets for `https:` ping rows.
+#[must_use]
+pub fn ping_posts(pings: &[PingTarget]) -> Vec<PingPost> {
+    pings
+        .iter()
+        .filter(|ping| ping.endpoint.starts_with("https:"))
+        .map(|ping| PingPost {
+            endpoint: ping.endpoint.clone(),
+            body: Vec::new(),
+        })
+        .collect()
 }
 
 /// Established or failed DM query.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectMessageQuery {
     /// Child DM after both confirms.
@@ -374,6 +457,7 @@ pub enum DirectMessageQuery {
 }
 
 /// Group query.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupQuery {
     /// Incoming group offer on a DM.
@@ -408,6 +492,10 @@ pub struct GroupMemberView {
     pub name: DisplayName,
     /// Photo carried with the member.
     pub photo: Option<super::super::ProfilePic>,
+    /// Composing signal for this member.
+    pub typing: Option<TypingView>,
+    /// Liveness signal for this member.
+    pub presence: Option<PresenceView>,
 }
 
 /// Invite that is not yet accepted.
@@ -440,22 +528,58 @@ pub struct GroupEstablishedView {
     pub persistents: Vec<super::super::DurableChannel>,
     /// Ephemeral channels.
     pub ephemerals: Vec<super::super::EphemeralChannel>,
+    /// Latest presence time.
+    pub last_active: Option<UnixSeconds>,
+    /// This member's prefs. Wake key material is omitted.
+    pub local_prefs: QueryLocalPrefs,
     /// Chat history.
     pub messages: Vec<HistoryItem>,
 }
 
+/// One linked device in the sync query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncMemberView {
+    /// Device id.
+    pub device_id: super::super::DeviceId,
+    /// Signing public key.
+    pub signing_pk: Vec<u8>,
+    /// Encryption public key.
+    pub encryption_pk: Vec<u8>,
+    /// Device name.
+    pub name: DisplayName,
+    /// Latest presence time.
+    pub last_active: Option<UnixSeconds>,
+}
+
+/// Established sync query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncEstablishedView {
+    /// This device's name.
+    pub device_name: DisplayName,
+    /// Linked devices.
+    pub members: Vec<SyncMemberView>,
+    /// Persistent channels.
+    pub persistents: Vec<super::super::DurableChannel>,
+    /// Ephemeral channels.
+    pub ephemerals: Vec<super::super::EphemeralChannel>,
+    /// Latest presence time.
+    pub last_active: Option<UnixSeconds>,
+}
+
 /// Synchronization query.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SynchronizationQuery {
     /// Sync handshake.
     Handshake(Handshake),
     /// Linked devices.
-    SyncEstablished,
+    SyncEstablished(SyncEstablishedView),
     /// Failed Synchronization.
     Failed(FailedReason),
 }
 
 /// Query conversation ADT.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Conversation {
     /// DM handshake.

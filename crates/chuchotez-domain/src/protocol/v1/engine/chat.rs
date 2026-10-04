@@ -8,6 +8,7 @@ use super::helpers::{invitee_intro_for, inviter_intro_for};
 use super::live::local_material;
 use super::query::{DmEstablished, HistoryItem, PingTarget, PresenceView, TypingView};
 use super::state::{EngineState, TypingNote};
+use super::{QueryLocalPrefs, QueryPeerPrefs};
 
 const HISTORY_CAP: usize = 1000;
 const TYPING_SECS: u64 = 6;
@@ -169,16 +170,159 @@ impl Engine {
         let presence = chains
             .presence_at
             .map(|at| PresenceView { last_active: at });
+        let card = peer_card(self, state, cid);
+        let parent = state.established_parent(cid);
+        let notice = parent.and_then(|id| super::helpers::notice_for(state, id));
         DmEstablished {
-            messages: history(state, cid, now),
+            name: card.name,
+            profile_pic: card.profile_pic,
+            encryption_pk: card.encryption_pk,
+            signing_pk: card.signing_pk,
+            persistents: notice.map(|n| n.persistents.clone()).unwrap_or_default(),
+            ephemerals: notice.map(|n| n.ephemerals.clone()).unwrap_or_default(),
+            confirmation_digest: parent
+                .and_then(|id| self.try_fingerprint(state, id).map(|(digest, _)| digest))
+                .unwrap_or_default(),
+            last_active: chains.presence_at,
             typing,
             presence,
+            read_up_to: latest_marker(state, cid, true),
+            delivered_up_to: latest_marker(state, cid, false),
+            local_prefs: local_prefs(self, state, cid),
+            peer_prefs: peer_prefs(&card.prefs),
+            messages: history(state, cid, now),
         }
     }
 
     pub(super) fn shows_online(&self, state: &EngineState, cid: ConversationId) -> bool {
         latest_online(state, cid).unwrap_or_else(|| self.defaults.online_visible())
     }
+}
+
+fn peer_prefs(prefs: &super::super::OnWirePrefs) -> QueryPeerPrefs {
+    QueryPeerPrefs {
+        read_receipts: prefs.read_receipts,
+        online_visible: prefs.online_visible,
+        send_typing: prefs.send_typing,
+        disappear_after: prefs.disappear_after,
+        wake_endpoint: prefs.wake.as_ref().map(|wake| wake.endpoint().to_owned()),
+        vapid_pk: prefs
+            .wake
+            .as_ref()
+            .and_then(|wake| wake.vapid_pk().map(|bytes| bytes.to_vec())),
+    }
+}
+
+pub(super) fn local_prefs(
+    engine: &Engine,
+    state: &EngineState,
+    cid: ConversationId,
+) -> QueryLocalPrefs {
+    let wire = latest_wire(state, cid).unwrap_or_else(|| engine.on_wire_prefs());
+    let peer = peer_prefs(&wire);
+    QueryLocalPrefs {
+        read_receipts: peer.read_receipts,
+        online_visible: peer.online_visible,
+        send_typing: peer.send_typing,
+        disappear_after: peer.disappear_after,
+        wake_endpoint: peer.wake_endpoint,
+        vapid_pk: peer.vapid_pk,
+        notification_privacy: engine.defaults.notification_privacy(),
+    }
+}
+
+struct PeerCard {
+    name: super::super::DisplayName,
+    profile_pic: Option<super::super::ProfilePic>,
+    encryption_pk: Vec<u8>,
+    signing_pk: Vec<u8>,
+    prefs: super::super::OnWirePrefs,
+}
+
+fn peer_card(engine: &Engine, state: &EngineState, cid: ConversationId) -> PeerCard {
+    let fallback = || PeerCard {
+        name: super::super::DisplayName::try_from(".").expect("dot"),
+        profile_pic: None,
+        encryption_pk: Vec::new(),
+        signing_pk: Vec::new(),
+        prefs: engine.on_wire_prefs(),
+    };
+    let Some(parent) = state.established_parent(cid) else {
+        return fallback();
+    };
+    let local = state.owner(cid).and_then(|(user, identity)| {
+        engine
+            .identity_keys(state, &user, &identity)
+            .map(|(_, _, signing)| signing)
+    });
+    if let Some(intro) = super::helpers::inviter_intro_for(state, parent)
+        && local
+            .as_ref()
+            .is_none_or(|signing| signing != &intro.signing_pk)
+    {
+        return PeerCard {
+            name: intro.name.clone(),
+            profile_pic: intro.profile_pic.clone(),
+            encryption_pk: intro.encryption_pk.clone(),
+            signing_pk: intro.signing_pk.clone(),
+            prefs: intro.prefs.clone(),
+        };
+    }
+    if let Some(intro) = super::helpers::invitee_intro_for(state, parent) {
+        return PeerCard {
+            name: intro.name.clone(),
+            profile_pic: intro.profile_pic.clone(),
+            encryption_pk: intro.encryption_pk.clone(),
+            signing_pk: intro.signing_pk.clone(),
+            prefs: intro.prefs.clone(),
+        };
+    }
+    fallback()
+}
+
+fn latest_wire(state: &EngineState, cid: ConversationId) -> Option<super::super::OnWirePrefs> {
+    let mut best: Option<(u64, u64, [u8; 32], super::super::OnWirePrefs)> = None;
+    for (id, tx) in &state.txs {
+        if tx.conversation_id != cid {
+            continue;
+        }
+        let TxPayload::Prefs(prefs) = &tx.payload else {
+            continue;
+        };
+        let idb = *id.as_bytes();
+        let replace = best.as_ref().is_none_or(|(wall, counter, prev, _)| {
+            (tx.hlc.wall_ms, tx.hlc.counter, idb) > (*wall, *counter, *prev)
+        });
+        if replace {
+            best = Some((tx.hlc.wall_ms, tx.hlc.counter, idb, prefs.clone()));
+        }
+    }
+    best.map(|(_, _, _, prefs)| prefs)
+}
+
+fn latest_marker(state: &EngineState, cid: ConversationId, read: bool) -> Option<Tag> {
+    let mut best: Option<(u64, u64, [u8; 32], Tag)> = None;
+    for (id, tx) in &state.txs {
+        if tx.conversation_id != cid {
+            continue;
+        }
+        let up_to = match &tx.payload {
+            TxPayload::Read { up_to } if read => Some(*up_to),
+            TxPayload::Delivered { up_to } if !read => Some(*up_to),
+            _ => None,
+        };
+        let Some(up_to) = up_to else {
+            continue;
+        };
+        let idb = *id.as_bytes();
+        let replace = best.as_ref().is_none_or(|(wall, counter, prev, _)| {
+            (tx.hlc.wall_ms, tx.hlc.counter, idb) > (*wall, *counter, *prev)
+        });
+        if replace {
+            best = Some((tx.hlc.wall_ms, tx.hlc.counter, idb, up_to));
+        }
+    }
+    best.map(|(_, _, _, up_to)| up_to)
 }
 
 fn ping_target(wake: Wake) -> PingTarget {
@@ -456,7 +600,89 @@ mod tests {
         );
         assert_eq!(latest_disappear(&state, cid), Some(Some(9)));
         assert_eq!(latest_online(&state, cid), Some(false));
+        assert!(super::latest_wire(&state, cid).is_some());
+        state.txs.insert(
+            Tag::from_bytes([11; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 1,
+                    counter: 0,
+                },
+                payload: TxPayload::Read {
+                    up_to: Tag::from_bytes([1; 32]),
+                },
+            },
+        );
+        state.txs.insert(
+            Tag::from_bytes([12; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 2,
+                    counter: 0,
+                },
+                payload: TxPayload::Read {
+                    up_to: Tag::from_bytes([2; 32]),
+                },
+            },
+        );
+        state.txs.insert(
+            Tag::from_bytes([13; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 1,
+                    counter: 0,
+                },
+                payload: TxPayload::Delivered {
+                    up_to: Tag::from_bytes([1; 32]),
+                },
+            },
+        );
+        state.txs.insert(
+            Tag::from_bytes([14; 32]),
+            DurableBody {
+                conversation_id: cid,
+                hlc: Hlc {
+                    wall_ms: 3,
+                    counter: 0,
+                },
+                payload: TxPayload::Delivered {
+                    up_to: Tag::from_bytes([2; 32]),
+                },
+            },
+        );
+        assert_eq!(
+            super::latest_marker(&state, cid, true),
+            Some(Tag::from_bytes([2; 32]))
+        );
+        assert_eq!(
+            super::latest_marker(&state, cid, false),
+            Some(Tag::from_bytes([2; 32]))
+        );
         assert_eq!(latest_disappear(&state, other), Some(Some(100)));
+        let with_wake = OnWirePrefs {
+            read_receipts: true,
+            online_visible: true,
+            send_typing: true,
+            disappear_after: None,
+            wake: Some(
+                crate::protocol::v1::Wake::try_new(
+                    "https://push.example/q",
+                    &[3u8; 65],
+                    &[4u8; 16],
+                    Some(vec![9, 9, 9]),
+                )
+                .expect("wake"),
+            ),
+        };
+        let shown = super::peer_prefs(&with_wake);
+        assert_eq!(
+            shown.wake_endpoint.as_deref(),
+            Some("https://push.example/q")
+        );
+        assert_eq!(shown.vapid_pk.as_deref(), Some(&[9, 9, 9][..]));
         let media = TxPayload::Media(super::super::super::payload::TxMedia {
             mime: "image/png".into(),
             filename: "a.png".into(),
@@ -486,6 +712,37 @@ mod tests {
         let state = EngineState::new();
         let cid = super::super::super::ConversationId::from_bytes([1; 32]);
         assert!(engine.shows_online(&state, cid));
+    }
+
+    #[test]
+    fn missing_peer_intro_uses_a_placeholder_name() {
+        use super::super::state::{DeviceNode, EngineState, IdentityNode};
+        use crate::protocol::v1::fixtures::test_engine;
+        use crate::protocol::v1::{ConversationId, IdentityId, Secret, UserId};
+        let engine = test_engine();
+        let cid = ConversationId::from_bytes([2; 32]);
+        let mut state = EngineState::new();
+        state.put_dm(
+            UserId::from_bytes([3; 32]),
+            IdentityId::from_bytes([4; 32]),
+            cid,
+            IdentityNode::direct(
+                Secret::from_bytes([5; 32]),
+                ConversationId::from_bytes([1; 32]),
+            ),
+        );
+        assert_eq!(super::peer_card(&engine, &state, cid).name.as_str(), ".");
+        state.put_sync(
+            ConversationId::from_bytes([8; 32]),
+            DeviceNode::sync(
+                Secret::from_bytes([6; 32]),
+                ConversationId::from_bytes([9; 32]),
+            ),
+        );
+        let named = engine.sync_view(&state, ConversationId::from_bytes([8; 32]));
+        assert!(named.members.is_empty());
+        let empty = engine.sync_view(&EngineState::new(), ConversationId::from_bytes([1; 32]));
+        assert_eq!(empty.device_name.as_str(), ".");
     }
 
     #[test]

@@ -2055,7 +2055,38 @@ fn query_adt_debug() {
     let _ = format!("{:?}", Handshake::Failed(FailedReason::Left));
     let _ = format!(
         "{:?}",
-        DirectMessageQuery::Established(super::DmEstablished::default())
+        DirectMessageQuery::Established(super::DmEstablished {
+            name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
+            profile_pic: None,
+            encryption_pk: vec![],
+            signing_pk: vec![],
+            persistents: vec![],
+            ephemerals: vec![],
+            confirmation_digest: String::new(),
+            last_active: None,
+            typing: None,
+            presence: None,
+            read_up_to: None,
+            delivered_up_to: None,
+            local_prefs: super::QueryLocalPrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake_endpoint: None,
+                vapid_pk: None,
+                notification_privacy: crate::protocol::v1::NotificationPrivacy::Name,
+            },
+            peer_prefs: super::QueryPeerPrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake_endpoint: None,
+                vapid_pk: None,
+            },
+            messages: vec![],
+        })
     );
     let _ = format!("{:?}", DirectMessageQuery::Failed(FailedReason::Left));
     let _ = format!(
@@ -2077,13 +2108,36 @@ fn query_adt_debug() {
             pending: vec![],
             persistents: vec![],
             ephemerals: vec![],
+            last_active: None,
+            local_prefs: super::QueryLocalPrefs {
+                read_receipts: true,
+                online_visible: true,
+                send_typing: true,
+                disappear_after: None,
+                wake_endpoint: None,
+                vapid_pk: None,
+                notification_privacy: crate::protocol::v1::NotificationPrivacy::Name,
+            },
             messages: vec![],
         })
     );
     let _ = format!("{:?}", GroupQuery::GroupFailed(FailedReason::Kicked));
     let hs = Handshake::Invitee(HandshakeInvitee::TicketReceived);
+    let sync_established = SynchronizationQuery::SyncEstablished(super::SyncEstablishedView {
+        device_name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
+        members: vec![super::SyncMemberView {
+            device_id: crate::protocol::v1::DeviceId::from_bytes([2; 32]),
+            signing_pk: vec![1],
+            encryption_pk: vec![2],
+            name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
+            last_active: None,
+        }],
+        persistents: vec![],
+        ephemerals: vec![],
+        last_active: None,
+    });
     let _ = format!("{:?}", SynchronizationQuery::Handshake(hs));
-    let _ = format!("{:?}", SynchronizationQuery::SyncEstablished);
+    let _ = format!("{:?}", sync_established);
     let _ = format!("{:?}", SynchronizationQuery::Failed(FailedReason::Left));
     let _ = format!(
         "{:?}",
@@ -2099,9 +2153,7 @@ fn query_adt_debug() {
     );
     let _ = format!(
         "{:?}",
-        Conversation::DirectMessage(DirectMessageQuery::Established(
-            super::DmEstablished::default()
-        ))
+        Conversation::DirectMessage(DirectMessageQuery::Failed(FailedReason::Left))
     );
     let _ = format!(
         "{:?}",
@@ -2112,10 +2164,7 @@ fn query_adt_debug() {
             from_conversation_id: crate::protocol::v1::ConversationId::from_bytes([1; 32]),
         }))
     );
-    let _ = format!(
-        "{:?}",
-        Conversation::Synchronization(SynchronizationQuery::SyncEstablished)
-    );
+    let _ = format!("{:?}", Conversation::Synchronization(sync_established));
     let _ = format!(
         "{:?}",
         BlockedIdentity {
@@ -4523,7 +4572,7 @@ fn handshake_sync_intros() {
     let child = rows
         .iter()
         .find_map(|r| match r.conversation {
-            Conversation::Synchronization(SynchronizationQuery::SyncEstablished) => {
+            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(_)) => {
                 Some(r.conversation_id)
             }
             _ => None,
@@ -4533,7 +4582,7 @@ fn handshake_sync_intros() {
         engine
             .get_conversation(&confirmed.state, zeros, zid, child)
             .expect("schq"),
-        Conversation::Synchronization(SynchronizationQuery::SyncEstablished)
+        Conversation::Synchronization(SynchronizationQuery::SyncEstablished(_))
     ));
     let mut fold_s = confirmed.state.clone();
     fold_s.cover_last_acks();
@@ -8041,6 +8090,18 @@ fn live_path_waits_then_falls_back() {
         .expect("ping");
     assert_eq!(pinged.pings().len(), 1);
     assert_eq!(pinged.pings()[0].endpoint, "https://push.example/x");
+    let posts = Engine::ping_posts(pinged.pings());
+    assert_eq!(posts.len(), 1);
+    assert!(posts[0].body.is_empty());
+    assert!(
+        Engine::ping_posts(&[super::PingTarget {
+            endpoint: "http://push.example/x".into(),
+            p256dh: [3; 65],
+            auth: [4; 16],
+            vapid_pk: None,
+        }])
+        .is_empty()
+    );
     for tx in bob.txs.values_mut() {
         if let TxPayload::InviterIntro(intro) = &mut tx.payload {
             intro.prefs.wake = Some(wake.clone());
@@ -8765,7 +8826,7 @@ fn live_path_sync_uses_device_actor() {
         .expect("list")
         .into_iter()
         .find_map(|row| match row.conversation {
-            Conversation::Synchronization(SynchronizationQuery::SyncEstablished) => {
+            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(_)) => {
                 Some(row.conversation_id)
             }
             _ => None,
@@ -8901,4 +8962,74 @@ fn live_path_sync_uses_device_actor() {
     ]);
     let mut blank = EngineState::new();
     assert!(super::fold_tree::install_device(engine.suite.b64u(), &mut blank, &bad).is_err());
+}
+
+#[test]
+fn host_cycle_acks_a_post_and_a_blob() {
+    use crate::protocol::v1::fixtures::{sample_durable, test_engine};
+    use crate::protocol::v1::{Address, Defaults, Kind, NotificationPrivacy, Policy, Tag};
+    let defaults = Defaults::try_new(
+        vec![sample_durable()],
+        Vec::new(),
+        true,
+        true,
+        true,
+        None,
+        false,
+        NotificationPrivacy::Name,
+    )
+    .expect("def");
+    let mut engine = Engine::new(test_engine().suite.clone(), defaults);
+    let rng = CounterRng::new();
+    engine
+        .wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
+        .expect("wrap");
+    let ticked = engine
+        .tick(EngineState::new(), 1_700_000_000)
+        .expect("tick");
+    assert!(
+        engine
+            .poll(&ticked.state)
+            .expect("empty")
+            .write_durable
+            .is_empty()
+    );
+    let (user_ok, uid) = engine.create_user(ticked.state, &rng).expect("user");
+    let (id_ok, iid) = engine
+        .create_identity(user_ok.state, &rng, uid, Policy::Classic)
+        .expect("id");
+    let named = engine
+        .set_display_name(id_ok.state, &rng, uid, iid, "Ada")
+        .expect("name");
+    let (invited, cid) = engine
+        .create_invite(named.state, &rng, uid, iid, 1_800_000_000, None)
+        .expect("inv");
+    let polled = engine.poll(&invited.state).expect("poll");
+    assert!(!polled.write_durable.is_empty());
+    assert!(!polled.list.is_empty());
+    let mut state = invited.state;
+    for write in polled.write_durable {
+        state = engine
+            .write_ack(state, write.channel, write.tag, &write.body)
+            .expect("ack")
+            .state;
+    }
+    assert!(engine.poll(&state).expect("acked").write_durable.is_empty());
+    let kind = Kind::try_from("blossom").expect("k");
+    let address = Address::try_from("https://blob.example").expect("a");
+    let tag = Tag::from_bytes([7; 32]);
+    state.blob_puts.push(super::BlobPut {
+        kind: kind.clone(),
+        address: address.clone(),
+        tag,
+        body: b"cipher".to_vec(),
+    });
+    let blobs = engine.poll(&state).expect("blobs");
+    assert_eq!(blobs.blob_put.len(), 1);
+    state = engine
+        .write_blob_ack(state, kind, address, tag, b"cipher")
+        .expect("blob-ack")
+        .state;
+    assert!(engine.poll(&state).expect("clear").blob_put.is_empty());
+    let _ = cid;
 }
