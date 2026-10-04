@@ -8917,6 +8917,7 @@ fn live_path_sync_uses_device_actor() {
                 .collect::<Vec<_>>(),
         )
         .expect("ieing");
+    let writes_before = inv_conf.writes.len();
     let confirmed = engine
         .confirm_established(inv_conf, &rng, ids)
         .expect("conf");
@@ -8924,12 +8925,20 @@ fn live_path_sync_uses_device_actor() {
     let ie_confirmed = engine
         .confirm_established(ie_conf.state, &rng, ids)
         .expect("ieconf");
-    let ct = confirmed.state.device.dek_ct.clone().expect("dek-ct");
     assert!(engine.open_sync_dek(&ie_state, &[]).is_err());
     let before_dek = *engine.dek.as_ref().expect("dek").as_bytes();
-    engine.open_sync_dek(&ie_state, &ct).expect("open-dek");
-    assert_eq!(engine.dek.as_ref().expect("dek").as_bytes(), &before_dek);
-    let _ = ie_confirmed;
+    let posted = engine.poll(&confirmed.state).expect("dek-poll");
+    assert!(posted.write_durable.len() > writes_before);
+    engine.lock();
+    let mut held = ie_confirmed.state;
+    for write in confirmed.state.writes.iter().skip(writes_before) {
+        held = engine
+            .ingest_packet(held, &rng, write.channel.clone(), write.tag, &write.body)
+            .expect("dek-body")
+            .state;
+    }
+    assert_eq!(engine.dek.as_ref().expect("held").as_bytes(), &before_dek);
+    let _ = held;
     let child = engine
         .list_conversations(&confirmed.state, zeros, zid)
         .expect("list")

@@ -147,8 +147,9 @@ name, owner, and epoch.
 `create_sync_invite` keeps at most 4 peers besides this device. On confirm
 the inviter seals the DEK to the invitee device encryption key as KEM
 ciphertext, a 12-byte nonce, and an AEAD under
-`expand(shared, "chuchotez/1/sync-dek")`. `open_sync_dek` opens that wrap
-and holds the DEK. `kick_device` of this device is `WrongPhase`. Kicking
+`expand(shared, "chuchotez/1/sync-dek")`. On confirm that sealed key is a
+body in `poll`. The other device opens it from the body it ingests and then
+holds that key. `kick_device` of this device is `WrongPhase`. Kicking
 another device drops that device's link and makes new sending keys for the
 Sync conversations that remain.
 `leave_sync` clears this device's Sync rows. Once a Synchronization exists,

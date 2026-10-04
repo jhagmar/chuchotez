@@ -439,6 +439,14 @@ impl Engine {
         Ok(())
     }
 
+    pub(super) fn hold_sync_dek(
+        &mut self,
+        state: &EngineState,
+        ct: &[u8],
+    ) -> Result<(), EngineError> {
+        self.open_sync_dek(state, ct)
+    }
+
     /// Set conversation prefs.
     pub fn set_conversation_prefs(
         &self,

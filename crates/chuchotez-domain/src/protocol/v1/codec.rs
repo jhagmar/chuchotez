@@ -205,6 +205,7 @@ pub(crate) fn payload_type(payload: &TxPayload) -> &'static str {
         TxPayload::EngineSetProfilePic { .. } => "v1-engine-set-profile-pic",
         TxPayload::EngineSetDeviceName { .. } => "v1-engine-set-device-name",
         TxPayload::EngineKickDevice { .. } => "v1-engine-kick-device",
+        TxPayload::SyncDek { .. } => "v1-sync-dek",
     }
 }
 
@@ -303,6 +304,9 @@ pub(crate) fn payload_to_json(b64u: &dyn Base64Url, payload: &TxPayload) -> Json
         }
         TxPayload::EngineKickDevice { device_id } => {
             members.push(("device_id".into(), bstr(b64u, device_id.as_bytes())));
+        }
+        TxPayload::SyncDek { ct } => {
+            members.push(("ct".into(), bstr(b64u, ct)));
         }
         TxPayload::Text(t) => {
             members.push(("body".into(), Json::String(t.body.clone())));
@@ -1128,6 +1132,12 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
                 device_id: id32(get_bstr(b64u, m, "device_id")?, DeviceId::from_bytes)?,
             })
         }
+        "v1-sync-dek" => {
+            extra_ok(m, &["type", "ct"])?;
+            Ok(TxPayload::SyncDek {
+                ct: get_bstr(b64u, m, "ct")?,
+            })
+        }
         _ => Err(()),
     }
 }
@@ -1874,6 +1884,7 @@ mod tests {
         roundtrip(TxPayload::EngineKickDevice {
             device_id: DeviceId::from_bytes([9; 32]),
         });
+        roundtrip(TxPayload::SyncDek { ct: vec![1, 2, 3] });
         let wake = Wake::try_new(
             "https://push.example/x",
             &[3u8; 65],
