@@ -107,6 +107,15 @@ impl Engine {
             .keys
             .as_ref()
             .map(|keys| keys.sign.public_bytes().to_vec());
+        let peer_device = match state.device.conversations.get(&cid) {
+            Some(node) => match &node.kind {
+                super::party::DeviceConversation::Synchronization { peer, .. } => {
+                    peer.unwrap_or(super::super::DeviceId::from_bytes([0; 32]))
+                }
+                _ => super::super::DeviceId::from_bytes([0; 32]),
+            },
+            None => super::super::DeviceId::from_bytes([0; 32]),
+        };
         if let Some(parent) = parent {
             if let Some(intro) = inviter_intro_for(state, parent)
                 && local_sign
@@ -114,7 +123,7 @@ impl Engine {
                     .is_none_or(|signing| signing != &intro.signing_pk)
             {
                 members.push(super::SyncMemberView {
-                    device_id: super::super::DeviceId::from_bytes([0; 32]),
+                    device_id: peer_device,
                     signing_pk: intro.signing_pk.clone(),
                     encryption_pk: intro.encryption_pk.clone(),
                     name: intro.name.clone(),
@@ -122,7 +131,7 @@ impl Engine {
                 });
             } else if let Some(intro) = invitee_intro_for(state, parent) {
                 members.push(super::SyncMemberView {
-                    device_id: super::super::DeviceId::from_bytes([0; 32]),
+                    device_id: peer_device,
                     signing_pk: intro.signing_pk.clone(),
                     encryption_pk: intro.encryption_pk.clone(),
                     name: intro.name.clone(),

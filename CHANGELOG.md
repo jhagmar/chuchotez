@@ -68,8 +68,8 @@ owner posts `TxGroupRoster` and `TxGroupWrap`. A roster that omits the local
 signing key stores `Kicked`. Leave and delete store `Left`. A durable group
 tx pings every member whose latest `TxPrefs.wake` is set.
 `create_sync_invite` keeps at most 4 peers besides this device. Confirm
-seals the DEK to the invitee encryption key. `kick_device` rekeys Sync
-sending chains. `leave_sync` clears this device's Sync rows. Engine txs
+seals the DEK to the invitee encryption key. `kick_device` of another device drops that link and makes new sending
+keys for the Sync conversations that remain. `leave_sync` clears this device's Sync rows. Engine txs
 also post on each established Sync live path. Query views for an
 established DM, group, and sync omit ticket secrets, the DEK, secret keys,
 tag keys, and Wake `p256dh` / `auth`. `ping_posts` is an empty-body POST

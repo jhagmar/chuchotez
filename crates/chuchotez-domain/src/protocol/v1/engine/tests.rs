@@ -8993,6 +8993,7 @@ fn live_path_sync_uses_device_actor() {
     assert!(with_user.state.eph_writes.len() > eph_engine);
     let secret_before = with_user.state.established_secret(child).expect("sec2");
     let pre_kick = with_user.state.clone();
+    let drop_base = pre_kick.clone();
     let eph_at = pre_kick.eph_writes.len();
     let other = crate::protocol::v1::DeviceId::from_bytes([9; 32]);
     let kicked = engine
@@ -9020,6 +9021,56 @@ fn live_path_sync_uses_device_actor() {
         again.state.established_secret(child).expect("same"),
         kicked.state.established_secret(child).expect("rekeyed2")
     );
+    let mut two = drop_base;
+    let extra = crate::protocol::v1::ConversationId::from_bytes([4; 32]);
+    two.put_sync(
+        extra,
+        super::state::DeviceNode::sync(
+            crate::protocol::v1::Secret::from_bytes([6; 32]),
+            crate::protocol::v1::ConversationId::from_bytes([5; 32]),
+        ),
+    );
+    engine.note_sync_peer(&mut two, child, &[1]);
+    engine.note_sync_peer(
+        &mut two,
+        crate::protocol::v1::ConversationId::from_bytes([7; 32]),
+        other.as_bytes(),
+    );
+    engine.note_sync_peer(&mut two, sid, other.as_bytes());
+    let local_id = two.device.keys.as_ref().expect("keys").id.expect("id");
+    engine.note_sync_peer(&mut two, child, local_id.as_bytes());
+    engine.note_sync_peer(&mut two, child, other.as_bytes());
+    engine.note_sync_peer(&mut two, child, other.as_bytes());
+    let keep = crate::protocol::v1::DeviceId::from_bytes([8; 32]);
+    engine.note_sync_peer(&mut two, extra, keep.as_bytes());
+    let _ = engine.sync_view(&two, sid);
+    let peer_seen = engine
+        .list_conversations(&two, zeros, zid)
+        .expect("list-peer")
+        .into_iter()
+        .any(|row| match row.conversation {
+            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(view)) => {
+                view.members.iter().any(|member| member.device_id == other)
+            }
+            _ => false,
+        });
+    assert!(peer_seen);
+    let keep_before = two.established_secret(extra).expect("keep-sec");
+    let dropped = engine.kick_device(two, &rng, other).expect("drop-link");
+    assert!(dropped.state.established_secret(child).is_none());
+    assert_ne!(
+        dropped
+            .state
+            .established_secret(extra)
+            .expect("rekeyed-keep"),
+        keep_before
+    );
+    let mut named_self = confirmed_state.clone();
+    engine
+        .note_device_kick(&mut named_self, local_id)
+        .expect("self-note");
+    assert!(named_self.established_secret(child).is_none());
+    assert!(named_self.device.conversations.contains_key(&sid));
     let mine = again
         .state
         .device
@@ -9059,6 +9110,17 @@ fn live_path_sync_uses_device_actor() {
         EngineError::EmptyEngineRequired
     );
     let mut slim = confirmed_state;
+    let mut with_peer = slim.clone();
+    engine.note_sync_peer(&mut with_peer, child, other.as_bytes());
+    with_peer.persist_log.clear();
+    let folded_peer = engine.fold(with_peer).expect("fold-peer");
+    let restored_peer = engine
+        .apply_folded(&folded_peer.snapshot)
+        .expect("apply-peer");
+    let dropped_peer = engine
+        .kick_device(restored_peer, &rng, other)
+        .expect("peer-kick");
+    assert!(dropped_peer.state.established_secret(child).is_none());
     slim.persist_log.clear();
     let folded = engine.fold(slim).expect("fold-s");
     let restored = engine.apply_folded(&folded.snapshot).expect("apply-s");

@@ -149,7 +149,8 @@ the inviter seals the DEK to the invitee device encryption key as KEM
 ciphertext, a 12-byte nonce, and an AEAD under
 `expand(shared, "chuchotez/1/sync-dek")`. `open_sync_dek` opens that wrap
 and holds the DEK. `kick_device` of this device is `WrongPhase`. Kicking
-another device drops it from membership and rekeys Sync sending chains.
+another device drops that device's link and makes new sending keys for the
+Sync conversations that remain.
 `leave_sync` clears this device's Sync rows. Once a Synchronization exists,
 engine transactions also post on that live path.
 
