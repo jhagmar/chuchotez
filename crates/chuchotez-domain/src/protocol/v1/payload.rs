@@ -489,6 +489,11 @@ pub enum TxPayload {
         /// Device id.
         device_id: DeviceId,
     },
+    /// Sealed vault DEK for the other device.
+    SyncDek {
+        /// KEM ciphertext, nonce, and AEAD of the DEK.
+        ct: Vec<u8>,
+    },
 }
 
 /// Handshake advertisement.

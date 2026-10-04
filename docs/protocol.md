@@ -930,6 +930,7 @@ TxPayload = TxNotice / TxInviterIntro / TxInviteeIntro / TxConfirm / TxReject
           / TxEngineCreateIdentity / TxEngineDeleteUser / TxEngineDeleteIdentity
           / TxEngineSetDisplayName / TxEngineUnsetDisplayName
           / TxEngineSetProfilePic / TxEngineSetDeviceName / TxEngineKickDevice
+          / TxSyncDek
 ```
 
 Handshake durable payloads: `TxNotice`, `TxInviterIntro`, `TxInviteeIntro`,
@@ -941,7 +942,7 @@ durable payloads: `TxText`, `TxEdit`, `TxRemove`, `TxReaction`, `TxRead`,
 `TxDelivered`, `TxMedia`, `TxAdvertise`, `TxWrap`, `TxAck`, `TxName`,
 `TxPhoto`, `TxPrefs`, `TxGroupRoster`, `TxGroupWrap`, `TxGroupLeave`,
 `TxGroupKick`. Sync handshake
-uses the handshake payloads. Synchronization durable payloads are engine
+uses the handshake payloads and `TxSyncDek`. Synchronization durable payloads are engine
 payloads and device `TxName`. Engine payloads are the `TxEngine*` sorts.
 
 #### TxNotice
@@ -1248,7 +1249,16 @@ TxEngineSetDeviceName = {
 TxEngineKickDevice = {
   device_id: DeviceId,
 }
+
+TxSyncDek = {
+  ct: bstr,
+}
 ```
+
+`ct` is the KEM ciphertext, a 12-byte nonce, and an AEAD of the DEK under
+`expand(shared, "chuchotez/1/sync-dek")`. On confirm the inviter posts that
+body in `poll`. The other device opens it from the ingested body and holds
+the DEK.
 
 An empty `EngineState` (no engine txs) accepts `createUser`, `setDefaults`,
 and `receiveSyncTicket`. `createUser` and `setDefaults` mint `TxEngineInit`
@@ -1475,6 +1485,7 @@ refuses an unknown `"type"`.
 | TxEngineSetProfilePic | `"v1-engine-set-profile-pic"` |
 | TxEngineSetDeviceName | `"v1-engine-set-device-name"` |
 | TxEngineKickDevice | `"v1-engine-kick-device"` |
+| TxSyncDek | `"v1-sync-dek"` |
 | VaultHeader | `"v1-vault-header"` |
 
 **Packet.** Mapper body:

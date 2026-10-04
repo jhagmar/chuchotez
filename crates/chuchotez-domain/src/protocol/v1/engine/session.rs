@@ -67,6 +67,17 @@ impl Engine {
             self.spawn_child(&mut ok.state, ids.conversation_id)?;
             if inviter {
                 self.wrap_sync_dek(&mut ok.state, _rng, ids.conversation_id)?;
+                let ct = ok
+                    .state
+                    .device
+                    .dek_ct
+                    .clone()
+                    .ok_or(EngineError::WrongPhase)?;
+                #[rustfmt::skip]
+                let (tx_id, _, rec) = self.merge_tx(&mut ok.state, &secret, ids.conversation_id, TxPayload::SyncDek { ct })?;
+                ok.persist.push(rec);
+                #[rustfmt::skip]
+                self.post_handshake_packets(&mut ok.state, _rng, ids.conversation_id, &secret, tx_id)?;
             }
             return Ok(ok);
         }

@@ -608,7 +608,7 @@ impl Engine {
     /// advances IntroductionMinted / Confirming. Unlock and policy failures
     /// store `FailedReason`.
     pub fn ingest_list(
-        &self,
+        &mut self,
         state: EngineState,
         rng: &dyn Rng,
         channel: DurableChannel,
@@ -639,7 +639,7 @@ impl Engine {
     /// reassembles fragments. Durable `PacketTxFragLast` / `PacketXorAck`
     /// matching `set_xor` after merge stores that actor's last Persistent ack.
     pub fn ingest_packet(
-        &self,
+        &mut self,
         mut state: EngineState,
         rng: &dyn Rng,
         channel: DurableChannel,
@@ -647,7 +647,6 @@ impl Engine {
         body: &[u8],
     ) -> Result<MutateOk, EngineError> {
         let now = Self::require_tick(&state)?;
-        let _ = self.require_dek()?;
         let hits = self.handshake_hits(&state, HitChannel::Durable(&channel), &tag, now);
         if hits.is_empty() {
             return self.finish_established(state, rng, LiveChannel::Durable(&channel), &tag, body);
@@ -664,7 +663,7 @@ impl Engine {
     /// Ingest one 512-byte ephemeral body. Matching `PacketXorAck` is a live
     /// ack only.
     pub fn ingest_ephemeral_packet(
-        &self,
+        &mut self,
         mut state: EngineState,
         rng: &dyn Rng,
         channel: EphemeralChannel,
@@ -763,7 +762,7 @@ impl Engine {
     }
 
     pub(super) fn ingest_known_body(
-        &self,
+        &mut self,
         state: &mut EngineState,
         rng: &dyn Rng,
         hits: &[HandshakeHit],
@@ -782,7 +781,7 @@ impl Engine {
     }
 
     pub(super) fn open_and_merge(
-        &self,
+        &mut self,
         state: &mut EngineState,
         rng: &dyn Rng,
         hit: &HandshakeHit,
@@ -964,6 +963,9 @@ impl Engine {
         let cid = durable.conversation_id;
         if let Some(extra) = self.handshake_ingest_gate(state, cid, &durable.payload)? {
             return Ok(extra);
+        }
+        if let TxPayload::SyncDek { ct } = &durable.payload {
+            self.hold_sync_dek(state, ct)?;
         }
         let seq = state.next_seq;
         let persist = self.persist_record(seq, &durable)?;
