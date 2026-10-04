@@ -1091,7 +1091,8 @@ the snapshot. Sync gossips unexpired txs. Relays follow the 72-bin TTL.
 
 `TxMedia` locates sealed bytes at a blob mapper. `hash` is `hash` of the
 plaintext. `kind`, `address`, and `tag` are the GET/PUT locator (example Kind
-`blossom`). Mime allowlist is host UI. `sendMedia` mints one `TxMedia` per
+`blossom`). `sendMedia` copies `kind` and `address` from the caller onto each
+`TxMedia`. Mime allowlist is host UI. `sendMedia` mints one `TxMedia` per
 attachment (length 1..=4). EngineState holds the pointer. Host cache holds
 plaintext after `open`.
 
@@ -1680,6 +1681,8 @@ type MediaDraft = {
   mediaBytes: Uint8Array
   mime: string
   filename: string
+  kind: Kind
+  address: Address
 }
 
 type HistoryItem = {
