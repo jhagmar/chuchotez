@@ -703,6 +703,6 @@ pub(super) enum DeviceConversation {
     Synchronization {
         secret: Secret,
         parent: super::super::ConversationId,
-        peer: Option<super::super::DeviceId>,
+        peer: super::super::DeviceId,
     },
 }

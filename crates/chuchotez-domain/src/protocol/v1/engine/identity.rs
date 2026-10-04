@@ -228,7 +228,7 @@ impl Engine {
         }
     }
 
-    /// Kick a linked device.
+    /// Kick a linked device. An id that is not a peer is `UnknownIds`.
     pub fn kick_device(
         &self,
         state: EngineState,
@@ -237,6 +237,15 @@ impl Engine {
     ) -> Result<MutateOk, EngineError> {
         if state.device.keys.as_ref().and_then(|k| k.id) == Some(device_id) {
             return Err(EngineError::WrongPhase);
+        }
+        let known = state.device.conversations.values().any(|node| {
+            matches!(
+                &node.kind,
+                DeviceConversation::Synchronization { peer, .. } if *peer == device_id
+            )
+        });
+        if !known {
+            return Err(EngineError::UnknownIds);
         }
         let secret = self.engine_secret()?;
         #[rustfmt::skip]
@@ -341,7 +350,7 @@ impl Engine {
         for cid in &cids {
             let node = state.device.conversations.get(cid).expect("row");
             if let DeviceConversation::Synchronization { peer, .. } = &node.kind
-                && *peer == Some(device_id)
+                && *peer == device_id
             {
                 drop_ids.push(*cid);
             }
@@ -393,9 +402,7 @@ impl Engine {
         let DeviceConversation::Synchronization { peer, .. } = &mut node.kind else {
             return;
         };
-        if peer.is_none() {
-            *peer = Some(id);
-        }
+        *peer = id;
     }
 
     pub(super) fn wrap_sync_dek(

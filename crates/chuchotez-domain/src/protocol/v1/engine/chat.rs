@@ -743,6 +743,7 @@ mod tests {
             DeviceNode::sync(
                 Secret::from_bytes([6; 32]),
                 ConversationId::from_bytes([9; 32]),
+                crate::protocol::v1::DeviceId::from_bytes([0; 32]),
             ),
         );
         let named = engine.sync_view(&state, ConversationId::from_bytes([8; 32]));

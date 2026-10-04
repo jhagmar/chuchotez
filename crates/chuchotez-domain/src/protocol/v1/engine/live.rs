@@ -598,6 +598,8 @@ impl Engine {
     ) -> Result<Option<Vec<Vec<u8>>>, EngineError> {
         let actors = if sort == ConversationSort::Group {
             group_member_actors(state, cid)
+        } else if sort == ConversationSort::Synchronization {
+            sync_open_actors(state, cid)
         } else {
             let parent = state.established_parent(cid).expect("parent");
             open_actors(state, parent, sort)
@@ -798,6 +800,19 @@ fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>>
         .unwrap_or_default()
 }
 
+fn sync_open_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
+    let mut actors = Vec::new();
+    if let Some(id) = state.device.keys.as_ref().and_then(|keys| keys.id) {
+        actors.push(id.as_bytes().to_vec());
+    }
+    if let Some(node) = state.device.conversations.get(&cid)
+        && let DeviceConversation::Synchronization { peer, .. } = &node.kind
+    {
+        actors.push(peer.as_bytes().to_vec());
+    }
+    actors
+}
+
 fn open_actors(
     state: &EngineState,
     parent: ConversationId,
@@ -810,11 +825,7 @@ fn open_actors(
     if let Some(intro) = inviter_intro_for(state, parent) {
         actors.push(intro.signing_pk.as_bytes().to_vec());
     }
-    if sort == ConversationSort::Synchronization
-        && let Some(id) = state.device.keys.as_ref().and_then(|keys| keys.id)
-    {
-        actors.push(id.as_bytes().to_vec());
-    }
+    let _ = sort;
     actors
 }
 

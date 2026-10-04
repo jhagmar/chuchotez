@@ -325,16 +325,28 @@ fn tick_user_identity_invite() {
     engine
         .set_device_name(sync_ok.state.clone(), &rng, "phone")
         .expect("dn");
-    engine
-        .kick_device(
-            sync_ok.state.clone(),
-            &rng,
+    assert_eq!(
+        engine
+            .kick_device(
+                sync_ok.state.clone(),
+                &rng,
+                crate::protocol::v1::DeviceId::from_bytes([9; 32]),
+            )
+            .unwrap_err(),
+        EngineError::UnknownIds
+    );
+    let mut linked = sync_ok.state.clone();
+    linked.put_sync(
+        crate::protocol::v1::ConversationId::from_bytes([4; 32]),
+        super::state::DeviceNode::sync(
+            crate::protocol::v1::Secret::from_bytes([3; 32]),
+            crate::protocol::v1::ConversationId::from_bytes([5; 32]),
             crate::protocol::v1::DeviceId::from_bytes([9; 32]),
-        )
-        .expect("kd");
+        ),
+    );
     let kicked = engine
         .kick_device(
-            sync_ok.state.clone(),
+            linked,
             &rng,
             crate::protocol::v1::DeviceId::from_bytes([9; 32]),
         )
@@ -4563,7 +4575,10 @@ fn handshake_sync_intros() {
     missing_sync.txs.retain(|_, body| {
         !matches!(
             body.payload,
-            TxPayload::InviterIntro(_) | TxPayload::InviteeIntro(_)
+            TxPayload::InviterIntro(_)
+                | TxPayload::InviteeIntro(_)
+                | TxPayload::SyncInviterIntro(_)
+                | TxPayload::SyncInviteeIntro(_)
         )
     });
     assert_eq!(
@@ -5404,7 +5419,11 @@ fn fold_tree_phases_and_parse_errors() {
     );
     sync_state.put_sync(
         ConversationId::from_bytes([3; 32]),
-        super::state::DeviceNode::sync(Secret::from_bytes([1; 32]), cid),
+        super::state::DeviceNode::sync(
+            Secret::from_bytes([1; 32]),
+            cid,
+            crate::protocol::v1::DeviceId::from_bytes([0; 32]),
+        ),
     );
     sync_state.device.name = Some(crate::protocol::v1::DisplayName::try_from("phone").expect("dn"));
     sync_state.device.keys = Some(super::state::DeviceKeys {
@@ -5610,7 +5629,11 @@ fn fold_tree_phases_and_parse_errors() {
     );
     edges.put_sync(
         child,
-        super::state::DeviceNode::sync(Secret::from_bytes([1; 32]), parent),
+        super::state::DeviceNode::sync(
+            Secret::from_bytes([1; 32]),
+            parent,
+            crate::protocol::v1::DeviceId::from_bytes([0; 32]),
+        ),
     );
     super::helpers::rekey_conversation(&mut edges, parent, ConversationId::from_bytes([13; 32]));
     edges.put_last_ack(
@@ -6422,7 +6445,11 @@ fn advertise_wrap_ack_and_mix() {
     let sync_child = ConversationId::from_bytes([3; 32]);
     quiet.put_sync(
         sync_child,
-        super::state::DeviceNode::sync(Secret::from_bytes([2; 32]), cid),
+        super::state::DeviceNode::sync(
+            Secret::from_bytes([2; 32]),
+            cid,
+            crate::protocol::v1::DeviceId::from_bytes([0; 32]),
+        ),
     );
     assert_eq!(quiet.established_parent(sync_child), Some(cid));
     let _ = format!("{:?}", quiet.chains(cid).expect("c").ratchet);
@@ -9040,6 +9067,25 @@ fn live_path_sync_uses_device_actor() {
         .state;
     ada = engine.tick(ada, now + 3).expect("due").state;
     assert!(ada.writes.len() > before);
+    let mut peer_state = held.clone();
+    for write in ada.writes.iter().skip(before) {
+        peer_state = engine
+            .ingest_packet(
+                peer_state,
+                &rng,
+                write.channel.clone(),
+                write.tag,
+                &write.body,
+            )
+            .expect("peer-open")
+            .state;
+    }
+    assert!(
+        peer_state
+            .txs
+            .values()
+            .any(|tx| { matches!(&tx.payload, TxPayload::Text(text) if text.body == "sync-hi") })
+    );
     assert!(ada.chains(child).expect("c").live_pending.is_empty());
     let eph_before = ada.eph_writes.len();
     ada = engine
@@ -9059,8 +9105,41 @@ fn live_path_sync_uses_device_actor() {
     let drop_base = pre_kick.clone();
     let eph_at = pre_kick.eph_writes.len();
     let other = crate::protocol::v1::DeviceId::from_bytes([9; 32]);
+    assert_eq!(
+        engine
+            .kick_device(with_user.state.clone(), &rng, other)
+            .unwrap_err(),
+        EngineError::UnknownIds
+    );
+    assert_eq!(
+        with_user.state.established_secret(child).expect("still"),
+        secret_before
+    );
+    let local_device = with_user
+        .state
+        .device
+        .keys
+        .as_ref()
+        .expect("keys")
+        .id
+        .expect("id");
+    let peer_id = engine
+        .list_conversations(&with_user.state, zeros, zid)
+        .expect("peers")
+        .into_iter()
+        .find_map(|row| match row.conversation {
+            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(view))
+                if row.conversation_id == child =>
+            {
+                view.members.into_iter().find_map(|member| {
+                    (member.device_id != local_device).then_some(member.device_id)
+                })
+            }
+            _ => None,
+        })
+        .expect("peer-id");
     let kicked = engine
-        .kick_device(with_user.state, &rng, other)
+        .kick_device(with_user.state, &rng, peer_id)
         .expect("kick-dev");
     let mut peer = pre_kick;
     for write in kicked.state.eph_writes[eph_at..].iter().cloned() {
@@ -9069,20 +9148,13 @@ fn live_path_sync_uses_device_actor() {
             .expect("kick-pkt")
             .state;
     }
-    assert_ne!(
-        peer.established_secret(child).expect("peer-rekey"),
-        secret_before
-    );
-    assert_ne!(
-        kicked.state.established_secret(child).expect("rekeyed"),
-        secret_before
-    );
-    let again = engine
-        .kick_device(kicked.state.clone(), &rng, other)
-        .expect("kick-again");
+    assert!(peer.established_secret(child).is_none());
+    assert!(kicked.state.established_secret(child).is_none());
     assert_eq!(
-        again.state.established_secret(child).expect("same"),
-        kicked.state.established_secret(child).expect("rekeyed2")
+        engine
+            .kick_device(kicked.state.clone(), &rng, peer_id)
+            .unwrap_err(),
+        EngineError::UnknownIds
     );
     let mut two = drop_base;
     let extra = crate::protocol::v1::ConversationId::from_bytes([4; 32]);
@@ -9091,6 +9163,7 @@ fn live_path_sync_uses_device_actor() {
         super::state::DeviceNode::sync(
             crate::protocol::v1::Secret::from_bytes([6; 32]),
             crate::protocol::v1::ConversationId::from_bytes([5; 32]),
+            crate::protocol::v1::DeviceId::from_bytes([8; 32]),
         ),
     );
     engine.note_sync_peer(&mut two, child, &[1]);
@@ -9132,9 +9205,19 @@ fn live_path_sync_uses_device_actor() {
     engine
         .note_device_kick(&mut named_self, local_id)
         .expect("self-note");
+    engine
+        .note_device_kick(&mut named_self, local_id)
+        .expect("self-note-again");
+    let mut bare = EngineState::new();
+    bare.spawn_established(
+        crate::protocol::v1::ConversationId::from_bytes([1; 32]),
+        crate::protocol::v1::ConversationId::from_bytes([2; 32]),
+        crate::protocol::v1::Secret::from_bytes([3; 32]),
+        None,
+    );
     assert!(named_self.established_secret(child).is_none());
     assert!(named_self.device.conversations.contains_key(&sid));
-    let mine = again
+    let mine = kicked
         .state
         .device
         .keys
@@ -9144,11 +9227,11 @@ fn live_path_sync_uses_device_actor() {
         .expect("id");
     assert_eq!(
         engine
-            .kick_device(again.state.clone(), &rng, mine)
+            .kick_device(kicked.state.clone(), &rng, mine)
             .unwrap_err(),
         EngineError::WrongPhase
     );
-    let left = engine.leave_sync(again.state, &rng).expect("leave-sync");
+    let left = engine.leave_sync(kicked.state, &rng).expect("leave-sync");
     assert!(left.state.device.conversations.is_empty());
     assert!(left.state.device.dek_ct.is_none());
     let mut slots = confirmed_state.clone();
@@ -9323,6 +9406,7 @@ fn actor_sort_and_watermark_edges() {
         DeviceNode::sync(
             Secret::from_bytes([9; 32]),
             ConversationId::from_bytes([10; 32]),
+            crate::protocol::v1::DeviceId::from_bytes([0; 32]),
         ),
     );
     assert_eq!(state.sort_of(sid), Some(ConversationSort::Synchronization));

@@ -340,6 +340,10 @@ pub enum TxPayload {
     InviterIntro(TxInviterIntro),
     /// Invitee calling information.
     InviteeIntro(TxInviteeIntro),
+    /// Sync inviter calling information, including this device's id.
+    SyncInviterIntro(SyncInviterIntro),
+    /// Sync invitee calling information, including this device's id.
+    SyncInviteeIntro(SyncInviteeIntro),
     /// Handshake confirm.
     Confirm,
     /// Handshake reject.
@@ -530,6 +534,24 @@ pub struct TxInviterIntro {
     pub seed_ct: Vec<u8>,
     /// Prefs.
     pub prefs: OnWirePrefs,
+}
+
+/// Sync inviter intro. The inner intro is the calling card. `device_id` is this device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncInviterIntro {
+    /// Calling card.
+    pub intro: TxInviterIntro,
+    /// This device.
+    pub device_id: DeviceId,
+}
+
+/// Sync invitee intro. The inner intro is the calling card. `device_id` is this device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncInviteeIntro {
+    /// Calling card.
+    pub intro: TxInviteeIntro,
+    /// This device.
+    pub device_id: DeviceId,
 }
 
 /// Invitee intro.

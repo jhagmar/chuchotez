@@ -197,12 +197,16 @@ impl DeviceNode {
         }
     }
 
-    pub(super) fn sync(secret: Secret, parent: ConversationId) -> Self {
+    pub(super) fn sync(
+        secret: Secret,
+        parent: ConversationId,
+        peer: super::super::DeviceId,
+    ) -> Self {
         Self {
             kind: DeviceConversation::Synchronization {
                 secret,
                 parent,
-                peer: None,
+                peer,
             },
             chains: ConversationChains::default(),
         }
@@ -672,6 +676,7 @@ impl EngineState {
         handshake: ConversationId,
         child: ConversationId,
         secret: Secret,
+        peer: Option<super::super::DeviceId>,
     ) {
         if self.child_of(handshake).is_some() {
             return;
@@ -685,9 +690,11 @@ impl EngineState {
                     IdentityNode::direct(secret, handshake),
                 );
             }
-            Some(ConversationScope::Device) | None => {
-                self.put_sync(child, DeviceNode::sync(secret, handshake));
+            Some(ConversationScope::Device) => {
+                let peer = peer.expect("sync peer");
+                self.put_sync(child, DeviceNode::sync(secret, handshake, peer));
             }
+            None => {}
         }
     }
 
