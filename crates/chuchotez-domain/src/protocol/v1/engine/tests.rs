@@ -2,7 +2,7 @@ use super::{ConversationRef, Engine, EngineState, FOLD_VERSION};
 use crate::protocol::v1::fixtures::{CounterRng, test_engine};
 use crate::protocol::v1::payload::{DurableBody, Hlc, TxPayload};
 use crate::protocol::v1::{
-    AEAD_NONCE_LEN, ActorId, AeadNonce, ConversationId, EngineError, IdentityId, Json, Policy,
+    AEAD_NONCE_LEN, Actor, AeadNonce, ConversationId, EngineError, IdentityId, Json, Policy,
     Secret, UnixSeconds, UnlockSecret, UserId,
 };
 
@@ -2071,8 +2071,8 @@ fn query_adt_debug() {
         DirectMessageQuery::Established(super::DmEstablished {
             name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
             profile_pic: None,
-            encryption_pk: vec![],
-            signing_pk: vec![],
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![]),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![]),
             persistents: vec![],
             ephemerals: vec![],
             confirmation_digest: String::new(),
@@ -2107,7 +2107,7 @@ fn query_adt_debug() {
         GroupQuery::GroupOffer(super::GroupOfferView {
             name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
             photo: None,
-            owner_signing_pk: vec![],
+            owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![]),
             from_conversation_id: crate::protocol::v1::ConversationId::from_bytes([1; 32]),
         })
     );
@@ -2116,7 +2116,7 @@ fn query_adt_debug() {
         GroupQuery::GroupEstablished(super::GroupEstablishedView {
             name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
             photo: None,
-            owner_signing_pk: vec![],
+            owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![]),
             members: vec![],
             pending: vec![],
             persistents: vec![],
@@ -2140,8 +2140,8 @@ fn query_adt_debug() {
         device_name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
         members: vec![super::SyncMemberView {
             device_id: crate::protocol::v1::DeviceId::from_bytes([2; 32]),
-            signing_pk: vec![1],
-            encryption_pk: vec![2],
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1]),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![2]),
             name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
             last_active: None,
         }],
@@ -2173,7 +2173,7 @@ fn query_adt_debug() {
         Conversation::Group(GroupQuery::GroupOffer(super::GroupOfferView {
             name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
             photo: None,
-            owner_signing_pk: vec![],
+            owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![]),
             from_conversation_id: crate::protocol::v1::ConversationId::from_bytes([1; 32]),
         }))
     );
@@ -2264,7 +2264,7 @@ fn invite_packets_open_from_ticket_secret() {
         .chains(cid)
         .and_then(|c| c.send.values().next().cloned())
     {
-        with_recv.put_recv_chain(cid, ActorId::handshake(), chain);
+        with_recv.put_recv_chain(cid, Actor::handshake(), chain);
     }
     let recv_snap = engine.fold(with_recv).expect("frsnap");
     assert!(
@@ -2277,7 +2277,7 @@ fn invite_packets_open_from_ticket_secret() {
     let mut sk = invited.state.clone();
     sk.put_skipped(
         cid,
-        ActorId::handshake(),
+        Actor::handshake(),
         super::super::chain::CachedMk {
             mk: [1; 32],
             expires_at: UnixSeconds::from_u64(u64::MAX),
@@ -2288,7 +2288,7 @@ fn invite_packets_open_from_ticket_secret() {
     let mut acked = invited.state.clone();
     acked.put_last_ack(
         cid,
-        ActorId::handshake(),
+        Actor::handshake(),
         [crate::protocol::v1::Tag::from_bytes([3; 32])]
             .into_iter()
             .collect(),
@@ -2345,7 +2345,7 @@ fn invite_packets_open_from_ticket_secret() {
     super::helpers::annotate_cached_mk(
         &mut EngineState::new(),
         cid,
-        &ActorId::handshake(),
+        &Actor::handshake(),
         &[0; 32],
         crate::protocol::v1::Tag::from_bytes([0; 32]),
     );
@@ -2830,7 +2830,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
     let mut leave_state = sync_ing.state.clone();
     leave_state.put_skipped(
         sid,
-        ActorId::handshake(),
+        Actor::handshake(),
         super::super::chain::CachedMk {
             mk: [2; 32],
             expires_at: UnixSeconds::from_u64(u64::MAX),
@@ -3170,7 +3170,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
     let _ = super::helpers::take_shared32(vec![1]);
     with_frag_state.put_skipped(
         ph_rk,
-        ActorId::handshake(),
+        Actor::handshake(),
         super::super::chain::CachedMk {
             mk: [3; 32],
             expires_at: UnixSeconds::from_u64(u64::MAX),
@@ -3179,7 +3179,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
     );
     with_frag_state.put_skipped(
         ph_rk,
-        ActorId::from_bytes([7; 8]),
+        Actor::signing(vec![7; 8]),
         super::super::chain::CachedMk {
             mk: [6; 32],
             expires_at: UnixSeconds::from_u64(u64::MAX),
@@ -3383,8 +3383,20 @@ fn handshake_intros_confirming_and_failures() {
     let mut swapped = inv_conf.clone();
     for tx in swapped.txs.values_mut() {
         match &mut tx.payload {
-            TxPayload::InviterIntro(i) => i.signing_pk = vec![0xff; i.signing_pk.len()],
-            TxPayload::InviteeIntro(i) => i.signing_pk = vec![0x00; i.signing_pk.len()],
+            TxPayload::InviterIntro(i) => {
+                i.signing_pk = crate::protocol::v1::SigningPublicKey::from_bytes(vec![
+                    0xff;
+                    i.signing_pk
+                        .len()
+                ])
+            }
+            TxPayload::InviteeIntro(i) => {
+                i.signing_pk = crate::protocol::v1::SigningPublicKey::from_bytes(vec![
+                    0x00;
+                    i.signing_pk
+                        .len()
+                ])
+            }
             _ => {}
         }
     }
@@ -3647,14 +3659,14 @@ fn handshake_intros_confirming_and_failures() {
     let ticket = ticket_from_json(engine.suite.b64u(), &json).expect("tk");
     let other_notice = TxPayload::Notice(TxNotice {
         policy: Policy::Classic,
-        intake_pk: vec![0; 32],
+        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![0; 32]),
         persistents: ticket.persistents.clone(),
         ephemerals: Vec::new(),
         expires: UnixSeconds::from_u64(1_800_000_001),
     });
     let stored_notice = TxPayload::Notice(TxNotice {
         policy: Policy::Classic,
-        intake_pk: vec![0; 32],
+        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![0; 32]),
         persistents: ticket.persistents.clone(),
         ephemerals: Vec::new(),
         expires: UnixSeconds::from_u64(1_800_000_000),
@@ -3690,9 +3702,9 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([1; 32]),
         eph_send_tag_key: TagKey::from_bytes([2; 32]),
-        encryption_pk: vec![1],
-        signing_pk: vec![2],
-        intake_pk: vec![3],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![2]),
+        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![3]),
         seed_ct: vec![4],
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -3719,9 +3731,9 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([1; 32]),
         eph_send_tag_key: TagKey::from_bytes([2; 32]),
-        encryption_pk: vec![1; 32],
-        signing_pk: vec![1; 32],
-        intake_pk: vec![1; 32],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
         seed_ct: unwrap_ct.clone(),
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -3746,9 +3758,9 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([1; 32]),
         eph_send_tag_key: TagKey::from_bytes([2; 32]),
-        encryption_pk: vec![1; 32],
-        signing_pk: vec![1; 32],
-        intake_pk: vec![1; 32],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
         seed_ct: unwrap_ct.clone(),
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -3773,8 +3785,8 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([3; 32]),
         eph_send_tag_key: TagKey::from_bytes([4; 32]),
-        encryption_pk: vec![1; 32],
-        signing_pk: vec![1; 32],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
         seed_ct: unwrap_ct,
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -3795,9 +3807,9 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([1; 32]),
         eph_send_tag_key: TagKey::from_bytes([2; 32]),
-        encryption_pk: vec![1; 32],
-        signing_pk: vec![1; 32],
-        intake_pk: vec![1; 32],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
         seed_ct: vec![1; 32],
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -3817,8 +3829,8 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([3; 32]),
         eph_send_tag_key: TagKey::from_bytes([4; 32]),
-        encryption_pk: vec![1; 32],
-        signing_pk: vec![1; 32],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
         seed_ct: vec![1; 32],
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -3884,8 +3896,8 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([3; 32]),
         eph_send_tag_key: TagKey::from_bytes([4; 32]),
-        encryption_pk: vec![1; 32],
-        signing_pk: vec![1; 32],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
         seed_ct: vec![1; 32],
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -3979,9 +3991,9 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([8; 32]),
         eph_send_tag_key: TagKey::from_bytes([9; 32]),
-        encryption_pk: vec![1; 32],
-        signing_pk: vec![1; 32],
-        intake_pk: vec![1; 32],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
         seed_ct: vec![1; 32],
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -4014,8 +4026,8 @@ fn handshake_intros_confirming_and_failures() {
         profile_pic: None,
         send_tag_key: TagKey::from_bytes([10; 32]),
         eph_send_tag_key: TagKey::from_bytes([11; 32]),
-        encryption_pk: vec![1],
-        signing_pk: vec![1],
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1]),
         seed_ct: vec![1],
         prefs: OnWirePrefs {
             read_receipts: true,
@@ -4048,9 +4060,9 @@ fn handshake_intros_confirming_and_failures() {
                 profile_pic: None,
                 send_tag_key: TagKey::from_bytes([12; 32]),
                 eph_send_tag_key: TagKey::from_bytes([13; 32]),
-                encryption_pk: vec![1; 32],
-                signing_pk: vec![1; 32],
-                intake_pk: Vec::new(),
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
                 seed_ct: vec![1; 32],
                 prefs: OnWirePrefs {
                     read_receipts: true,
@@ -4107,9 +4119,9 @@ fn handshake_intros_confirming_and_failures() {
                 profile_pic: None,
                 send_tag_key: TagKey::from_bytes([16; 32]),
                 eph_send_tag_key: TagKey::from_bytes([17; 32]),
-                encryption_pk: vec![1; 32],
-                signing_pk: vec![1; 32],
-                intake_pk,
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(intake_pk),
                 seed_ct: vec![0xee, 0xfd],
                 prefs: OnWirePrefs {
                     read_receipts: true,
@@ -4154,9 +4166,9 @@ fn handshake_intros_confirming_and_failures() {
                 profile_pic: None,
                 send_tag_key: TagKey::from_bytes([14; 32]),
                 eph_send_tag_key: TagKey::from_bytes([15; 32]),
-                encryption_pk: vec![1; 32],
-                signing_pk: vec![1; 32],
-                intake_pk: vec![1; 32],
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
                 seed_ct: vec![1; 32],
                 prefs: OnWirePrefs {
                     read_receipts: true,
@@ -4187,9 +4199,9 @@ fn handshake_intros_confirming_and_failures() {
                 profile_pic: None,
                 send_tag_key: TagKey::from_bytes([16; 32]),
                 eph_send_tag_key: TagKey::from_bytes([17; 32]),
-                encryption_pk: vec![1; 32],
-                signing_pk: vec![1; 32],
-                intake_pk: vec![1; 32],
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
                 seed_ct: vec![1; 32],
                 prefs: OnWirePrefs {
                     read_receipts: true,
@@ -4263,7 +4275,7 @@ fn handshake_intros_confirming_and_failures() {
     );
     rk.put_skipped(
         ConversationId::from_bytes([1; 32]),
-        ActorId::handshake(),
+        Actor::handshake(),
         super::super::chain::CachedMk {
             mk: [2; 32],
             expires_at: UnixSeconds::from_u64(9),
@@ -4286,17 +4298,17 @@ fn handshake_intros_confirming_and_failures() {
     };
     rk.put_send_chain(
         ConversationId::from_bytes([1; 32]),
-        ActorId::handshake(),
+        Actor::handshake(),
         dummy.clone(),
     );
     rk.put_recv_chain(
         ConversationId::from_bytes([1; 32]),
-        ActorId::handshake(),
+        Actor::handshake(),
         dummy,
     );
     rk.put_last_ack(
         ConversationId::from_bytes([1; 32]),
-        ActorId::from_bytes(vec![1]),
+        Actor::signing(vec![1]),
         std::collections::BTreeSet::new(),
     );
     super::helpers::rekey_conversation(
@@ -4339,7 +4351,7 @@ fn handshake_intros_confirming_and_failures() {
     let mut chain = named_ie
         .state
         .chains(cid)
-        .and_then(|c| c.recv.get(&ActorId::handshake()).cloned())
+        .and_then(|c| c.recv.get(&Actor::handshake()).cloned())
         .expect("rc");
     let clash_body = DurableBody {
         conversation_id: cid,
@@ -4782,7 +4794,7 @@ fn watermark_expire_live_ack_and_fold_fields() {
     );
     engine.fold(ghost).expect("ghost");
     let mut empty_actors = ingested.state.clone();
-    empty_actors.put_last_ack(cid, ActorId::handshake(), Default::default());
+    empty_actors.put_last_ack(cid, Actor::handshake(), Default::default());
     engine.fold(empty_actors).expect("emptyack");
     let mut orphan = ingested.state.clone();
     orphan.persist_log.insert(
@@ -5266,7 +5278,7 @@ fn fold_tree_phases_and_parse_errors() {
             payload: crate::protocol::v1::payload::TxPayload::Notice(
                 crate::protocol::v1::payload::TxNotice {
                     policy: Policy::Hybrid,
-                    intake_pk: vec![0; 32],
+                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![0; 32]),
                     persistents: ticket.persistents.clone(),
                     ephemerals: Vec::new(),
                     expires: UnixSeconds::from_u64(9),
@@ -5289,9 +5301,12 @@ fn fold_tree_phases_and_parse_errors() {
                     profile_pic: None,
                     send_tag_key: crate::protocol::v1::TagKey::from_bytes([1; 32]),
                     eph_send_tag_key: crate::protocol::v1::TagKey::from_bytes([2; 32]),
-                    encryption_pk: vec![1; 32],
-                    signing_pk: vec![1; 32],
-                    intake_pk: vec![1; 32],
+                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![
+                        1;
+                        32
+                    ]),
+                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 32]),
+                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
                     seed_ct: vec![1; 32],
                     prefs: crate::protocol::v1::OnWirePrefs {
                         read_receipts: true,
@@ -5335,7 +5350,7 @@ fn fold_tree_phases_and_parse_errors() {
             payload: crate::protocol::v1::payload::TxPayload::Notice(
                 crate::protocol::v1::payload::TxNotice {
                     policy: Policy::Classic,
-                    intake_pk: vec![0; 32],
+                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![0; 32]),
                     persistents: ticket.persistents.clone(),
                     ephemerals: Vec::new(),
                     expires: UnixSeconds::from_u64(9),
@@ -5357,9 +5372,9 @@ fn fold_tree_phases_and_parse_errors() {
                     profile_pic: None,
                     send_tag_key: crate::protocol::v1::TagKey::from_bytes([3; 32]),
                     eph_send_tag_key: crate::protocol::v1::TagKey::from_bytes([4; 32]),
-                    encryption_pk: vec![1; 8],
-                    signing_pk: vec![1; 8],
-                    intake_pk: vec![1; 8],
+                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 8]),
+                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1; 8]),
+                    intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 8]),
                     seed_ct: vec![1; 8],
                     prefs: crate::protocol::v1::OnWirePrefs {
                         read_receipts: true,
@@ -5600,7 +5615,7 @@ fn fold_tree_phases_and_parse_errors() {
     super::helpers::rekey_conversation(&mut edges, parent, ConversationId::from_bytes([13; 32]));
     edges.put_last_ack(
         child,
-        crate::protocol::v1::ActorId::handshake(),
+        crate::protocol::v1::Actor::handshake(),
         Default::default(),
     );
     assert!(edges.has_last_acks());
@@ -6073,7 +6088,7 @@ fn advertise_wrap_ack_and_mix() {
     use super::state::{IdentityNode, KnownShared, UnusedSk};
     use crate::protocol::v1::fixtures::suite_with_kem;
     use crate::protocol::v1::kem::Kem;
-    use crate::protocol::v1::{ActorId, KemError, PacketEpoch, PacketSeq, Tag};
+    use crate::protocol::v1::{Actor, KemError, PacketEpoch, PacketSeq, Tag};
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -6177,7 +6192,7 @@ fn advertise_wrap_ack_and_mix() {
             chains.ratchet.minted.insert(id);
             chains.ratchet.unused.push(UnusedSk {
                 tx_id: id,
-                pk: vec![i],
+                pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![i]),
                 sk: vec![i],
             });
         }
@@ -6202,7 +6217,7 @@ fn advertise_wrap_ack_and_mix() {
                 counter: 0,
             },
             payload: TxPayload::Advertise {
-                encaps_pk: peer_pk.clone(),
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(peer_pk.clone()),
             },
         },
     );
@@ -6225,7 +6240,7 @@ fn advertise_wrap_ack_and_mix() {
             .ratchet
             .known
             .iter()
-            .any(|row| row.from_us && row.encaps_pk == peer_pk)
+            .any(|row| row.from_us && row.encaps_pk.as_bytes() == peer_pk.as_slice())
     );
 
     let mut peer_wrap = invited.state.clone();
@@ -6235,7 +6250,7 @@ fn advertise_wrap_ack_and_mix() {
         chains.ratchet.minted.insert(sk_tx);
         chains.ratchet.unused.push(UnusedSk {
             tx_id: sk_tx,
-            pk: vec![9; 32],
+            pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![9; 32]),
             sk: vec![9; 32],
         });
         chains.ratchet.known.push(KnownShared {
@@ -6243,7 +6258,7 @@ fn advertise_wrap_ack_and_mix() {
             shared: Secret::from_bytes([1; 32]),
             ct_hash: Tag::from_bytes([0x38; 32]),
             from_us: true,
-            encaps_pk: vec![1; 32],
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1; 32]),
         });
         chains.ratchet.since = 50;
     }
@@ -6329,20 +6344,19 @@ fn advertise_wrap_ack_and_mix() {
             shared: Secret::from_bytes([2; 32]),
             ct_hash: hash_a,
             from_us: false,
-            encaps_pk: Vec::new(),
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
         });
         chains.ratchet.known.push(KnownShared {
             wrap_tx: wrap_b,
             shared: Secret::from_bytes([3; 32]),
             ct_hash: hash_b,
             from_us: false,
-            encaps_pk: Vec::new(),
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
         });
         chains.ratchet.since = 50;
-        chains.last_acks.insert(
-            ActorId::handshake(),
-            BTreeSet::from([wrap_a, wrap_b, ack_a]),
-        );
+        chains
+            .last_acks
+            .insert(Actor::handshake(), BTreeSet::from([wrap_a, wrap_b, ack_a]));
     }
     for (id, payload) in [
         (
@@ -6471,7 +6485,7 @@ fn advertise_wrap_ack_and_mix() {
                 counter: 0,
             },
             payload: TxPayload::Advertise {
-                encaps_pk: vec![4; 32],
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![4; 32]),
             },
         },
     );
@@ -6479,7 +6493,7 @@ fn advertise_wrap_ack_and_mix() {
         .chains_mut(cid)
         .expect("c")
         .last_acks
-        .insert(ActorId::handshake(), BTreeSet::from([notice_tx]));
+        .insert(Actor::handshake(), BTreeSet::from([notice_tx]));
     hidden.chains_mut(cid).expect("c").ratchet.since = 50;
     let ads_before = hidden
         .txs
@@ -6500,20 +6514,16 @@ fn advertise_wrap_ack_and_mix() {
     let mut mix_state = invited.state.clone();
     {
         let chains = mix_state.chains_mut(cid).expect("c");
-        let mut chain = chains
-            .send
-            .get(&ActorId::handshake())
-            .expect("send")
-            .clone();
+        let mut chain = chains.send.get(&Actor::handshake()).expect("send").clone();
         chain.packet_seq = PacketSeq::from_u64(8);
-        chains.send.insert(ActorId::handshake(), chain);
+        chains.send.insert(Actor::handshake(), chain);
         for i in 0..8u8 {
             chains.ratchet.known.push(KnownShared {
                 wrap_tx: Tag::from_bytes([0x60 + i; 32]),
                 shared: Secret::from_bytes([i; 32]),
                 ct_hash: Tag::from_bytes([0x70 + i; 32]),
                 from_us: true,
-                encaps_pk: Vec::new(),
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
             });
         }
     }
@@ -6554,7 +6564,7 @@ fn advertise_wrap_ack_and_mix() {
         .chains(cid)
         .expect("c")
         .send
-        .get(&ActorId::handshake())
+        .get(&Actor::handshake())
         .expect("send")
         .clone();
     assert_eq!(mixed_chain.epoch, PacketEpoch::from_u64(1));
@@ -6562,19 +6572,15 @@ fn advertise_wrap_ack_and_mix() {
     let mut few = invited.state.clone();
     {
         let chains = few.chains_mut(cid).expect("c");
-        let mut chain = chains
-            .send
-            .get(&ActorId::handshake())
-            .expect("send")
-            .clone();
+        let mut chain = chains.send.get(&Actor::handshake()).expect("send").clone();
         chain.packet_seq = PacketSeq::from_u64(8);
-        chains.send.insert(ActorId::handshake(), chain);
+        chains.send.insert(Actor::handshake(), chain);
         chains.ratchet.known.push(KnownShared {
             wrap_tx: Tag::from_bytes([0x91; 32]),
             shared: Secret::from_bytes([9; 32]),
             ct_hash: Tag::from_bytes([0x92; 32]),
             from_us: true,
-            encaps_pk: Vec::new(),
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
         });
     }
     few.txs.insert(
@@ -6610,7 +6616,7 @@ fn advertise_wrap_ack_and_mix() {
         few.chains(cid)
             .expect("c")
             .send
-            .get(&ActorId::handshake())
+            .get(&Actor::handshake())
             .expect("send")
             .epoch,
         PacketEpoch::from_u64(0)
@@ -6619,13 +6625,9 @@ fn advertise_wrap_ack_and_mix() {
     let mut recv_state = invited.state.clone();
     let start = {
         let chains = recv_state.chains_mut(cid).expect("c");
-        let mut chain = chains
-            .send
-            .get(&ActorId::handshake())
-            .expect("send")
-            .clone();
+        let mut chain = chains.send.get(&Actor::handshake()).expect("send").clone();
         chain.packet_seq = PacketSeq::from_u64(8);
-        chains.recv.insert(ActorId::handshake(), chain.clone());
+        chains.recv.insert(Actor::handshake(), chain.clone());
         for i in 0..8u8 {
             let wrap_tx = Tag::from_bytes([0x60 + i; 32]);
             let ct_hash = Tag::from_bytes([0x70 + i; 32]);
@@ -6634,7 +6636,7 @@ fn advertise_wrap_ack_and_mix() {
                 shared: Secret::from_bytes([i; 32]),
                 ct_hash,
                 from_us: false,
-                encaps_pk: Vec::new(),
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
             });
         }
         chain
@@ -6696,7 +6698,7 @@ fn advertise_wrap_ack_and_mix() {
             .chains(cid)
             .expect("c")
             .recv
-            .get(&ActorId::handshake())
+            .get(&Actor::handshake())
             .expect("recv")
             .epoch,
         PacketEpoch::from_u64(1)
@@ -6710,7 +6712,7 @@ fn advertise_wrap_ack_and_mix() {
         chains.ratchet.minted.insert(id);
         chains.ratchet.unused.push(UnusedSk {
             tx_id: id,
-            pk: vec![1],
+            pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
             sk: vec![2],
         });
         chains.ratchet.known.push(KnownShared {
@@ -6718,10 +6720,10 @@ fn advertise_wrap_ack_and_mix() {
             shared: Secret::from_bytes([3; 32]),
             ct_hash: Tag::from_bytes([4; 32]),
             from_us: true,
-            encaps_pk: vec![5],
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![5]),
         });
         chains.skipped_mks.insert(
-            ActorId::handshake(),
+            Actor::handshake(),
             vec![super::super::chain::CachedMk {
                 mk: [6; 32],
                 expires_at: UnixSeconds::from_u64(9),
@@ -6770,7 +6772,9 @@ fn advertise_wrap_ack_and_mix() {
                 wall_ms: 0,
                 counter: 0,
             },
-            payload: TxPayload::Advertise { encaps_pk: peer },
+            payload: TxPayload::Advertise {
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(peer),
+            },
         },
     );
     boom_state.txs.insert(
@@ -6812,7 +6816,7 @@ fn advertise_wrap_ack_and_mix() {
             shared: Secret::from_bytes([8; 32]),
             ct_hash: Tag::from_bytes([0x5a; 32]),
             from_us: true,
-            encaps_pk: old_pk.clone(),
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(old_pk.clone()),
         });
     short_state.txs.insert(
         Tag::from_bytes([0x57; 32]),
@@ -6822,7 +6826,9 @@ fn advertise_wrap_ack_and_mix() {
                 wall_ms: 0,
                 counter: 0,
             },
-            payload: TxPayload::Advertise { encaps_pk: old_pk },
+            payload: TxPayload::Advertise {
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(old_pk),
+            },
         },
     );
     short_state.txs.insert(
@@ -6847,7 +6853,7 @@ fn advertise_wrap_ack_and_mix() {
                 counter: 0,
             },
             payload: TxPayload::Advertise {
-                encaps_pk: new_pk.clone(),
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(new_pk.clone()),
             },
         },
     );
@@ -6999,7 +7005,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
     use super::super::payload::{ConversationSort, PacketPlain, PacketXorAck};
     use crate::protocol::v1::fixtures::sample_durable;
     use crate::protocol::v1::{
-        ActorId, Address, Defaults, EphemeralChannel, Kind, NotificationPrivacy, Tag,
+        Actor, Address, Defaults, EphemeralChannel, Kind, NotificationPrivacy, Tag,
     };
 
     let mut engine = test_engine();
@@ -7057,7 +7063,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         .chains(cid)
         .expect("c")
         .send
-        .get(&ActorId::handshake())
+        .get(&Actor::handshake())
         .expect("send")
         .clone();
     let remote = super::super::chain::set_xor_for(&ada.txs, cid);
@@ -7165,7 +7171,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         .chains(cid)
         .expect("lc")
         .send
-        .get(&ActorId::handshake())
+        .get(&Actor::handshake())
         .expect("lsend")
         .clone();
     let matched = super::super::chain::set_xor_for(&ada.txs, cid);
@@ -7321,7 +7327,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
             std::slice::from_ref(&channel),
             tag,
             notice,
-            ActorId::handshake(),
+            Actor::handshake(),
             false,
         )
         .expect("move");
@@ -7457,7 +7463,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         chains.heal.ready = vec![vec![9]];
         chains.heal.sealed_from = Some(origin.clone());
         chains.heal.sealed_to = Some(origin.clone());
-        chains.send.insert(ActorId::handshake(), origin);
+        chains.send.insert(Actor::handshake(), origin);
     }
     live_engine.flush_heal(&mut gap);
     live_engine
@@ -7497,7 +7503,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         .chains(cid)
         .expect("c")
         .recv
-        .get(&ActorId::handshake())
+        .get(&Actor::handshake())
         .expect("recv")
         .clone();
     let text = DurableBody {
@@ -7816,7 +7822,7 @@ fn live_path_waits_then_falls_back() {
         &rng,
         &eph_mk(engine.suite.hmac(), &peer),
         &PacketPlain::XorAck(PacketXorAck {
-            actor_id: invitee_pk.clone(),
+            actor_id: invitee_pk.as_bytes().to_vec(),
             packet_seq: peer.packet_seq.as_u64(),
             set_xor,
         }),
@@ -7867,7 +7873,7 @@ fn live_path_waits_then_falls_back() {
         &rng,
         &mk(engine.suite.hmac(), &peer),
         &PacketPlain::XorAck(PacketXorAck {
-            actor_id: invitee_pk,
+            actor_id: invitee_pk.as_bytes().to_vec(),
             packet_seq: 0,
             set_xor: super::super::chain::set_xor_for(&ada.txs, child),
         }),
@@ -7909,7 +7915,7 @@ fn live_path_waits_then_falls_back() {
     );
     let secret = ada.established_secret(child).expect("sec2");
     let payload = TxPayload::Advertise {
-        encaps_pk: vec![7; 32],
+        encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![7; 32]),
     };
     let (tx_id, _, _) = engine
         .merge_tx(&mut ada, &secret, child, payload.clone())
@@ -8058,11 +8064,11 @@ fn live_path_waits_then_falls_back() {
     let view = engine.dm_view(&ada, child);
     assert!(view.messages.iter().any(|item| {
         matches!(&item.payload, TxPayload::Text(text) if text.body == "hi")
-            && !item.sender.is_empty()
+            && !item.sender.as_bytes().is_empty()
     }));
     assert!(view.messages.iter().any(|item| {
         matches!(&item.payload, TxPayload::Text(text) if text.body == "bare")
-            && item.sender.is_empty()
+            && item.sender.as_bytes().is_empty()
     }));
     assert!(view.messages.iter().all(|item| !matches!(
         item.payload,
@@ -8758,8 +8764,10 @@ fn live_path_waits_then_falls_back() {
     let live = super::group::live_mut(&mut capped, gid).expect("live");
     while live.members.len() + live.pending.len() < 32 {
         live.pending.push(super::party::GroupPending {
-            signing_pk: vec![live.pending.len() as u8],
-            encryption_pk: vec![1],
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![
+                live.pending.len() as u8
+            ]),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
             from_conversation_id: child,
             name: pad_name.clone(),
             photo: None,
@@ -9258,4 +9266,67 @@ fn host_cycle_acks_a_post_and_a_blob() {
         .state;
     assert!(engine.poll(&state).expect("clear").blob_put.is_empty());
     let _ = cid;
+}
+
+#[test]
+fn actor_sort_and_watermark_edges() {
+    use super::super::payload::ConversationSort;
+    use super::helpers::{actor_for, store_durable_last_ack, watermark_of};
+    use super::party::{GroupPhase, IdentityConversation};
+    use super::state::{DeviceNode, IdentityNode};
+    use crate::protocol::v1::{ConversationId, IdentityId, Secret, Tag, UserId};
+    assert!(actor_for(ConversationSort::Engine, &[1]).is_none());
+    assert!(actor_for(ConversationSort::DirectMessage, &[]).is_none());
+    assert!(actor_for(ConversationSort::Synchronization, &[9; 32]).is_some());
+    let mut state = super::state::EngineState::new();
+    let cid = ConversationId::from_bytes([1; 32]);
+    assert!(state.sort_of(cid).is_none());
+    let tx = Tag::from_bytes([2; 32]);
+    state.txs.insert(
+        tx,
+        super::super::payload::DurableBody {
+            conversation_id: cid,
+            hlc: super::super::payload::Hlc {
+                wall_ms: 0,
+                counter: 0,
+            },
+            payload: super::super::payload::TxPayload::Confirm,
+        },
+    );
+    store_durable_last_ack(&mut state, cid, &[], tx);
+    let user = UserId::from_bytes([3; 32]);
+    state.ensure_identity(user, IdentityId::from_bytes([0; 32]));
+    state.put_dm(
+        user,
+        IdentityId::from_bytes([4; 32]),
+        cid,
+        IdentityNode::direct(
+            Secret::from_bytes([5; 32]),
+            ConversationId::from_bytes([6; 32]),
+        ),
+    );
+    assert_eq!(state.sort_of(cid), Some(ConversationSort::DirectMessage));
+    let gid = ConversationId::from_bytes([7; 32]);
+    state.put_dm(
+        user,
+        IdentityId::from_bytes([4; 32]),
+        gid,
+        IdentityNode {
+            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::FailedReason::Left)),
+            chains: Default::default(),
+        },
+    );
+    assert_eq!(state.sort_of(gid), Some(ConversationSort::Group));
+    let sid = ConversationId::from_bytes([8; 32]);
+    state.put_sync(
+        sid,
+        DeviceNode::sync(
+            Secret::from_bytes([9; 32]),
+            ConversationId::from_bytes([10; 32]),
+        ),
+    );
+    assert_eq!(state.sort_of(sid), Some(ConversationSort::Synchronization));
+    state.put_last_ack(cid, super::super::Actor::signing(vec![1]), [tx].into());
+    state.put_last_ack(cid, super::super::Actor::signing(vec![2]), [tx].into());
+    assert!(watermark_of(&state, cid).contains(&tx));
 }

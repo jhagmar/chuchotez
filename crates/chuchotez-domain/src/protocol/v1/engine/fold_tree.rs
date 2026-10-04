@@ -6,7 +6,7 @@ use super::super::kem::KeyPair;
 use super::super::payload::{Ticket, parse_policy, policy_str};
 use super::super::sign::SigningKeyPair;
 use super::super::{
-    ActorId, Base64Url, ConversationId, DisplayName, EngineError, IdentityId, Json, ProfilePic,
+    Actor, Base64Url, ConversationId, DisplayName, EngineError, IdentityId, Json, ProfilePic,
     Secret, Tag, TimeBin, UserId,
 };
 use super::helpers::{decode_fold_bstr, decode_fold32, keypair_json, parse_fold_keypair};
@@ -573,6 +573,7 @@ fn chains_json(
             .collect();
         skipped.push(Json::Object(vec![
             ("actor_id".into(), bstr(b64u, actor.as_bytes())),
+            ("actor_role".into(), Json::String(actor.role().into())),
             ("mks".into(), Json::Array(mks)),
         ]));
     }
@@ -580,6 +581,7 @@ fn chains_json(
     for (actor, ids) in &chains.last_acks {
         last_acks.push(Json::Object(vec![
             ("actor_id".into(), bstr(b64u, actor.as_bytes())),
+            ("actor_role".into(), Json::String(actor.role().into())),
             (
                 "tx_ids".into(),
                 Json::Array(ids.iter().map(|id| bstr(b64u, id.as_bytes())).collect()),
@@ -883,7 +885,14 @@ fn parse_chains(
             let Json::Object(sm) = item else {
                 return Err(EngineError::MalformedPersist);
             };
-            let actor = ActorId::from_bytes(decode_fold_bstr(b64u, field(sm, "actor_id")?)?);
+            let actor_bytes = decode_fold_bstr(b64u, field(sm, "actor_id")?)?;
+            let role = match optional(sm, "actor_role") {
+                Some(Json::String(role)) => Some(role.as_str()),
+                Some(_) => return Err(EngineError::MalformedPersist),
+                None => None,
+            };
+            let actor =
+                Actor::from_stored(role, actor_bytes).ok_or(EngineError::MalformedPersist)?;
             let Json::Array(mks) = field(sm, "mks")? else {
                 return Err(EngineError::MalformedPersist);
             };
@@ -916,7 +925,14 @@ fn parse_chains(
             let Json::Object(am) = item else {
                 return Err(EngineError::MalformedPersist);
             };
-            let actor = ActorId::from_bytes(decode_fold_bstr(b64u, field(am, "actor_id")?)?);
+            let actor_bytes = decode_fold_bstr(b64u, field(am, "actor_id")?)?;
+            let role = match optional(am, "actor_role") {
+                Some(Json::String(role)) => Some(role.as_str()),
+                Some(_) => return Err(EngineError::MalformedPersist),
+                None => None,
+            };
+            let actor =
+                Actor::from_stored(role, actor_bytes).ok_or(EngineError::MalformedPersist)?;
             let Json::Array(ids_v) = field(am, "tx_ids")? else {
                 return Err(EngineError::MalformedPersist);
             };
@@ -959,7 +975,8 @@ fn parse_ratchet(b64u: &dyn Base64Url, value: &Json) -> Result<super::state::Rat
         };
         unused.push(super::state::UnusedSk {
             tx_id: Tag::from_bytes(decode_fold32(b64u, field(row, "tx_id")?)?),
-            pk: decode_fold_bstr(b64u, field(row, "pk")?)?,
+            #[rustfmt::skip]
+            pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(decode_fold_bstr(b64u, field(row, "pk")?)?),
             sk: decode_fold_bstr(b64u, field(row, "sk")?)?,
         });
     }
@@ -979,7 +996,8 @@ fn parse_ratchet(b64u: &dyn Base64Url, value: &Json) -> Result<super::state::Rat
             shared: Secret::from_bytes(decode_fold32(b64u, field(row, "shared")?)?),
             ct_hash: Tag::from_bytes(decode_fold32(b64u, field(row, "ct_hash")?)?),
             from_us: *from_us,
-            encaps_pk: decode_fold_bstr(b64u, field(row, "encaps_pk")?)?,
+            #[rustfmt::skip]
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(decode_fold_bstr(b64u, field(row, "encaps_pk")?)?),
         });
     }
     Ok(super::state::Ratchet {
@@ -1014,4 +1032,25 @@ fn optional<'a>(m: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
 
 fn bstr(b64u: &dyn Base64Url, bytes: &[u8]) -> Json {
     super::super::codec::bstr(b64u, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Json, parse_chains};
+
+    #[test]
+    fn bad_actor_role_is_rejected() {
+        let engine = crate::protocol::v1::fixtures::test_engine();
+        let b64 = engine.suite.b64u();
+        let actor = ("actor_id".into(), Json::String(b64.encode(&[1])));
+        let role = ("actor_role".into(), Json::Number(1));
+        let skipped = Json::Object(vec![
+            actor.clone(),
+            role.clone(),
+            ("mks".into(), Json::Array(vec![])),
+        ]);
+        assert!(parse_chains(b64, &[("skipped_mks".into(), Json::Array(vec![skipped]))]).is_err());
+        let acks = Json::Object(vec![actor, role, ("tx_ids".into(), Json::Array(vec![]))]);
+        assert!(parse_chains(b64, &[("last_acks".into(), Json::Array(vec![acks]))]).is_err());
+    }
 }

@@ -668,7 +668,7 @@ pub(super) struct GroupLive {
     pub(super) secret: Secret,
     pub(super) name: super::super::DisplayName,
     pub(super) photo: Option<super::super::ProfilePic>,
-    pub(super) owner_signing_pk: Vec<u8>,
+    pub(super) owner_signing_pk: super::super::SigningPublicKey,
     pub(super) persistents: Vec<super::super::DurableChannel>,
     pub(super) ephemerals: Vec<super::super::EphemeralChannel>,
     pub(super) members: Vec<super::super::payload::GroupMember>,
@@ -682,15 +682,15 @@ pub(super) struct GroupOffer {
     pub(super) secret: Secret,
     pub(super) name: super::super::DisplayName,
     pub(super) photo: Option<super::super::ProfilePic>,
-    pub(super) owner_signing_pk: Vec<u8>,
+    pub(super) owner_signing_pk: super::super::SigningPublicKey,
     pub(super) from_conversation_id: super::super::ConversationId,
 }
 
 /// Invite not yet accepted.
 #[derive(Clone, Debug)]
 pub(super) struct GroupPending {
-    pub(super) signing_pk: Vec<u8>,
-    pub(super) encryption_pk: Vec<u8>,
+    pub(super) signing_pk: super::super::SigningPublicKey,
+    pub(super) encryption_pk: super::super::EncryptionPublicKey,
     pub(super) from_conversation_id: super::super::ConversationId,
     pub(super) name: super::super::DisplayName,
     pub(super) photo: Option<super::super::ProfilePic>,

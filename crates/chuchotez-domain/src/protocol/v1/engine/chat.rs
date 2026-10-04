@@ -234,8 +234,8 @@ pub(super) fn local_prefs(
 struct PeerCard {
     name: super::super::DisplayName,
     profile_pic: Option<super::super::ProfilePic>,
-    encryption_pk: Vec<u8>,
-    signing_pk: Vec<u8>,
+    encryption_pk: super::super::EncryptionPublicKey,
+    signing_pk: super::super::SigningPublicKey,
     prefs: super::super::OnWirePrefs,
 }
 
@@ -243,8 +243,8 @@ fn peer_card(engine: &Engine, state: &EngineState, cid: ConversationId) -> PeerC
     let fallback = || PeerCard {
         name: super::super::DisplayName::try_from(".").expect("dot"),
         profile_pic: None,
-        encryption_pk: Vec::new(),
-        signing_pk: Vec::new(),
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(Vec::new()),
         prefs: engine.on_wire_prefs(),
     };
     let Some(parent) = state.established_parent(cid) else {
@@ -258,7 +258,7 @@ fn peer_card(engine: &Engine, state: &EngineState, cid: ConversationId) -> PeerC
     if let Some(intro) = super::helpers::inviter_intro_for(state, parent)
         && local
             .as_ref()
-            .is_none_or(|signing| signing != &intro.signing_pk)
+            .is_none_or(|signing| signing.as_slice() != intro.signing_pk.as_bytes())
     {
         return PeerCard {
             name: intro.name.clone(),
@@ -336,14 +336,14 @@ fn ping_target(wake: Wake) -> PingTarget {
 
 struct PrefsSeen {
     id: Tag,
-    sender: Vec<u8>,
+    sender: super::super::Actor,
     wall: u64,
     counter: u64,
     wake: Option<Wake>,
 }
 
 struct LatestWake {
-    sender: Vec<u8>,
+    sender: super::super::Actor,
     key: (u64, u64, [u8; 32]),
     wake: Option<Wake>,
 }
@@ -353,7 +353,7 @@ fn group_member_pings(state: &EngineState, cid: ConversationId) -> Vec<PingTarge
         .expect("group")
         .members
         .iter()
-        .map(|member| member.signing_pk.clone())
+        .map(|member| member.signing_pk.as_bytes().to_vec())
         .collect();
     let senders = state.chains(cid).expect("row").chat_senders.clone();
     let mut rows = Vec::new();
@@ -378,7 +378,10 @@ fn group_member_pings(state: &EngineState, cid: ConversationId) -> Vec<PingTarge
     rows.sort_by_key(|row| *row.id.as_bytes());
     let mut best: Vec<LatestWake> = Vec::new();
     for row in rows {
-        if !members.iter().any(|member| member == &row.sender) {
+        if !members
+            .iter()
+            .any(|member| member.as_slice() == row.sender.as_bytes())
+        {
             continue;
         }
         let key = (row.wall, row.counter, *row.id.as_bytes());
@@ -444,7 +447,7 @@ fn peer_wake(engine: &Engine, state: &EngineState, cid: ConversationId) -> Optio
     let parent = state.established_parent(cid)?;
     let (_, signing) = local_material(engine, state, cid)?;
     if let Some(intro) = inviter_intro_for(state, parent)
-        && intro.signing_pk != signing
+        && intro.signing_pk != crate::protocol::v1::SigningPublicKey::from_bytes(signing)
     {
         return intro.prefs.wake.clone();
     }
@@ -463,7 +466,10 @@ fn history(state: &EngineState, cid: ConversationId, now: UnixSeconds) -> Vec<Hi
         }
         items.push(HistoryItem {
             tx_id: *id,
-            sender: senders.get(id).cloned().unwrap_or_default(),
+            sender: senders
+                .get(id)
+                .cloned()
+                .unwrap_or_else(super::super::Actor::handshake),
             hlc: tx.hlc,
             payload: tx.payload.clone(),
             expire_at: expire_of(&tx.payload),
@@ -522,7 +528,7 @@ mod tests {
         let items: Vec<_> = (0..1001)
             .map(|n| HistoryItem {
                 tx_id: Tag::from_bytes([u8::try_from(n & 0xff).unwrap_or(0); 32]),
-                sender: Vec::new(),
+                sender: super::super::super::Actor::handshake(),
                 hlc: Hlc {
                     wall_ms: n,
                     counter: 0,
@@ -758,8 +764,8 @@ mod tests {
         let owner = vec![1u8];
         let other = vec![2u8];
         let member = |pk: Vec<u8>, n: u8| GroupMember {
-            signing_pk: pk,
-            encryption_pk: vec![1],
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(pk),
+            encryption_pk: super::super::super::EncryptionPublicKey::from_bytes(vec![1]),
             send_tag_key: TagKey::from_bytes([n; 32]),
             eph_send_tag_key: TagKey::from_bytes([n.wrapping_add(1); 32]),
         };
@@ -773,7 +779,9 @@ mod tests {
                     secret: Secret::from_bytes([5; 32]),
                     name: DisplayName::try_from("G").expect("n"),
                     photo: None,
-                    owner_signing_pk: owner.clone(),
+                    owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(
+                        owner.clone(),
+                    ),
                     persistents: Vec::new(),
                     ephemerals: Vec::new(),
                     members: vec![member(owner.clone(), 6), member(other.clone(), 8)],
@@ -846,11 +854,21 @@ mod tests {
             },
         );
         let chains = state.chains_mut(cid).expect("chains");
-        chains.chat_senders.insert(id(0), owner.clone());
-        chains.chat_senders.insert(id(1), owner.clone());
-        chains.chat_senders.insert(id(2), owner);
-        chains.chat_senders.insert(id(3), vec![9]);
-        chains.chat_senders.insert(id(8), other);
+        chains
+            .chat_senders
+            .insert(id(0), super::super::super::Actor::signing(owner.clone()));
+        chains
+            .chat_senders
+            .insert(id(1), super::super::super::Actor::signing(owner.clone()));
+        chains
+            .chat_senders
+            .insert(id(2), super::super::super::Actor::signing(owner));
+        chains
+            .chat_senders
+            .insert(id(3), super::super::super::Actor::signing(vec![9]));
+        chains
+            .chat_senders
+            .insert(id(8), super::super::super::Actor::signing(other));
         let pings = group_member_pings(&state, cid);
         assert_eq!(pings.len(), 1);
         assert_eq!(pings[0].endpoint, "https://push.example/b");

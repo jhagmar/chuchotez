@@ -10,7 +10,7 @@ use super::super::payload::{
     PacketTyping, PacketTypingActive, TxPayload, time_bin,
 };
 use super::super::{
-    ActorId, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex, Secret, Tag,
+    Actor, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex, Secret, Tag,
     TagKey, TimeBin, UnixSeconds,
 };
 use super::Engine;
@@ -36,7 +36,7 @@ struct LiveRoute {
     ephemerals: Vec<EphemeralChannel>,
     send_tag_key: TagKey,
     eph_send_tag_key: TagKey,
-    actor: ActorId,
+    actor: Actor,
 }
 
 pub(super) fn live_persistent_only(sort: ConversationSort, payload: &TxPayload) -> bool {
@@ -421,7 +421,7 @@ impl Engine {
         }
         let parent = state.established_parent(cid)?;
         let notice = notice_for(state, parent)?;
-        let (actor_bytes, signing) = local_material(self, state, cid)?;
+        let (actor, signing) = local_material(self, state, cid)?;
         let (send_tag_key, eph_send_tag_key) = intro_tag_keys(state, parent, &signing)?;
         let sort = if state.is_sync(cid) {
             ConversationSort::Synchronization
@@ -434,7 +434,7 @@ impl Engine {
             ephemerals: notice.ephemerals.clone(),
             send_tag_key,
             eph_send_tag_key,
-            actor: ActorId::from_bytes(actor_bytes),
+            actor,
         })
     }
 
@@ -461,18 +461,18 @@ impl Engine {
 
     fn group_route(&self, state: &EngineState, cid: ConversationId) -> Option<LiveRoute> {
         let live = super::group::group_live(state, cid)?;
-        let (actor_bytes, signing) = local_material(self, state, cid)?;
+        let (actor, signing) = local_material(self, state, cid)?;
         let member = live
             .members
             .iter()
-            .find(|member| member.signing_pk == signing)?;
+            .find(|member| member.signing_pk.as_bytes() == signing.as_slice())?;
         Some(LiveRoute {
             sort: ConversationSort::Group,
             persistents: live.persistents.clone(),
             ephemerals: Vec::new(),
             send_tag_key: member.send_tag_key,
             eph_send_tag_key: member.eph_send_tag_key,
-            actor: ActorId::from_bytes(actor_bytes),
+            actor,
         })
     }
 
@@ -603,7 +603,7 @@ impl Engine {
             open_actors(state, parent, sort)
         };
         for actor_bytes in actors {
-            let actor = ActorId::from_bytes(actor_bytes.clone());
+            let actor = super::helpers::actor_for(sort, &actor_bytes).expect("actor");
             #[rustfmt::skip]
             let joined = join(self.suite.hmac(), secret.as_bytes(), sort, &actor_bytes)?;
             let start = state
@@ -726,11 +726,15 @@ impl Engine {
             state.next_seq = state.next_seq.saturating_add(1);
             state.txs.insert(part.tx_id, durable.clone());
             self.on_group_payload(state, rng, cid, &durable.payload)?;
+            let sender = state
+                .sort_of(cid)
+                .and_then(|sort| super::helpers::actor_for(sort, &packet_actor(packet)))
+                .unwrap_or_else(Actor::handshake);
             state
                 .chains_mut(cid)
                 .expect("row")
                 .chat_senders
-                .insert(part.tx_id, packet_actor(packet));
+                .insert(part.tx_id, sender);
             if persistent && let PacketPlain::TxFragLast(last) = packet {
                 store_durable_last_ack(state, cid, &last.actor_id, last.set_xor);
                 self.note_set_xor(state, rng, cid, last.set_xor)?;
@@ -758,15 +762,15 @@ pub(super) fn local_material(
     engine: &Engine,
     state: &EngineState,
     cid: ConversationId,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> Option<(Actor, Vec<u8>)> {
     if state.is_sync(cid) {
         let keys = state.device.keys.as_ref()?;
         let id = keys.id?;
-        return Some((id.as_bytes().to_vec(), keys.sign.public_bytes().to_vec()));
+        return Some((Actor::device(id), keys.sign.public_bytes().to_vec()));
     }
     let (user, identity) = state.owner(cid)?;
     let (_, _, signing) = engine.identity_keys(state, &user, &identity)?;
-    Some((signing.clone(), signing))
+    Some((Actor::signing(signing.clone()), signing))
 }
 
 fn intro_tag_keys(
@@ -775,12 +779,12 @@ fn intro_tag_keys(
     signing: &[u8],
 ) -> Option<(TagKey, TagKey)> {
     if let Some(intro) = inviter_intro_for(state, parent)
-        && intro.signing_pk == signing
+        && intro.signing_pk == crate::protocol::v1::SigningPublicKey::from_bytes(signing)
     {
         return Some((intro.send_tag_key, intro.eph_send_tag_key));
     }
     let intro = invitee_intro_for(state, parent)?;
-    (intro.signing_pk == signing).then_some((intro.send_tag_key, intro.eph_send_tag_key))
+    (intro.signing_pk.as_bytes() == signing).then_some((intro.send_tag_key, intro.eph_send_tag_key))
 }
 
 fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
@@ -788,7 +792,7 @@ fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>>
         .map(|live| {
             live.members
                 .iter()
-                .map(|member| member.signing_pk.clone())
+                .map(|member| member.signing_pk.as_bytes().to_vec())
                 .collect()
         })
         .unwrap_or_default()
@@ -801,10 +805,10 @@ fn open_actors(
 ) -> Vec<Vec<u8>> {
     let mut actors = Vec::new();
     if let Some(intro) = invitee_intro_for(state, parent) {
-        actors.push(intro.signing_pk.clone());
+        actors.push(intro.signing_pk.as_bytes().to_vec());
     }
     if let Some(intro) = inviter_intro_for(state, parent) {
-        actors.push(intro.signing_pk.clone());
+        actors.push(intro.signing_pk.as_bytes().to_vec());
     }
     if sort == ConversationSort::Synchronization
         && let Some(id) = state.device.keys.as_ref().and_then(|keys| keys.id)
@@ -829,7 +833,9 @@ mod tests {
         ));
         assert!(live_persistent_only(
             ConversationSort::DirectMessage,
-            &TxPayload::Advertise { encaps_pk: vec![] }
+            &TxPayload::Advertise {
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![])
+            }
         ));
         assert!(live_persistent_only(
             ConversationSort::Synchronization,

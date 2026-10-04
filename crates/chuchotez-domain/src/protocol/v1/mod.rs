@@ -45,15 +45,15 @@ pub use error::EngineError;
 pub use hash::{HashBytes, Sha256};
 pub use hmac::{HmacSha256, HmacSha256Key, HmacSha256Mac};
 pub use ids::{
-    ActorId, ConversationId, DeviceId, FragIndex, IdentityId, PacketEpoch, PacketSeq, PersistSeq,
+    Actor, ConversationId, DeviceId, FragIndex, IdentityId, PacketEpoch, PacketSeq, PersistSeq,
     Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
 };
 pub use json::{CanonicalJson, CanonicalJsonError, Json};
 pub use kem::{
-    CLASSIC_KEM_CT_LEN, CLASSIC_KEM_PK_LEN, CLASSIC_KEM_SK_LEN, KEM_SEED_LEN, KEM_SHARED_LEN, Kem,
-    KemError, KemSeed, KemSeedBytes, KeyPair, MLKEM768_KEM_CT_LEN, MLKEM768_KEM_PK_LEN,
-    MLKEM768_KEM_SK_LEN, XWING_KEM_CT_LEN, XWING_KEM_PK_LEN, XWING_KEM_SK_LEN, kem_ct_len,
-    kem_pk_len, kem_sk_len,
+    CLASSIC_KEM_CT_LEN, CLASSIC_KEM_PK_LEN, CLASSIC_KEM_SK_LEN, EncryptionPublicKey, KEM_SEED_LEN,
+    KEM_SHARED_LEN, Kem, KemError, KemSeed, KemSeedBytes, KeyPair, MLKEM768_KEM_CT_LEN,
+    MLKEM768_KEM_PK_LEN, MLKEM768_KEM_SK_LEN, XWING_KEM_CT_LEN, XWING_KEM_PK_LEN, XWING_KEM_SK_LEN,
+    kem_ct_len, kem_pk_len, kem_sk_len,
 };
 pub use payload::{
     AEAD_TAG_LEN, ConversationSort, DurableBody, GroupMember, Hlc, PACKET_LEN,
@@ -67,7 +67,7 @@ pub use sign::{
     CLASSIC_SIGN_PK_LEN, CLASSIC_SIGN_SIG_LEN, CLASSIC_SIGN_SK_LEN, HYBRID_SIGN_PK_LEN,
     HYBRID_SIGN_SIG_LEN, HYBRID_SIGN_SK_LEN, MLDSA65_SIGN_PK_LEN, MLDSA65_SIGN_SIG_LEN,
     MLDSA65_SIGN_SK_LEN, SIGN_SEED_LEN, Sign, SignError, SignSeed, SignSeedBytes, SigningKeyPair,
-    sign_pk_len, sign_sig_len, sign_sk_len,
+    SigningPublicKey, sign_pk_len, sign_sig_len, sign_sk_len,
 };
 pub use suite::Suite;
 
