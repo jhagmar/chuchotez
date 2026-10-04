@@ -210,6 +210,10 @@ pub struct MediaDraft {
     pub mime: String,
     /// Filename.
     pub filename: String,
+    /// Blob mapper kind.
+    pub kind: Kind,
+    /// Blob mapper address.
+    pub address: Address,
 }
 
 /// Inviter handshake query.

@@ -126,7 +126,8 @@ Typing clears 6 ticked seconds after the signal. Reload has empty typing
 and presence. A durable DM send pings the peer `Wake` when that
 subscription is set.
 
-`sendMedia` takes 1..=4 attachments on an established DM. `media_key` is
+`sendMedia` takes 1..=4 attachments on an established DM. Each attachment
+carries the blob kind and address from the caller. `media_key` is
 `expand(conversation_secret, "chuchotez/1/media" || hash)`. `poll.blob_put`
 carries `nonce || seal(media_key, media_bytes)` until `write_blob_ack`.
 `poll.blob_get` lists `TxMedia` locators that are not still being put.

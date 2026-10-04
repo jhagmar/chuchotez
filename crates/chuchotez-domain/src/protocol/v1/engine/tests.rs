@@ -472,6 +472,8 @@ fn tick_user_identity_invite() {
             media_bytes: vec![1],
             mime: "a".into(),
             filename: "b".into(),
+            kind: crate::protocol::v1::Kind::try_from("blossom").expect("k"),
+            address: crate::protocol::v1::Address::try_from("https://blob.example").expect("a"),
         }
     );
 }
@@ -529,6 +531,8 @@ fn library_edges() {
                 media_bytes: b"blob".to_vec(),
                 mime: "image/png".into(),
                 filename: "a.png".into(),
+                kind: crate::protocol::v1::Kind::try_from("blossom").expect("k"),
+                address: crate::protocol::v1::Address::try_from("https://blob.example").expect("a"),
             }],
             None,
             Some("cap"),
@@ -552,6 +556,9 @@ fn library_edges() {
                         media_bytes: vec![1],
                         mime: "image/png".into(),
                         filename: "a.png".into(),
+                        kind: crate::protocol::v1::Kind::try_from("blossom").expect("k"),
+                        address: crate::protocol::v1::Address::try_from("https://blob.example")
+                            .expect("a"),
                     };
                     5
                 ],
@@ -571,6 +578,9 @@ fn library_edges() {
                     media_bytes: vec![1],
                     mime: "image/png".into(),
                     filename: "a\u{0301}.png".into(),
+                    kind: crate::protocol::v1::Kind::try_from("blossom").expect("k"),
+                    address: crate::protocol::v1::Address::try_from("https://blob.example")
+                        .expect("a"),
                 }],
                 None,
                 Some(""),
@@ -726,6 +736,9 @@ fn library_edges() {
                     media_bytes: b"blob".to_vec(),
                     mime: String::new(),
                     filename: "a.png".into(),
+                    kind: crate::protocol::v1::Kind::try_from("blossom").expect("k"),
+                    address: crate::protocol::v1::Address::try_from("https://blob.example")
+                        .expect("a"),
                 }],
                 None,
                 None,
@@ -8120,6 +8133,9 @@ fn live_path_waits_then_falls_back() {
                 media_bytes: b"blob".to_vec(),
                 mime: "image/png".into(),
                 filename: "a.png".into(),
+                kind: crate::protocol::v1::Kind::try_from("s3").expect("k"),
+                address: crate::protocol::v1::Address::try_from("https://files.example")
+                    .expect("a"),
             }],
             None,
             Some("cap"),
@@ -8133,15 +8149,18 @@ fn live_path_waits_then_falls_back() {
         .expect("put")
         .clone();
     assert_ne!(put.body, b"blob");
-    let hash = sent
-        .state
-        .txs
-        .values()
-        .find_map(|tx| match &tx.payload {
-            TxPayload::Media(media) if media.filename == "a.png" => Some(media.hash),
-            _ => None,
-        })
-        .expect("hash");
+    assert_eq!(put.kind.as_str(), "s3");
+    assert_eq!(put.address.as_str(), "https://files.example");
+    let mut hash = None;
+    let mut saw_other = false;
+    for tx in sent.state.txs.values() {
+        match &tx.payload {
+            TxPayload::Media(media) if media.filename == "a.png" => hash = Some(media.hash),
+            _ => saw_other = true,
+        }
+    }
+    assert!(saw_other);
+    let hash = hash.expect("hash");
     let plain = engine
         .open_media(&sent.state, child, hash, &put.body)
         .expect("open");
