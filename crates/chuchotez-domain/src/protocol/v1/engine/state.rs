@@ -5,7 +5,7 @@ use super::super::kem::KeyPair;
 use super::super::payload::{ConversationSort, DurableBody, Ticket};
 use super::super::sign::SigningKeyPair;
 use super::super::{
-    ActorId, ConversationId, DeviceId, DisplayName, DurableChannel, FragIndex, IdentityId,
+    Actor, ConversationId, DeviceId, DisplayName, DurableChannel, FragIndex, IdentityId,
     PersistSeq, ProfilePic, Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
 };
 use super::party::{
@@ -18,8 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// List-bin progress keyed by durable channel and invite tag-key.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) struct BinKey {
-    pub(super) kind: String,
-    pub(super) address: String,
+    pub(super) channel: DurableChannel,
     pub(super) tag_key: TagKey,
 }
 
@@ -53,7 +52,7 @@ pub(super) struct HandshakeHit {
 #[derive(Clone)]
 pub(super) struct UnusedSk {
     pub(super) tx_id: Tag,
-    pub(super) pk: Vec<u8>,
+    pub(super) pk: super::super::EncryptionPublicKey,
     pub(super) sk: Vec<u8>,
 }
 
@@ -64,7 +63,7 @@ pub(super) struct KnownShared {
     pub(super) shared: Secret,
     pub(super) ct_hash: Tag,
     pub(super) from_us: bool,
-    pub(super) encaps_pk: Vec<u8>,
+    pub(super) encaps_pk: super::super::EncryptionPublicKey,
 }
 
 /// Advertise, wrap, ack, and mix bookkeeping for one conversation.
@@ -108,7 +107,7 @@ pub(super) struct LivePending {
     pub(super) sent_at: UnixSeconds,
     pub(super) bodies: Vec<Vec<u8>>,
     pub(super) sealed_to: SendChain,
-    pub(super) actor: ActorId,
+    pub(super) actor: Actor,
     pub(super) acks: u8,
     pub(super) needed: u8,
 }
@@ -132,10 +131,10 @@ pub(super) struct Heal {
 /// Packet chains, skip-ahead `mk`s, last Persistent acks, and ratchet state.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConversationChains {
-    pub(super) send: BTreeMap<ActorId, SendChain>,
-    pub(super) recv: BTreeMap<ActorId, SendChain>,
-    pub(super) skipped_mks: BTreeMap<ActorId, Vec<CachedMk>>,
-    pub(super) last_acks: BTreeMap<ActorId, BTreeSet<Tag>>,
+    pub(super) send: BTreeMap<Actor, SendChain>,
+    pub(super) recv: BTreeMap<Actor, SendChain>,
+    pub(super) skipped_mks: BTreeMap<Actor, Vec<CachedMk>>,
+    pub(super) last_acks: BTreeMap<Actor, BTreeSet<Tag>>,
     pub(super) ratchet: Ratchet,
     /// Heal search still waiting for an answer.
     pub(super) heal: Heal,
@@ -146,7 +145,7 @@ pub(super) struct ConversationChains {
     /// A presence probe was sent since this process came online.
     pub(super) presence_sent: bool,
     /// Sender of a chat tx, for query `messages`.
-    pub(super) chat_senders: BTreeMap<Tag, Vec<u8>>,
+    pub(super) chat_senders: BTreeMap<Tag, super::super::Actor>,
     /// Latest composing signal. Not folded.
     pub(super) typing: Option<TypingNote>,
     /// Latest presence time. Not folded.
@@ -545,6 +544,29 @@ impl EngineState {
         self.device.conversations.contains_key(&cid)
     }
 
+    pub(super) fn sort_of(&self, cid: ConversationId) -> Option<ConversationSort> {
+        if let Some(node) = self.device.conversations.get(&cid) {
+            return Some(match &node.kind {
+                DeviceConversation::SyncHandshake(_) => ConversationSort::HandshakeSync,
+                DeviceConversation::Synchronization { .. } => ConversationSort::Synchronization,
+            });
+        }
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                if let Some(node) = ident.conversations.get(&cid) {
+                    return Some(match &node.kind {
+                        IdentityConversation::DmHandshake(_) => ConversationSort::HandshakeDm,
+                        IdentityConversation::DirectMessage { .. } => {
+                            ConversationSort::DirectMessage
+                        }
+                        IdentityConversation::Group(_) => ConversationSort::Group,
+                    });
+                }
+            }
+        }
+        None
+    }
+
     #[cfg(test)]
     pub(super) fn is_sync_established(&self, cid: ConversationId) -> bool {
         matches!(
@@ -751,14 +773,14 @@ impl EngineState {
     #[cfg(test)]
     pub(crate) fn send_chain_seq(&self, conversation_id: &ConversationId) -> Option<u64> {
         self.chains(*conversation_id)
-            .and_then(|c| c.send.get(&ActorId::handshake()))
+            .and_then(|c| c.send.get(&Actor::handshake()))
             .map(|c| c.packet_seq.as_u64())
     }
 
     #[cfg(test)]
     pub(crate) fn recv_chain_seq(&self, conversation_id: &ConversationId) -> Option<u64> {
         self.chains(*conversation_id)
-            .and_then(|c| c.recv.get(&ActorId::handshake()))
+            .and_then(|c| c.recv.get(&Actor::handshake()))
             .map(|c| c.packet_seq.as_u64())
     }
 
@@ -779,28 +801,28 @@ impl EngineState {
     }
 
     #[cfg(test)]
-    pub(crate) fn put_skipped(&mut self, cid: ConversationId, actor: ActorId, entry: CachedMk) {
+    pub(crate) fn put_skipped(&mut self, cid: ConversationId, actor: Actor, entry: CachedMk) {
         if let Some(chains) = self.chains_mut(cid) {
             chains.skipped_mks.entry(actor).or_default().push(entry);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn put_send_chain(&mut self, cid: ConversationId, actor: ActorId, chain: SendChain) {
+    pub(crate) fn put_send_chain(&mut self, cid: ConversationId, actor: Actor, chain: SendChain) {
         if let Some(chains) = self.chains_mut(cid) {
             chains.send.insert(actor, chain);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn put_recv_chain(&mut self, cid: ConversationId, actor: ActorId, chain: SendChain) {
+    pub(crate) fn put_recv_chain(&mut self, cid: ConversationId, actor: Actor, chain: SendChain) {
         if let Some(chains) = self.chains_mut(cid) {
             chains.recv.insert(actor, chain);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn put_last_ack(&mut self, cid: ConversationId, actor: ActorId, ids: BTreeSet<Tag>) {
+    pub(crate) fn put_last_ack(&mut self, cid: ConversationId, actor: Actor, ids: BTreeSet<Tag>) {
         if let Some(chains) = self.chains_mut(cid) {
             chains.last_acks.insert(actor, ids);
         }
@@ -818,7 +840,7 @@ impl EngineState {
     #[cfg(test)]
     pub(crate) fn last_acks_snapshot(
         &self,
-    ) -> BTreeMap<ConversationId, BTreeMap<ActorId, BTreeSet<Tag>>> {
+    ) -> BTreeMap<ConversationId, BTreeMap<Actor, BTreeSet<Tag>>> {
         let mut out = BTreeMap::new();
         for user in self.users.values() {
             for ident in user.identities.values() {

@@ -370,7 +370,7 @@ pub enum TxPayload {
     /// Encaps advertise.
     Advertise {
         /// Encaps public key.
-        encaps_pk: Vec<u8>,
+        encaps_pk: super::kem::EncryptionPublicKey,
     },
     /// Encaps wrap.
     Wrap {
@@ -415,7 +415,7 @@ pub enum TxPayload {
     /// Group kick.
     GroupKick {
         /// Member signing pk.
-        signing_pk: Vec<u8>,
+        signing_pk: super::sign::SigningPublicKey,
     },
     /// Engine init.
     EngineInit,
@@ -502,7 +502,7 @@ pub struct TxNotice {
     /// Policy.
     pub policy: Policy,
     /// Intake public key.
-    pub intake_pk: Vec<u8>,
+    pub intake_pk: super::kem::EncryptionPublicKey,
     /// Persistent channels.
     pub persistents: Vec<DurableChannel>,
     /// Ephemeral channels.
@@ -523,9 +523,9 @@ pub struct TxInviterIntro {
     /// Eph tag key.
     pub eph_send_tag_key: TagKey,
     /// Encryption pk.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::kem::EncryptionPublicKey,
     /// Signing pk.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::sign::SigningPublicKey,
     /// Wrap of seed to invitee intake.
     pub seed_ct: Vec<u8>,
     /// Prefs.
@@ -544,11 +544,11 @@ pub struct TxInviteeIntro {
     /// Eph tag key.
     pub eph_send_tag_key: TagKey,
     /// Encryption pk.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::kem::EncryptionPublicKey,
     /// Signing pk.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::sign::SigningPublicKey,
     /// Invitee intake pk.
-    pub intake_pk: Vec<u8>,
+    pub intake_pk: super::kem::EncryptionPublicKey,
     /// Wrap of seed to inviter notice intake.
     pub seed_ct: Vec<u8>,
     /// Prefs.
@@ -615,7 +615,7 @@ pub struct TxGroupInvite {
     /// Group id.
     pub group_id: ConversationId,
     /// Owner signing pk.
-    pub owner_signing_pk: Vec<u8>,
+    pub owner_signing_pk: super::sign::SigningPublicKey,
     /// Persistents.
     pub persistents: Vec<DurableChannel>,
     /// Ephemerals.
@@ -625,7 +625,7 @@ pub struct TxGroupInvite {
     /// Photo.
     pub photo: Option<ProfilePic>,
     /// Invitee signing pk.
-    pub invitee_signing_pk: Vec<u8>,
+    pub invitee_signing_pk: super::sign::SigningPublicKey,
     /// Wrap of group secret.
     pub group_secret_ct: Vec<u8>,
 }
@@ -634,9 +634,9 @@ pub struct TxGroupInvite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupMember {
     /// Signing pk.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::sign::SigningPublicKey,
     /// Encryption pk.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::kem::EncryptionPublicKey,
     /// Persist tag key.
     pub send_tag_key: TagKey,
     /// Eph tag key.
@@ -658,9 +658,9 @@ pub struct TxGroupRoster {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TxGroupWrap {
     /// Recipient signing pk.
-    pub to: Vec<u8>,
+    pub to: super::sign::SigningPublicKey,
     /// Sender signing pk.
-    pub from: Vec<u8>,
+    pub from: super::sign::SigningPublicKey,
     /// Wrap ciphertext.
     pub kem_ct: Vec<u8>,
 }

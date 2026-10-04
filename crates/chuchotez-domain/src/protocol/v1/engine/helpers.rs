@@ -8,7 +8,7 @@ use super::super::payload::{
 };
 use super::super::sign::sign_pk_len;
 use super::super::{
-    ActorId, Address, ConversationId, DisplayName, DurableChannel, EngineError, FragIndex, Json,
+    Actor, Address, ConversationId, DisplayName, DurableChannel, EngineError, FragIndex, Json,
     Kind, Policy, Secret, Tag, TagKey, TimeBin, UnixSeconds,
 };
 use super::party::HandshakeFailure;
@@ -139,8 +139,7 @@ pub(super) fn invite_tag(hmac: &dyn HmacSha256, secret: &[u8; 32], bin: TimeBin)
 
 pub(super) fn progress_key(channel: &DurableChannel, tag_key: &TagKey) -> BinKey {
     BinKey {
-        kind: channel.kind().as_str().into(),
-        address: channel.address().as_str().into(),
+        channel: channel.clone(),
         tag_key: *tag_key,
     }
 }
@@ -377,11 +376,24 @@ pub(super) fn parse_fold_channel(value: &Json) -> Result<DurableChannel, EngineE
     Ok(DurableChannel::new(kind, address))
 }
 
-pub(super) fn handshake_actor_key(actor_id: &[u8], local_inviter: bool) -> ActorId {
-    if actor_id.is_empty() {
-        ActorId::from_bytes(vec![u8::from(local_inviter)])
-    } else {
-        ActorId::from_bytes(actor_id)
+pub(super) fn actor_for(
+    sort: super::super::payload::ConversationSort,
+    bytes: &[u8],
+) -> Option<super::super::Actor> {
+    use super::super::Actor;
+    use super::super::payload::ConversationSort;
+    match sort {
+        ConversationSort::HandshakeDm | ConversationSort::HandshakeSync => {
+            bytes.is_empty().then_some(Actor::handshake())
+        }
+        ConversationSort::DirectMessage | ConversationSort::Group => {
+            (!bytes.is_empty()).then(|| Actor::signing(bytes.to_vec()))
+        }
+        ConversationSort::Synchronization => {
+            let id: [u8; 32] = bytes.try_into().ok()?;
+            Some(Actor::device(super::super::DeviceId::from_bytes(id)))
+        }
+        ConversationSort::Engine => None,
     }
 }
 
@@ -447,8 +459,12 @@ pub(super) fn store_durable_last_ack(
     if set_xor_for(&state.txs, conversation_id) != set_xor {
         return;
     }
-    let local_inviter = state.is_inviter(conversation_id);
-    let actor = handshake_actor_key(actor_id, local_inviter);
+    let Some(sort) = state.sort_of(conversation_id) else {
+        return;
+    };
+    let Some(actor) = actor_for(sort, actor_id) else {
+        return;
+    };
     let ids = conversation_tx_ids(state, conversation_id);
     if let Some(chains) = state.chains_mut(conversation_id) {
         chains.last_acks.insert(actor, ids);
@@ -482,7 +498,7 @@ pub(super) fn prune_cached_mks(state: &mut EngineState) {
 pub(super) fn annotate_cached_mk(
     state: &mut EngineState,
     cid: ConversationId,
-    actor: &ActorId,
+    actor: &Actor,
     mk: &[u8; 32],
     tx_id: Tag,
 ) {

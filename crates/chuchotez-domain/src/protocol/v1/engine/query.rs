@@ -331,8 +331,8 @@ pub enum Handshake {
 pub struct HistoryItem {
     /// Transaction id.
     pub tx_id: Tag,
-    /// Sender signing public key, or `DeviceId`.
-    pub sender: Vec<u8>,
+    /// Sender signing key, or device id.
+    pub sender: super::super::Actor,
     /// Presentation timestamp.
     pub hlc: Hlc,
     /// Chat payload.
@@ -365,9 +365,9 @@ pub struct DmEstablished {
     /// Peer profile picture.
     pub profile_pic: Option<super::super::ProfilePic>,
     /// Peer encryption public key.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::super::EncryptionPublicKey,
     /// Peer signing public key.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::super::SigningPublicKey,
     /// Persistent channels.
     pub persistents: Vec<super::super::DurableChannel>,
     /// Ephemeral channels.
@@ -480,7 +480,7 @@ pub struct GroupOfferView {
     /// Group photo.
     pub photo: Option<super::super::ProfilePic>,
     /// Owner signing public key.
-    pub owner_signing_pk: Vec<u8>,
+    pub owner_signing_pk: super::super::SigningPublicKey,
     /// DM the offer arrived on.
     pub from_conversation_id: ConversationId,
 }
@@ -489,9 +489,9 @@ pub struct GroupOfferView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupMemberView {
     /// Signing public key.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::super::SigningPublicKey,
     /// Encryption public key.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::super::EncryptionPublicKey,
     /// Display name carried with the member.
     pub name: DisplayName,
     /// Photo carried with the member.
@@ -506,7 +506,7 @@ pub struct GroupMemberView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupPendingView {
     /// Invitee signing public key.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::super::SigningPublicKey,
     /// DM the invite was posted on.
     pub from_conversation_id: ConversationId,
     /// Name on the invite.
@@ -523,7 +523,7 @@ pub struct GroupEstablishedView {
     /// Group photo.
     pub photo: Option<super::super::ProfilePic>,
     /// Owner signing public key.
-    pub owner_signing_pk: Vec<u8>,
+    pub owner_signing_pk: super::super::SigningPublicKey,
     /// Accepted members.
     pub members: Vec<GroupMemberView>,
     /// Outstanding invites.
@@ -546,9 +546,9 @@ pub struct SyncMemberView {
     /// Device id.
     pub device_id: super::super::DeviceId,
     /// Signing public key.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::super::SigningPublicKey,
     /// Encryption public key.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::super::EncryptionPublicKey,
     /// Device name.
     pub name: DisplayName,
     /// Latest presence time.

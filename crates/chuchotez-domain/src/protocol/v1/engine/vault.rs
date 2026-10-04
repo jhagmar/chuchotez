@@ -8,7 +8,7 @@ use super::super::payload::{
     VAULT_P, VAULT_T, VaultHeader, time_bin,
 };
 use super::super::{
-    AEAD_NONCE_LEN, ActorId, AeadKey, AeadNonce, ConversationId, EngineError, Json, PersistSeq,
+    AEAD_NONCE_LEN, Actor, AeadKey, AeadNonce, ConversationId, EngineError, Json, PersistSeq,
     Secret, Tag, UnixSeconds,
 };
 use super::query::*;
@@ -292,7 +292,7 @@ impl Engine {
             )
             .into_bytes(),
         );
-        let actor = ActorId::handshake();
+        let actor = Actor::handshake();
         self.absorb_peer_wraps(state, cid);
         if let Some(owed) = self.mint_if_owed(state, rng, cid, conv_secret)? {
             self.write_chain_packets(
@@ -321,7 +321,7 @@ impl Engine {
         persistents: &[super::super::DurableChannel],
         tag: Tag,
         tx_id: Tag,
-        actor: ActorId,
+        actor: Actor,
         count_since: bool,
     ) -> Result<(), EngineError> {
         let secret = state

@@ -8,7 +8,7 @@ use super::super::payload::{
     PACKET_MAX_UNCOMPRESSED, PacketPlain, TxInviteeIntro, TxInviterIntro, TxPayload, time_bin,
 };
 use super::super::{
-    ActorId, Address, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex,
+    Actor, Address, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex,
     IdentityId, KemSeed, Kind, OnWirePrefs, Policy, Secret, SignSeed, Tag, TagKey, TimeBin,
     UnixSeconds, UserId,
 };
@@ -96,8 +96,12 @@ impl Engine {
                 device_id: keys
                     .id
                     .unwrap_or(super::super::DeviceId::from_bytes([0; 32])),
-                signing_pk: keys.sign.public_bytes().to_vec(),
-                encryption_pk: keys.enc.public_bytes().to_vec(),
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(
+                    keys.sign.public_bytes().to_vec(),
+                ),
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(
+                    keys.enc.public_bytes().to_vec(),
+                ),
                 name: device_name.clone(),
                 last_active: None,
             });
@@ -120,7 +124,7 @@ impl Engine {
             if let Some(intro) = inviter_intro_for(state, parent)
                 && local_sign
                     .as_ref()
-                    .is_none_or(|signing| signing != &intro.signing_pk)
+                    .is_none_or(|signing| signing.as_slice() != intro.signing_pk.as_bytes())
             {
                 members.push(super::SyncMemberView {
                     device_id: peer_device,
@@ -527,9 +531,11 @@ impl Engine {
             profile_pic: pic,
             send_tag_key: TagKey::from(rng.random32()),
             eph_send_tag_key: TagKey::from(rng.random32()),
-            encryption_pk: enc,
-            signing_pk: sign,
-            intake_pk: intake.public_bytes().to_vec(),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(enc),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign),
+            intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(
+                intake.public_bytes().to_vec(),
+            ),
             seed_ct,
             prefs: self.on_wire_prefs(),
         });
@@ -592,8 +598,8 @@ impl Engine {
             profile_pic: pic,
             send_tag_key: TagKey::from(rng.random32()),
             eph_send_tag_key: TagKey::from(rng.random32()),
-            encryption_pk: enc,
-            signing_pk: sign,
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(enc),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign),
             seed_ct,
             prefs: self.on_wire_prefs(),
         });
@@ -798,7 +804,7 @@ impl Engine {
         if state.failed(hit.cid).is_some() {
             return Err(EngineError::UnknownTag);
         }
-        let actor = ActorId::handshake();
+        let actor = Actor::handshake();
         self.absorb_peer_wraps(state, hit.cid);
         let joined = join(self.suite.hmac(), hit.secret.as_bytes(), hit.sort, &[])?;
         let start = state

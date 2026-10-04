@@ -161,42 +161,89 @@ u64_type!(PacketSeq, "Packet sequence on a sending chain.");
 u64_type!(PacketEpoch, "Sending-chain epoch.");
 u64_type!(FragIndex, "Fragment index within a packet transaction.");
 
-/// Actor bytes on a conversation: empty on handshake, signing public key or
-/// device id on Established sorts.
+/// Who sent a packet. Handshake packets use [`Actor::Handshake`].
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ActorId(Vec<u8>);
+pub enum Actor {
+    /// Empty `actor_id` on a handshake sending chain.
+    Handshake,
+    /// Direct message or group sender.
+    Signing(crate::protocol::v1::sign::SigningPublicKey),
+    /// Synchronization sender.
+    Device(DeviceId),
+}
 
-impl ActorId {
-    /// Wrap actor bytes that already have this role.
-    #[must_use]
-    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into())
-    }
-
-    /// Handshake sending-chain actor (empty `actor_id`).
+impl Actor {
+    /// Handshake sending-chain actor.
     #[must_use]
     pub const fn handshake() -> Self {
-        Self(Vec::new())
+        Self::Handshake
     }
 
-    /// Raw bytes.
+    /// Signing-key actor from bytes already checked for a policy.
+    #[must_use]
+    pub fn signing(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Signing(crate::protocol::v1::sign::SigningPublicKey::from_bytes(
+            bytes,
+        ))
+    }
+
+    /// Device actor.
+    #[must_use]
+    pub const fn device(id: DeviceId) -> Self {
+        Self::Device(id)
+    }
+
+    /// Fold role name.
+    #[must_use]
+    pub fn role(&self) -> &'static str {
+        match self {
+            Self::Handshake => "handshake",
+            Self::Signing(_) => "signing",
+            Self::Device(_) => "device",
+        }
+    }
+
+    /// Restore an actor from a folded role and bytes.
+    pub fn from_stored(role: Option<&str>, bytes: Vec<u8>) -> Option<Self> {
+        match role {
+            Some("handshake") => Some(Self::Handshake),
+            Some("device") => {
+                let id: [u8; 32] = bytes.try_into().ok()?;
+                Some(Self::device(DeviceId::from_bytes(id)))
+            }
+            Some("signing") | None => {
+                if bytes.is_empty() {
+                    Some(Self::Handshake)
+                } else {
+                    Some(Self::signing(bytes))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Wire `actor_id`.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        match self {
+            Self::Handshake => &[],
+            Self::Signing(pk) => pk.as_bytes(),
+            Self::Device(id) => id.as_bytes(),
+        }
     }
 }
 
-impl core::fmt::Debug for ActorId {
+impl core::fmt::Debug for Actor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("ActorId(..)")
+        f.write_str("Actor(..)")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ActorId, ConversationId, DeviceId, FragIndex, IdentityId, PacketEpoch, PacketSeq,
-        PersistSeq, Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
+        Actor, ConversationId, DeviceId, FragIndex, IdentityId, PacketEpoch, PacketSeq, PersistSeq,
+        Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
     };
     use crate::protocol::Random32;
 
@@ -236,10 +283,24 @@ mod tests {
         assert_eq!(FragIndex::from_u64(7).as_u64(), 7);
         assert_eq!(FragIndex::from_u64(7).saturating_add(1).as_u64(), 8);
         assert_eq!(FragIndex::from_u64(7).saturating_sub(1).as_u64(), 6);
-        let actor = ActorId::from_bytes([1, 2]);
+        let actor = Actor::signing(vec![1, 2]);
         assert_eq!(actor.as_bytes(), &[1, 2]);
-        assert_eq!(format!("{actor:?}"), "ActorId(..)");
-        assert_eq!(ActorId::handshake().as_bytes().len(), 0);
-        assert!(ActorId::handshake() < actor);
+        assert_eq!(format!("{actor:?}"), "Actor(..)");
+        assert_eq!(Actor::handshake().as_bytes().len(), 0);
+        assert!(Actor::handshake() < actor);
+        let device = Actor::device(DeviceId::from_bytes([3; 32]));
+        assert_eq!(device.role(), "device");
+        assert_eq!(
+            Actor::from_stored(Some("device"), vec![3; 32])
+                .unwrap()
+                .as_bytes(),
+            &[3; 32]
+        );
+        assert!(Actor::from_stored(Some("device"), vec![1]).is_none());
+        assert!(Actor::from_stored(Some("nope"), vec![]).is_none());
+        assert!(matches!(
+            Actor::from_stored(Some("signing"), vec![]),
+            Some(Actor::Handshake)
+        ));
     }
 }

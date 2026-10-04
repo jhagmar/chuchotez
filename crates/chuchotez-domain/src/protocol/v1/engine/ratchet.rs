@@ -27,7 +27,7 @@ enum Effect {
     Wrap {
         shared: Secret,
         ct_hash: Tag,
-        encaps_pk: Vec<u8>,
+        encaps_pk: super::super::EncryptionPublicKey,
     },
     Ack,
 }
@@ -83,7 +83,7 @@ impl Engine {
                         shared: Secret::from_bytes(bytes),
                         ct_hash: digest_tag(self, &ct),
                         from_us: false,
-                        encaps_pk: Vec::new(),
+                        encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
                     });
                 }
                 break;
@@ -117,7 +117,11 @@ impl Engine {
                 if chains.ratchet.unused.len() >= UNUSED_CAP {
                     chains.ratchet.unused.remove(0);
                 }
-                chains.ratchet.unused.push(UnusedSk { tx_id, pk, sk });
+                chains.ratchet.unused.push(UnusedSk {
+                    tx_id,
+                    pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(pk),
+                    sk,
+                });
             }
             Effect::Wrap {
                 shared,
@@ -235,7 +239,7 @@ impl Engine {
     ) -> Option<Minted> {
         let chains = state.chains(cid)?;
         let minted = chains.ratchet.minted.clone();
-        let wrapped: Vec<Vec<u8>> = chains
+        let wrapped: Vec<super::super::EncryptionPublicKey> = chains
             .ratchet
             .known
             .iter()
@@ -256,7 +260,8 @@ impl Engine {
                 continue;
             }
             let seed = KemSeed::from_pair(rng.random32(), rng.random32());
-            let Ok((shared, kem_ct)) = self.suite.kem().wrap(policy, encaps_pk, &seed) else {
+            let Ok((shared, kem_ct)) = self.suite.kem().wrap(policy, encaps_pk.as_bytes(), &seed)
+            else {
                 continue;
             };
             if shared.len() != super::super::kem::KEM_SHARED_LEN {
@@ -285,7 +290,9 @@ impl Engine {
         };
         Ok(Some(Minted {
             payload: TxPayload::Advertise {
-                encaps_pk: keys.public_bytes().to_vec(),
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(
+                    keys.public_bytes().to_vec(),
+                ),
             },
             effect: Effect::Advertise {
                 pk: keys.public_bytes().to_vec(),

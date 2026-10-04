@@ -51,7 +51,9 @@ impl Engine {
             .map_err(|_| EngineError::MalformedPayload)?;
         let payload = TxPayload::Notice(TxNotice {
             policy: identity_policy,
-            intake_pk: intake.public_bytes().to_vec(),
+            intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(
+                intake.public_bytes().to_vec(),
+            ),
             persistents: persistents.clone(),
             ephemerals: self.defaults.ephemerals().to_vec(),
             expires,
@@ -250,7 +252,9 @@ impl Engine {
             .map_err(|_| EngineError::MalformedPayload)?;
         let payload = TxPayload::Notice(TxNotice {
             policy,
-            intake_pk: intake.public_bytes().to_vec(),
+            intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(
+                intake.public_bytes().to_vec(),
+            ),
             persistents: persistents.clone(),
             ephemerals: self.defaults.ephemerals().to_vec(),
             expires,
