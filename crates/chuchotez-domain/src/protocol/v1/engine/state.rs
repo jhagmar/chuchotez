@@ -176,14 +176,21 @@ pub(super) struct DeviceNode {
 impl IdentityNode {
     pub(super) fn handshake(party: DmParty) -> Self {
         Self {
-            kind: IdentityConversation::DmHandshake(party),
+            kind: IdentityConversation::DmHandshake {
+                party,
+                log: BTreeMap::new(),
+            },
             chains: ConversationChains::default(),
         }
     }
 
     pub(super) fn direct(secret: Secret, parent: ConversationId) -> Self {
         Self {
-            kind: IdentityConversation::DirectMessage { secret, parent },
+            kind: IdentityConversation::DirectMessage {
+                secret,
+                parent,
+                log: BTreeMap::new(),
+            },
             chains: ConversationChains::default(),
         }
     }
@@ -192,7 +199,10 @@ impl IdentityNode {
 impl DeviceNode {
     pub(super) fn handshake(party: SyncParty) -> Self {
         Self {
-            kind: DeviceConversation::SyncHandshake(party),
+            kind: DeviceConversation::SyncHandshake {
+                party,
+                log: BTreeMap::new(),
+            },
             chains: ConversationChains::default(),
         }
     }
@@ -207,6 +217,7 @@ impl DeviceNode {
                 secret,
                 parent,
                 peer,
+                log: BTreeMap::new(),
             },
             chains: ConversationChains::default(),
         }
@@ -254,11 +265,25 @@ pub(super) enum ConversationScope {
     Device,
 }
 
+/// Where one `tx_id` is stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TxPlace {
+    Engine,
+    Identity {
+        user: UserId,
+        identity: IdentityId,
+        cid: ConversationId,
+    },
+    Device {
+        cid: ConversationId,
+    },
+}
+
 /// Host-owned CRDT plus the local identity directory.
 ///
-/// `txs` is the protocol CRDT: one set of `DurableBody` keyed by `tx_id`. Merge,
-/// persist, `set_xor`, and Sync gossip walk that set. Conversation query filters
-/// it. Packet chains and last Persistent acks live on that row. Invite-tag
+/// Each conversation row stores the transactions legal for its phase. Vault
+/// transactions live on `engine_log`. `tx_id` is unique across those logs.
+/// Packet chains and last Persistent acks live on that row. Invite-tag
 /// `BinProgress` stays keyed by channel and tag-key so ingest can match
 /// InviteTag before a packet names an identity.
 ///
@@ -269,8 +294,10 @@ pub(super) enum ConversationScope {
 /// child (spawn secret and parent handshake id).
 #[derive(Clone, Debug, Default)]
 pub struct EngineState {
-    /// Durable bodies keyed by `tx_id`.
-    pub(super) txs: BTreeMap<Tag, DurableBody>,
+    /// Vault transactions keyed by `tx_id`.
+    pub(super) engine_log: super::row_log::TxLog<super::row_log::EngineTx>,
+    /// Where each `tx_id` is stored.
+    tx_place: BTreeMap<Tag, TxPlace>,
     /// Next persist-record sequence number.
     pub(super) next_seq: PersistSeq,
     /// Last `tick` Unix seconds.
@@ -303,7 +330,7 @@ impl EngineState {
     /// Number of durable txs.
     #[must_use]
     pub fn tx_count(&self) -> usize {
-        self.txs.len()
+        self.body_pairs().len()
     }
 
     pub(super) fn ensure_user(&mut self, user: UserId) -> &mut User {
@@ -420,7 +447,7 @@ impl EngineState {
     pub(super) fn party(&self, cid: ConversationId) -> Option<PartyRef<'_>> {
         for user in self.users.values() {
             for ident in user.identities.values() {
-                if let Some(IdentityConversation::DmHandshake(party)) =
+                if let Some(IdentityConversation::DmHandshake { party, .. }) =
                     ident.conversations.get(&cid).map(|n| &n.kind)
                 {
                     return Some(PartyRef::Dm(party));
@@ -428,7 +455,7 @@ impl EngineState {
             }
         }
         match self.device.conversations.get(&cid).map(|n| &n.kind) {
-            Some(DeviceConversation::SyncHandshake(party)) => Some(PartyRef::Sync(party)),
+            Some(DeviceConversation::SyncHandshake { party, .. }) => Some(PartyRef::Sync(party)),
             _ => None,
         }
     }
@@ -440,7 +467,7 @@ impl EngineState {
                     .conversations
                     .get_mut(&cid)
                     .and_then(|node| match &mut node.kind {
-                        IdentityConversation::DmHandshake(party) => Some(party),
+                        IdentityConversation::DmHandshake { party, .. } => Some(party),
                         IdentityConversation::DirectMessage { .. }
                         | IdentityConversation::Group(_) => None,
                     })
@@ -452,7 +479,7 @@ impl EngineState {
             .conversations
             .get_mut(&cid)
             .and_then(|node| match &mut node.kind {
-                DeviceConversation::SyncHandshake(party) => Some(PartyMut::Sync(party)),
+                DeviceConversation::SyncHandshake { party, .. } => Some(PartyMut::Sync(party)),
                 DeviceConversation::Synchronization { .. } => None,
             })
     }
@@ -518,7 +545,7 @@ impl EngineState {
     fn dm_party(&self, cid: ConversationId) -> Option<&DmParty> {
         for user in self.users.values() {
             for ident in user.identities.values() {
-                if let Some(IdentityConversation::DmHandshake(party)) =
+                if let Some(IdentityConversation::DmHandshake { party, .. }) =
                     ident.conversations.get(&cid).map(|n| &n.kind)
                 {
                     return Some(party);
@@ -530,7 +557,7 @@ impl EngineState {
 
     fn sync_party(&self, cid: ConversationId) -> Option<&SyncParty> {
         match self.device.conversations.get(&cid).map(|n| &n.kind) {
-            Some(DeviceConversation::SyncHandshake(party)) => Some(party),
+            Some(DeviceConversation::SyncHandshake { party, .. }) => Some(party),
             _ => None,
         }
     }
@@ -551,7 +578,7 @@ impl EngineState {
     pub(super) fn sort_of(&self, cid: ConversationId) -> Option<ConversationSort> {
         if let Some(node) = self.device.conversations.get(&cid) {
             return Some(match &node.kind {
-                DeviceConversation::SyncHandshake(_) => ConversationSort::HandshakeSync,
+                DeviceConversation::SyncHandshake { .. } => ConversationSort::HandshakeSync,
                 DeviceConversation::Synchronization { .. } => ConversationSort::Synchronization,
             });
         }
@@ -559,7 +586,7 @@ impl EngineState {
             for ident in user.identities.values() {
                 if let Some(node) = ident.conversations.get(&cid) {
                     return Some(match &node.kind {
-                        IdentityConversation::DmHandshake(_) => ConversationSort::HandshakeDm,
+                        IdentityConversation::DmHandshake { .. } => ConversationSort::HandshakeDm,
                         IdentityConversation::DirectMessage { .. } => {
                             ConversationSort::DirectMessage
                         }
@@ -583,7 +610,7 @@ impl EngineState {
         self.device
             .conversations
             .values()
-            .any(|n| matches!(n.kind, DeviceConversation::SyncHandshake(_)))
+            .any(|n| matches!(n.kind, DeviceConversation::SyncHandshake { .. }))
     }
 
     pub(super) fn is_inviter(&self, cid: ConversationId) -> bool {
@@ -704,7 +731,7 @@ impl EngineState {
         for user in self.users.values() {
             for ident in user.identities.values() {
                 for (cid, node) in &ident.conversations {
-                    if let IdentityConversation::DmHandshake(party) = &node.kind {
+                    if let IdentityConversation::DmHandshake { party, .. } = &node.kind {
                         rows.push(HandshakeEntry {
                             cid: *cid,
                             party: PartyRef::Dm(party),
@@ -715,7 +742,7 @@ impl EngineState {
             }
         }
         for (cid, node) in &self.device.conversations {
-            if let DeviceConversation::SyncHandshake(party) = &node.kind {
+            if let DeviceConversation::SyncHandshake { party, .. } = &node.kind {
                 rows.push(HandshakeEntry {
                     cid: *cid,
                     party: PartyRef::Sync(party),
@@ -865,8 +892,8 @@ impl EngineState {
     #[cfg(test)]
     pub(crate) fn cover_last_acks(&mut self) {
         let mut by_cid: BTreeMap<ConversationId, BTreeSet<Tag>> = BTreeMap::new();
-        for (id, body) in &self.txs {
-            by_cid.entry(body.conversation_id).or_default().insert(*id);
+        for (id, body) in self.body_pairs() {
+            by_cid.entry(body.conversation_id).or_default().insert(id);
         }
         let apply = |cid: ConversationId, chains: &mut ConversationChains| {
             if let Some(ids) = by_cid.get(&cid) {
@@ -893,6 +920,345 @@ pub(super) struct HandshakeEntry<'a> {
     pub(super) cid: ConversationId,
     pub(super) party: PartyRef<'a>,
     pub(super) sort: ConversationSort,
+}
+
+impl EngineState {
+    pub(super) fn body(&self, id: &Tag) -> Option<DurableBody> {
+        let place = *self.tx_place.get(id)?;
+        self.body_at(id, place)
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains_body(&self, id: &Tag) -> bool {
+        self.body(id).is_some()
+    }
+
+    pub(super) fn bodies(&self) -> Vec<DurableBody> {
+        self.body_pairs()
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect()
+    }
+
+    pub(super) fn body_pairs(&self) -> Vec<(Tag, DurableBody)> {
+        let mut out = BTreeMap::new();
+        for (id, row) in &self.engine_log {
+            out.insert(
+                *id,
+                super::row_log::durable(row.conversation_id, row.hlc, row.payload.to_payload()),
+            );
+        }
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                for node in ident.conversations.values() {
+                    push_identity(&mut out, &node.kind);
+                }
+            }
+        }
+        for node in self.device.conversations.values() {
+            push_device(&mut out, &node.kind);
+        }
+        out.into_iter().collect()
+    }
+
+    pub(super) fn insert_body(
+        &mut self,
+        id: Tag,
+        body: DurableBody,
+    ) -> Result<(), super::super::EngineError> {
+        if self.tx_place.contains_key(&id) {
+            self.remove_body(&id);
+        }
+        let conversation_id = body.conversation_id;
+        let hlc = body.hlc;
+        let payload = body.payload;
+        match self.place_of(conversation_id) {
+            Some(TxPlace::Identity {
+                user,
+                identity,
+                cid,
+            }) => {
+                let node = self
+                    .identity_mut(user, identity)
+                    .and_then(|ident| ident.conversations.get_mut(&cid))
+                    .ok_or(super::super::EngineError::WrongPhase)?;
+                match &mut node.kind {
+                    IdentityConversation::DmHandshake { log, .. } => {
+                        let tx = super::row_log::DmHandshakeTx::from_payload(payload)
+                            .ok_or(super::super::EngineError::WrongPhase)?;
+                        log.insert(id, row(conversation_id, hlc, tx));
+                    }
+                    IdentityConversation::DirectMessage { log, .. } => {
+                        let tx = super::row_log::DmTx::from_payload(payload)
+                            .ok_or(super::super::EngineError::WrongPhase)?;
+                        log.insert(id, row(conversation_id, hlc, tx));
+                    }
+                    IdentityConversation::Group(super::party::GroupPhase::Live(live)) => {
+                        let tx = super::row_log::LiveGroupTx::from_payload(payload)
+                            .ok_or(super::super::EngineError::WrongPhase)?;
+                        live.log.insert(id, row(conversation_id, hlc, tx));
+                    }
+                    IdentityConversation::Group(_) => {
+                        return Err(super::super::EngineError::WrongPhase);
+                    }
+                }
+                self.tx_place.insert(
+                    id,
+                    TxPlace::Identity {
+                        user,
+                        identity,
+                        cid,
+                    },
+                );
+            }
+            Some(TxPlace::Device { cid }) => {
+                let node = self
+                    .device
+                    .conversations
+                    .get_mut(&cid)
+                    .ok_or(super::super::EngineError::WrongPhase)?;
+                match &mut node.kind {
+                    DeviceConversation::SyncHandshake { log, .. } => {
+                        let tx = super::row_log::SyncHandshakeTx::from_payload(payload)
+                            .ok_or(super::super::EngineError::WrongPhase)?;
+                        log.insert(id, row(conversation_id, hlc, tx));
+                    }
+                    DeviceConversation::Synchronization { log, .. } => {
+                        let tx = super::row_log::SyncTx::from_payload(payload)
+                            .ok_or(super::super::EngineError::WrongPhase)?;
+                        log.insert(id, row(conversation_id, hlc, tx));
+                    }
+                }
+                self.tx_place.insert(id, TxPlace::Device { cid });
+            }
+            Some(TxPlace::Engine) | None => {
+                let tx = super::row_log::EngineTx::from_payload(payload)
+                    .ok_or(super::super::EngineError::WrongPhase)?;
+                self.engine_log.insert(id, row(conversation_id, hlc, tx));
+                self.tx_place.insert(id, TxPlace::Engine);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_body(&mut self, id: &Tag) {
+        let Some(place) = self.tx_place.remove(id) else {
+            return;
+        };
+        match place {
+            TxPlace::Engine => {
+                self.engine_log.remove(id);
+            }
+            TxPlace::Identity {
+                user,
+                identity,
+                cid,
+            } => {
+                let Some(node) = self
+                    .identity_mut(user, identity)
+                    .and_then(|ident| ident.conversations.get_mut(&cid))
+                else {
+                    return;
+                };
+                match &mut node.kind {
+                    IdentityConversation::DmHandshake { log, .. } => {
+                        log.remove(id);
+                    }
+                    IdentityConversation::DirectMessage { log, .. } => {
+                        log.remove(id);
+                    }
+                    IdentityConversation::Group(super::party::GroupPhase::Live(live)) => {
+                        live.log.remove(id);
+                    }
+                    IdentityConversation::Group(_) => {}
+                }
+            }
+            TxPlace::Device { cid } => {
+                let Some(node) = self.device.conversations.get_mut(&cid) else {
+                    return;
+                };
+                match &mut node.kind {
+                    DeviceConversation::SyncHandshake { log, .. } => {
+                        log.remove(id);
+                    }
+                    DeviceConversation::Synchronization { log, .. } => {
+                        log.remove(id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn retain_bodies(&mut self, mut keep: impl FnMut(&Tag, &DurableBody) -> bool) {
+        let kept: Vec<_> = self
+            .body_pairs()
+            .into_iter()
+            .filter(|(id, body)| keep(id, body))
+            .collect();
+        self.clear_logs();
+        for (id, body) in kept {
+            self.insert_body(id, body).expect("kept tx");
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn edit_bodies(&mut self, edit: impl FnOnce(&mut BTreeMap<Tag, DurableBody>)) {
+        let mut map: BTreeMap<_, _> = self.body_pairs().into_iter().collect();
+        self.clear_logs();
+        edit(&mut map);
+        for (id, body) in map {
+            self.insert_body(id, body).expect("edited tx");
+        }
+    }
+
+    fn place_of(&self, cid: ConversationId) -> Option<TxPlace> {
+        for (user, row) in &self.users {
+            for (identity, ident) in &row.identities {
+                if ident.conversations.contains_key(&cid) {
+                    return Some(TxPlace::Identity {
+                        user: *user,
+                        identity: *identity,
+                        cid,
+                    });
+                }
+            }
+        }
+        self.device
+            .conversations
+            .contains_key(&cid)
+            .then_some(TxPlace::Device { cid })
+    }
+
+    fn body_at(&self, id: &Tag, place: TxPlace) -> Option<DurableBody> {
+        match place {
+            TxPlace::Engine => {
+                let row = self.engine_log.get(id)?;
+                Some(super::row_log::durable(
+                    row.conversation_id,
+                    row.hlc,
+                    row.payload.to_payload(),
+                ))
+            }
+            TxPlace::Identity {
+                user,
+                identity,
+                cid,
+            } => {
+                let node = self.identity(user, identity)?.conversations.get(&cid)?;
+                identity_body(&node.kind, id)
+            }
+            TxPlace::Device { cid } => {
+                let node = self.device.conversations.get(&cid)?;
+                device_body(&node.kind, id)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn clear_logs(&mut self) {
+        self.engine_log.clear();
+        self.tx_place.clear();
+        for user in self.users.values_mut() {
+            for ident in user.identities.values_mut() {
+                for node in ident.conversations.values_mut() {
+                    clear_identity(&mut node.kind);
+                }
+            }
+        }
+        for node in self.device.conversations.values_mut() {
+            clear_device(&mut node.kind);
+        }
+    }
+}
+
+fn row<T>(
+    conversation_id: ConversationId,
+    hlc: super::super::Hlc,
+    payload: T,
+) -> super::row_log::TxRow<T> {
+    super::row_log::TxRow {
+        conversation_id,
+        hlc,
+        payload,
+    }
+}
+
+fn push_identity(out: &mut BTreeMap<Tag, DurableBody>, kind: &IdentityConversation) {
+    match kind {
+        IdentityConversation::DmHandshake { log, .. } => push_log(out, log, |tx| tx.to_payload()),
+        IdentityConversation::DirectMessage { log, .. } => push_log(out, log, |tx| tx.to_payload()),
+        IdentityConversation::Group(super::party::GroupPhase::Live(live)) => {
+            push_log(out, &live.log, |tx| tx.to_payload());
+        }
+        IdentityConversation::Group(_) => {}
+    }
+}
+
+fn push_device(out: &mut BTreeMap<Tag, DurableBody>, kind: &DeviceConversation) {
+    match kind {
+        DeviceConversation::SyncHandshake { log, .. } => push_log(out, log, |tx| tx.to_payload()),
+        DeviceConversation::Synchronization { log, .. } => push_log(out, log, |tx| tx.to_payload()),
+    }
+}
+
+fn push_log<T>(
+    out: &mut BTreeMap<Tag, DurableBody>,
+    log: &super::row_log::TxLog<T>,
+    to_payload: impl Fn(&T) -> super::super::payload::TxPayload,
+) {
+    for (id, row) in log {
+        out.insert(
+            *id,
+            super::row_log::durable(row.conversation_id, row.hlc, to_payload(&row.payload)),
+        );
+    }
+}
+
+fn identity_body(kind: &IdentityConversation, id: &Tag) -> Option<DurableBody> {
+    match kind {
+        IdentityConversation::DmHandshake { log, .. } => log.get(id).map(|row| {
+            super::row_log::durable(row.conversation_id, row.hlc, row.payload.to_payload())
+        }),
+        IdentityConversation::DirectMessage { log, .. } => log.get(id).map(|row| {
+            super::row_log::durable(row.conversation_id, row.hlc, row.payload.to_payload())
+        }),
+        IdentityConversation::Group(super::party::GroupPhase::Live(live)) => {
+            live.log.get(id).map(|row| {
+                super::row_log::durable(row.conversation_id, row.hlc, row.payload.to_payload())
+            })
+        }
+        IdentityConversation::Group(_) => None,
+    }
+}
+
+fn device_body(kind: &DeviceConversation, id: &Tag) -> Option<DurableBody> {
+    match kind {
+        DeviceConversation::SyncHandshake { log, .. } => log.get(id).map(|row| {
+            super::row_log::durable(row.conversation_id, row.hlc, row.payload.to_payload())
+        }),
+        DeviceConversation::Synchronization { log, .. } => log.get(id).map(|row| {
+            super::row_log::durable(row.conversation_id, row.hlc, row.payload.to_payload())
+        }),
+    }
+}
+
+#[cfg(test)]
+fn clear_identity(kind: &mut IdentityConversation) {
+    match kind {
+        IdentityConversation::DmHandshake { log, .. } => log.clear(),
+        IdentityConversation::DirectMessage { log, .. } => log.clear(),
+        IdentityConversation::Group(super::party::GroupPhase::Live(live)) => live.log.clear(),
+        IdentityConversation::Group(_) => {}
+    }
+}
+
+#[cfg(test)]
+fn clear_device(kind: &mut DeviceConversation) {
+    match kind {
+        DeviceConversation::SyncHandshake { log, .. } => log.clear(),
+        DeviceConversation::Synchronization { log, .. } => log.clear(),
+    }
 }
 
 fn rekey_map<V>(map: &mut BTreeMap<ConversationId, V>, from: ConversationId, to: ConversationId) {

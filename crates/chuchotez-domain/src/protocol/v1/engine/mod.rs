@@ -14,6 +14,7 @@ mod persist;
 mod poll;
 mod query;
 mod ratchet;
+mod row_log;
 mod session;
 mod state;
 mod vault;

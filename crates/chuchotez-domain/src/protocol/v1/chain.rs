@@ -423,7 +423,7 @@ pub(crate) fn packed_tx(suite: &Suite, body: &DurableBody) -> Vec<u8> {
 }
 
 pub(crate) fn set_xor_for(
-    txs: &std::collections::BTreeMap<Tag, DurableBody>,
+    txs: impl IntoIterator<Item = (Tag, DurableBody)>,
     conversation_id: ConversationId,
 ) -> Tag {
     let mut acc = [0u8; 32];
@@ -712,7 +712,7 @@ mod tests {
                 payload: TxPayload::Confirm,
             },
         );
-        assert_eq!(set_xor_for(&txs, cid), tx_id);
+        assert_eq!(set_xor_for(txs, cid), tx_id);
         let chain = join(s.hmac(), &[1u8; 32], ConversationSort::HandshakeDm, &[]).expect("j");
         let json = chain_to_json(s.b64u(), cid, &Actor::handshake(), &chain);
         let (cid2, actor, c2) = chain_from_json(s.b64u(), &json).expect("parse");

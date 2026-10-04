@@ -46,15 +46,15 @@ impl Engine {
             .map(|c| c.ratchet.known.iter().map(|k| k.wrap_tx).collect())
             .unwrap_or_default();
         let wraps: Vec<(Tag, Vec<u8>)> = state
-            .txs
-            .iter()
+            .body_pairs()
+            .into_iter()
             .filter_map(|(id, body)| match &body.payload {
                 TxPayload::Wrap { kem_ct }
                     if body.conversation_id == cid
-                        && !minted.contains(id)
-                        && !known.contains(id) =>
+                        && !minted.contains(&id)
+                        && !known.contains(&id) =>
                 {
-                    Some((*id, kem_ct.clone()))
+                    Some((id, kem_ct.clone()))
                 }
                 _ => None,
             })
@@ -98,6 +98,9 @@ impl Engine {
         cid: ConversationId,
         secret: &Secret,
     ) -> Result<Option<Tag>, EngineError> {
+        if state.is_sync(cid) || state.established_secret(cid).is_none() {
+            return Ok(None);
+        }
         let since = state.chains(cid).map(|c| c.ratchet.since).unwrap_or(0);
         if since < OWED_PACKETS {
             return Ok(None);
@@ -211,14 +214,14 @@ impl Engine {
         policy: Policy,
     ) -> Option<TxPayload> {
         let minted = &state.chains(cid)?.ratchet.minted;
-        for (id, body) in &state.txs {
+        for (id, body) in state.body_pairs() {
             let TxPayload::Advertise { encaps_pk } = &body.payload else {
                 continue;
             };
-            if body.conversation_id != cid || minted.contains(id) {
+            if body.conversation_id != cid || minted.contains(&id) {
                 continue;
             }
-            if encaps_pk.len() != kem_pk_len(policy) || !tx_watermarked(state, *id) {
+            if encaps_pk.len() != kem_pk_len(policy) || !tx_watermarked(state, id) {
                 continue;
             }
             let tag = digest_tag(self, encaps_pk);
@@ -246,14 +249,14 @@ impl Engine {
             .filter(|k| k.from_us)
             .map(|k| k.encaps_pk.clone())
             .collect();
-        for (id, body) in &state.txs {
+        for (id, body) in state.body_pairs() {
             let TxPayload::Advertise { encaps_pk } = &body.payload else {
                 continue;
             };
-            if body.conversation_id != cid || minted.contains(id) {
+            if body.conversation_id != cid || minted.contains(&id) {
                 continue;
             }
-            if encaps_pk.len() != kem_pk_len(policy) || !tx_watermarked(state, *id) {
+            if encaps_pk.len() != kem_pk_len(policy) || !tx_watermarked(state, id) {
                 continue;
             }
             if wrapped.iter().any(|pk| pk == encaps_pk) {
@@ -338,7 +341,7 @@ fn agreed_shareds(state: &EngineState, cid: ConversationId, from_us: bool) -> Ve
 }
 
 fn ack_exists(state: &EngineState, cid: ConversationId, tag: Tag) -> bool {
-    state.txs.values().any(|body| {
+    state.bodies().iter().any(|body| {
         body.conversation_id == cid
             && matches!(
                 &body.payload,
@@ -348,13 +351,13 @@ fn ack_exists(state: &EngineState, cid: ConversationId, tag: Tag) -> bool {
 }
 
 fn ack_watermarked(state: &EngineState, cid: ConversationId, tag: Tag) -> bool {
-    state.txs.iter().any(|(id, body)| {
+    state.body_pairs().into_iter().any(|(id, body)| {
         body.conversation_id == cid
             && matches!(
                 &body.payload,
                 TxPayload::Ack { ratchet_ack } if *ratchet_ack == tag
             )
-            && tx_watermarked(state, *id)
+            && tx_watermarked(state, id)
     })
 }
 
@@ -372,7 +375,7 @@ pub(super) fn conversation_policy(state: &EngineState, cid: ConversationId) -> O
         return Some(notice.policy);
     }
     let (user, identity) = state.owner(cid)?;
-    state.txs.values().find_map(|body| match &body.payload {
+    state.bodies().iter().find_map(|body| match &body.payload {
         TxPayload::EngineCreateIdentity {
             user_id,
             identity_id,

@@ -28,9 +28,17 @@ pub(super) fn notice_for(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<&TxNotice> {
-    state.txs.values().find_map(|t| match &t.payload {
-        TxPayload::Notice(n) if t.conversation_id == conversation_id => Some(n),
-        _ => None,
+    if let Some(log) = dm_handshake_log(state, conversation_id) {
+        return log.values().find_map(|row| match &row.payload {
+            super::row_log::DmHandshakeTx::Notice(notice) => Some(notice),
+            _ => None,
+        });
+    }
+    sync_handshake_log(state, conversation_id).and_then(|log| {
+        log.values().find_map(|row| match &row.payload {
+            super::row_log::SyncHandshakeTx::Notice(notice) => Some(notice),
+            _ => None,
+        })
     })
 }
 
@@ -38,10 +46,17 @@ pub(super) fn invitee_intro_for(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<&TxInviteeIntro> {
-    state.txs.values().find_map(|t| match &t.payload {
-        TxPayload::InviteeIntro(i) if t.conversation_id == conversation_id => Some(i),
-        TxPayload::SyncInviteeIntro(s) if t.conversation_id == conversation_id => Some(&s.intro),
-        _ => None,
+    if let Some(log) = dm_handshake_log(state, conversation_id) {
+        return log.values().find_map(|row| match &row.payload {
+            super::row_log::DmHandshakeTx::InviteeIntro(intro) => Some(intro),
+            _ => None,
+        });
+    }
+    sync_handshake_log(state, conversation_id).and_then(|log| {
+        log.values().find_map(|row| match &row.payload {
+            super::row_log::SyncHandshakeTx::InviteeIntro(intro) => Some(&intro.intro),
+            _ => None,
+        })
     })
 }
 
@@ -49,14 +64,17 @@ pub(super) fn invitee_intro_tx_id(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<Tag> {
-    state.txs.iter().find_map(|(id, t)| match &t.payload {
-        TxPayload::InviteeIntro(_) | TxPayload::SyncInviteeIntro(_)
-            if t.conversation_id == conversation_id =>
-        {
-            Some(*id)
-        }
-        _ => None,
-    })
+    state
+        .body_pairs()
+        .into_iter()
+        .find_map(|(id, t)| match &t.payload {
+            TxPayload::InviteeIntro(_) | TxPayload::SyncInviteeIntro(_)
+                if t.conversation_id == conversation_id =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })
 }
 
 pub(super) fn sync_peer_device(
@@ -64,7 +82,7 @@ pub(super) fn sync_peer_device(
     handshake: ConversationId,
 ) -> Option<super::super::DeviceId> {
     let ours = state.device.keys.as_ref().and_then(|keys| keys.id);
-    state.txs.values().find_map(|tx| {
+    state.bodies().iter().find_map(|tx| {
         if tx.conversation_id != handshake {
             return None;
         }
@@ -84,11 +102,44 @@ pub(super) fn inviter_intro_for(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<&TxInviterIntro> {
-    state.txs.values().find_map(|t| match &t.payload {
-        TxPayload::InviterIntro(i) if t.conversation_id == conversation_id => Some(i),
-        TxPayload::SyncInviterIntro(s) if t.conversation_id == conversation_id => Some(&s.intro),
-        _ => None,
+    if let Some(log) = dm_handshake_log(state, conversation_id) {
+        return log.values().find_map(|row| match &row.payload {
+            super::row_log::DmHandshakeTx::InviterIntro(intro) => Some(intro),
+            _ => None,
+        });
+    }
+    sync_handshake_log(state, conversation_id).and_then(|log| {
+        log.values().find_map(|row| match &row.payload {
+            super::row_log::SyncHandshakeTx::InviterIntro(intro) => Some(&intro.intro),
+            _ => None,
+        })
     })
+}
+
+fn dm_handshake_log(
+    state: &EngineState,
+    cid: ConversationId,
+) -> Option<&super::row_log::TxLog<super::row_log::DmHandshakeTx>> {
+    for user in state.users.values() {
+        for ident in user.identities.values() {
+            if let Some(super::party::IdentityConversation::DmHandshake { log, .. }) =
+                ident.conversations.get(&cid).map(|node| &node.kind)
+            {
+                return Some(log);
+            }
+        }
+    }
+    None
+}
+
+fn sync_handshake_log(
+    state: &EngineState,
+    cid: ConversationId,
+) -> Option<&super::row_log::TxLog<super::row_log::SyncHandshakeTx>> {
+    match state.device.conversations.get(&cid).map(|node| &node.kind) {
+        Some(super::party::DeviceConversation::SyncHandshake { log, .. }) => Some(log),
+        _ => None,
+    }
 }
 
 pub(super) fn intro_keys_ok(
@@ -429,10 +480,10 @@ pub(super) fn conversation_tx_ids(
     conversation_id: ConversationId,
 ) -> BTreeSet<Tag> {
     state
-        .txs
-        .iter()
+        .body_pairs()
+        .into_iter()
         .filter(|(_, body)| body.conversation_id == conversation_id)
-        .map(|(id, _)| *id)
+        .map(|(id, _)| id)
         .collect()
 }
 
@@ -451,8 +502,7 @@ pub(super) fn watermark_of(state: &EngineState, conversation_id: ConversationId)
 
 pub(super) fn tx_watermarked(state: &EngineState, tx_id: Tag) -> bool {
     state
-        .txs
-        .get(&tx_id)
+        .body(&tx_id)
         .is_some_and(|body| watermark_of(state, body.conversation_id).contains(&tx_id))
 }
 
@@ -467,7 +517,7 @@ pub(super) fn payload_expire_at(payload: &TxPayload) -> Option<UnixSeconds> {
 pub(super) fn persist_outside_watermark(state: &EngineState) -> bool {
     let now = state.ticked.unwrap_or_default();
     state.persist_log.values().any(|tx_id| {
-        let Some(body) = state.txs.get(tx_id) else {
+        let Some(body) = state.body(tx_id) else {
             return false;
         };
         if payload_expire_at(&body.payload).is_some_and(|expires| expires <= now) {
@@ -483,7 +533,7 @@ pub(super) fn store_durable_last_ack(
     actor_id: &[u8],
     set_xor: Tag,
 ) {
-    if set_xor_for(&state.txs, conversation_id) != set_xor {
+    if set_xor_for(state.body_pairs(), conversation_id) != set_xor {
         return;
     }
     let Some(sort) = state.sort_of(conversation_id) else {

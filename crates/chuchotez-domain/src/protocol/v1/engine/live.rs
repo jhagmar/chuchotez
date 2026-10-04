@@ -200,9 +200,13 @@ impl Engine {
         if wait {
             self.probe_presence(state, rng, cid, &route, &chain, now)?;
         }
-        let body = state.txs.get(&tx_id).expect("tx").clone();
+        if let Some(owed) = self.mint_if_owed(state, rng, cid, secret)? {
+            let owed_payload = state.body(&owed).expect("owed").payload.clone();
+            self.post_live(state, rng, cid, secret, owed, &owed_payload)?;
+        }
+        let body = state.body(&tx_id).expect("tx").clone();
         let mut packed = super::super::chain::packed_tx(&self.suite, &body);
-        let set_xor = set_xor_for(&state.txs, cid);
+        let set_xor = set_xor_for(state.body_pairs(), cid);
         let eph_key = eph_mk(self.suite.hmac(), &chain);
         let mut frag_i = 0u64;
         let mut durable = Vec::new();
@@ -713,8 +717,7 @@ impl Engine {
             #[rustfmt::skip]
         let durable = durable_body_from_json(self.suite.b64u(), &json).map_err(|_| EngineError::MalformedPayload)?;
             if state
-                .txs
-                .get(&part.tx_id)
+                .body(&part.tx_id)
                 .is_some_and(|existing| existing.payload == durable.payload)
             {
                 return Ok(Vec::new());
@@ -726,7 +729,7 @@ impl Engine {
         let rec = self.persist_record(seq, &durable)?;
             state.persist_log.insert(seq, part.tx_id);
             state.next_seq = state.next_seq.saturating_add(1);
-            state.txs.insert(part.tx_id, durable.clone());
+            state.insert_body(part.tx_id, durable.clone())?;
             self.on_group_payload(state, rng, cid, &durable.payload)?;
             let sender = state
                 .sort_of(cid)

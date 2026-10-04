@@ -69,7 +69,6 @@ impl Engine {
         };
         let persist = self.persist_record(state.next_seq, &body)?;
         state.next_seq = state.next_seq.saturating_add(1);
-        state.txs.insert(tx_id, body);
         state.put_dm_inviter(
             user_id,
             identity_id,
@@ -80,6 +79,7 @@ impl Engine {
                 list_from: time_bin(now),
             },
         );
+        state.insert_body(tx_id, body)?;
         #[rustfmt::skip]
         self.post_handshake_packets(&mut state, rng, conversation_id, &secret, tx_id)?;
         Ok((
@@ -99,8 +99,8 @@ impl Engine {
         identity_id: &IdentityId,
     ) -> Result<Policy, EngineError> {
         state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .find_map(|tx| match &tx.payload {
                 TxPayload::EngineCreateIdentity {
                     user_id: u,
@@ -167,7 +167,7 @@ impl Engine {
     /// List users.
     pub fn list_users(&self, state: &EngineState) -> Result<Vec<UserId>, EngineError> {
         let mut out = Vec::new();
-        for tx in state.txs.values() {
+        for tx in state.bodies().iter() {
             if let TxPayload::EngineCreateUser { user_id } = &tx.payload {
                 out.push(*user_id);
             }
@@ -182,7 +182,7 @@ impl Engine {
         user_id: UserId,
     ) -> Result<Vec<IdentityId>, EngineError> {
         let mut out = Vec::new();
-        for tx in state.txs.values() {
+        for tx in state.bodies().iter() {
             if let TxPayload::EngineCreateIdentity {
                 user_id: u,
                 identity_id,
@@ -270,7 +270,6 @@ impl Engine {
         };
         let persist = self.persist_record(state.next_seq, &body)?;
         state.next_seq = state.next_seq.saturating_add(1);
-        state.txs.insert(tx_id, body);
         let ticket = Ticket {
             secret,
             persistents: persistents.clone(),
@@ -284,6 +283,7 @@ impl Engine {
                 list_from: time_bin(now),
             },
         );
+        state.insert_body(tx_id, body)?;
         state.device.name = Some(name);
         #[rustfmt::skip]
         self.post_handshake_packets(&mut state, rng, conversation_id, &secret, tx_id)?;
@@ -305,8 +305,8 @@ impl Engine {
         ticket_host_string: &str,
     ) -> Result<(MutateOk, ConversationId), EngineError> {
         if state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .any(|t| matches!(t.payload, TxPayload::EngineCreateUser { .. }))
         {
             return Err(EngineError::EmptyEngineRequired);
@@ -361,7 +361,9 @@ fn sync_peer_count(state: &EngineState) -> usize {
         .iter()
         .filter(|(cid, node)| match &node.kind {
             super::party::DeviceConversation::Synchronization { .. } => true,
-            super::party::DeviceConversation::SyncHandshake(_) => state.child_of(**cid).is_none(),
+            super::party::DeviceConversation::SyncHandshake { .. } => {
+                state.child_of(**cid).is_none()
+            }
         })
         .count()
 }

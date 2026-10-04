@@ -30,7 +30,7 @@ impl Engine {
         let already = state.chains(cid).is_some_and(|c| c.live_until.is_some());
         if let PacketPlain::XorAck(ack) = packet {
             self.settle_live(state, cid, ack.set_xor, now);
-            if set_xor_for(&state.txs, cid) == ack.set_xor {
+            if set_xor_for(state.body_pairs(), cid) == ack.set_xor {
                 self.note_live(state, cid, now);
             }
             self.note_set_xor(state, rng, cid, ack.set_xor)?;
@@ -79,7 +79,7 @@ impl Engine {
         cid: ConversationId,
         remote: Tag,
     ) -> Result<(), EngineError> {
-        let local = set_xor_for(&state.txs, cid);
+        let local = set_xor_for(state.body_pairs(), cid);
         if local == remote {
             if let Some(chains) = state.chains_mut(cid) {
                 chains.heal = Heal::default();
@@ -251,8 +251,7 @@ impl Engine {
             .copied()
             .filter(|id| {
                 state
-                    .txs
-                    .get(id)
+                    .body(id)
                     .is_some_and(|body| body.conversation_id == cid)
             })
             .collect();
@@ -275,8 +274,7 @@ impl Engine {
             .copied()
             .filter(|id| {
                 !state
-                    .txs
-                    .get(id)
+                    .body(id)
                     .is_some_and(|body| body.conversation_id == cid)
             })
             .take(ID_CAP)
@@ -508,10 +506,10 @@ fn channels(
 
 fn conv_ids(state: &EngineState, cid: ConversationId) -> Vec<Tag> {
     let mut ids: Vec<Tag> = state
-        .txs
-        .iter()
+        .body_pairs()
+        .into_iter()
         .filter(|(_, body)| body.conversation_id == cid)
-        .map(|(id, _)| *id)
+        .map(|(id, _)| id)
         .collect();
     ids.sort();
     ids
