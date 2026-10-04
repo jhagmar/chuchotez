@@ -3,8 +3,8 @@
 use super::super::hmac::{HmacSha256Key, expand};
 use super::super::payload::{PACKET_NONCE_LEN, TxPayload};
 use super::super::{
-    AeadKey, AeadNonce, Defaults, DeviceId, DisplayName, EngineError, IdentityId, KemSeed,
-    OnWirePrefs, Policy, Secret, SignSeed, UserId,
+    AeadKey, AeadNonce, ConversationId, Defaults, DeviceId, DisplayName, EngineError, IdentityId,
+    KemSeed, OnWirePrefs, Policy, Secret, SignSeed, UserId,
 };
 use super::helpers::{invitee_intro_for, notice_for};
 use super::party::DeviceConversation;
@@ -329,8 +329,30 @@ impl Engine {
             return Ok(());
         }
         state.device.kicked.push(device_id);
+        if state.device.keys.as_ref().and_then(|keys| keys.id) == Some(device_id) {
+            state
+                .device
+                .conversations
+                .retain(|_, node| !matches!(node.kind, DeviceConversation::Synchronization { .. }));
+            return Ok(());
+        }
         let cids: Vec<_> = state.device.conversations.keys().copied().collect();
+        let mut drop_ids = Vec::new();
+        for cid in &cids {
+            let node = state.device.conversations.get(cid).expect("row");
+            if let DeviceConversation::Synchronization { peer, .. } = &node.kind
+                && *peer == Some(device_id)
+            {
+                drop_ids.push(*cid);
+            }
+        }
+        for cid in &drop_ids {
+            state.device.conversations.remove(cid);
+        }
         for cid in cids {
+            if drop_ids.contains(&cid) {
+                continue;
+            }
             let node = state.device.conversations.get_mut(&cid).expect("row");
             let DeviceConversation::Synchronization { secret, .. } = &mut node.kind else {
                 continue;
@@ -350,6 +372,30 @@ impl Engine {
             node.chains.live_pending.clear();
         }
         Ok(())
+    }
+
+    pub(super) fn note_sync_peer(
+        &self,
+        state: &mut EngineState,
+        cid: ConversationId,
+        actor: &[u8],
+    ) {
+        let Ok(bytes) = <[u8; 32]>::try_from(actor) else {
+            return;
+        };
+        let id = DeviceId::from_bytes(bytes);
+        if state.device.keys.as_ref().and_then(|keys| keys.id) == Some(id) {
+            return;
+        }
+        let Some(node) = state.device.conversations.get_mut(&cid) else {
+            return;
+        };
+        let DeviceConversation::Synchronization { peer, .. } = &mut node.kind else {
+            return;
+        };
+        if peer.is_none() {
+            *peer = Some(id);
+        }
     }
 
     pub(super) fn wrap_sync_dek(

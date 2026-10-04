@@ -2064,7 +2064,9 @@ Owner is in the roster immediately (`GroupEstablished`). Parallel
 `TxGroupInvite` on each named DM. Member cap 32 including owner. Device cap 5
 including the inviter. `addGroupMember` of a pending invitee is `WrongPhase`.
 `kickGroupMember` on a `GroupOffer` contact drops the offer. `kickDevice` of
-this device is `WrongPhase`; `leaveSync` unlinks this device. Last remaining
+this device is `WrongPhase`. Removing another device drops that device's link
+and makes new sending keys for the conversations that remain. `leaveSync`
+unlinks this device. Last remaining
 device after leave/kick is legal. `receiveSyncTicket` is `EmptyEngineRequired`
 unless EngineState has no users. Until an engine `TxEngineCreateUser` tx is merged,
 `getConversation` and `listConversations` for that Sync handshake use `userId`

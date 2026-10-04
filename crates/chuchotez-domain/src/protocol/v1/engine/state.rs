@@ -200,7 +200,11 @@ impl DeviceNode {
 
     pub(super) fn sync(secret: Secret, parent: ConversationId) -> Self {
         Self {
-            kind: DeviceConversation::Synchronization { secret, parent },
+            kind: DeviceConversation::Synchronization {
+                secret,
+                parent,
+                peer: None,
+            },
             chains: ConversationChains::default(),
         }
     }

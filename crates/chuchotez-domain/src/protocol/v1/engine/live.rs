@@ -726,10 +726,6 @@ impl Engine {
             state.next_seq = state.next_seq.saturating_add(1);
             state.txs.insert(part.tx_id, durable.clone());
             self.on_group_payload(state, rng, cid, &durable.payload)?;
-            if let TxPayload::EngineKickDevice { device_id } = &durable.payload {
-                #[rustfmt::skip]
-                self.note_device_kick(state, *device_id)?;
-            }
             state
                 .chains_mut(cid)
                 .expect("row")
@@ -738,6 +734,11 @@ impl Engine {
             if persistent && let PacketPlain::TxFragLast(last) = packet {
                 store_durable_last_ack(state, cid, &last.actor_id, last.set_xor);
                 self.note_set_xor(state, rng, cid, last.set_xor)?;
+            }
+            self.note_sync_peer(state, cid, &packet_actor(packet));
+            if let TxPayload::EngineKickDevice { device_id } = &durable.payload {
+                #[rustfmt::skip]
+                self.note_device_kick(state, *device_id)?;
             }
             out.push(rec);
         }
