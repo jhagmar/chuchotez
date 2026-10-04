@@ -59,7 +59,7 @@
 
 pub use chuchotez_adapters::{
     AesGcm, Base64Ct, Deflate, LibcruxHmac, LibcruxKem, LibcruxSha256, LibcruxSign, Rfc8785,
-    RustcryptoArgon2id,
+    RustcryptoArgon2id, nfc,
 };
 pub use chuchotez_domain::{Policy, RANDOM32_LEN, Random32, Random32Bytes, Rng, VERSION, protocol};
 

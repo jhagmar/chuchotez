@@ -26,7 +26,8 @@ pub use query::{
     ConversationRef, DirectMessageQuery, DmEstablished, DurableLocator, DurableWrite,
     EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupEstablishedView, GroupOfferView,
     GroupQuery, Handshake, HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk,
-    PingTarget, Poll, PresenceView, SynchronizationQuery, TypingView, WrapDekOk,
+    PingPost, PingTarget, Poll, PresenceView, QueryLocalPrefs, QueryPeerPrefs, SyncEstablishedView,
+    SyncMemberView, SynchronizationQuery, TypingView, WrapDekOk,
 };
 pub use state::EngineState;
 
@@ -79,5 +80,11 @@ impl Engine {
     /// Brand a display name.
     pub fn try_new_display_name(name: &str) -> Result<DisplayName, super::DisplayNameError> {
         DisplayName::try_from(name)
+    }
+
+    /// RFC 8291 empty-body POSTs for `https:` ping rows.
+    #[must_use]
+    pub fn ping_posts(pings: &[PingTarget]) -> Vec<PingPost> {
+        query::ping_posts(pings)
     }
 }

@@ -61,7 +61,7 @@ impl Engine {
         if state.established_secret(conversation_id).is_some() {
             if state.is_sync(conversation_id) {
                 return Some(Conversation::Synchronization(
-                    SynchronizationQuery::SyncEstablished,
+                    SynchronizationQuery::SyncEstablished(self.sync_view(state, conversation_id)),
                 ));
             }
             return Some(Conversation::DirectMessage(
@@ -76,6 +76,69 @@ impl Engine {
         } else {
             Conversation::HandshakeDm(row)
         })
+    }
+
+    pub(super) fn sync_view(
+        &self,
+        state: &EngineState,
+        cid: ConversationId,
+    ) -> super::SyncEstablishedView {
+        let device_name = state
+            .device
+            .name
+            .clone()
+            .unwrap_or_else(|| super::super::DisplayName::try_from(".").expect("dot"));
+        let parent = state.established_parent(cid);
+        let notice = parent.and_then(|id| notice_for(state, id));
+        let mut members = Vec::new();
+        if let Some(keys) = &state.device.keys {
+            members.push(super::SyncMemberView {
+                device_id: keys
+                    .id
+                    .unwrap_or(super::super::DeviceId::from_bytes([0; 32])),
+                signing_pk: keys.sign.public_bytes().to_vec(),
+                encryption_pk: keys.enc.public_bytes().to_vec(),
+                name: device_name.clone(),
+                last_active: None,
+            });
+        }
+        let local_sign = state
+            .device
+            .keys
+            .as_ref()
+            .map(|keys| keys.sign.public_bytes().to_vec());
+        if let Some(parent) = parent {
+            if let Some(intro) = inviter_intro_for(state, parent)
+                && local_sign
+                    .as_ref()
+                    .is_none_or(|signing| signing != &intro.signing_pk)
+            {
+                members.push(super::SyncMemberView {
+                    device_id: super::super::DeviceId::from_bytes([0; 32]),
+                    signing_pk: intro.signing_pk.clone(),
+                    encryption_pk: intro.encryption_pk.clone(),
+                    name: intro.name.clone(),
+                    last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                });
+            } else if let Some(intro) = invitee_intro_for(state, parent) {
+                members.push(super::SyncMemberView {
+                    device_id: super::super::DeviceId::from_bytes([0; 32]),
+                    signing_pk: intro.signing_pk.clone(),
+                    encryption_pk: intro.encryption_pk.clone(),
+                    name: intro.name.clone(),
+                    last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                });
+            }
+        }
+        super::SyncEstablishedView {
+            device_name,
+            members,
+            persistents: notice
+                .map(|row| row.persistents.clone())
+                .unwrap_or_default(),
+            ephemerals: notice.map(|row| row.ephemerals.clone()).unwrap_or_default(),
+            last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+        }
     }
 
     pub(super) fn project_party(
