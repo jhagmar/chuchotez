@@ -919,7 +919,9 @@ the same txs also travel on the Sync live path.
 Sort-constrained inner value.
 
 ```
-TxPayload = TxNotice / TxInviterIntro / TxInviteeIntro / TxConfirm / TxReject
+TxPayload = TxNotice / TxInviterIntro / TxInviteeIntro
+          / TxSyncInviterIntro / TxSyncInviteeIntro
+          / TxConfirm / TxReject
           / TxText / TxEdit / TxRemove / TxReaction
           / TxRead / TxDelivered / TxMedia
           / TxAdvertise / TxWrap / TxAck
@@ -941,9 +943,10 @@ DM durable payloads: `TxText`, `TxEdit`, `TxRemove`, `TxReaction`, `TxRead`,
 durable payloads: `TxText`, `TxEdit`, `TxRemove`, `TxReaction`, `TxRead`,
 `TxDelivered`, `TxMedia`, `TxAdvertise`, `TxWrap`, `TxAck`, `TxName`,
 `TxPhoto`, `TxPrefs`, `TxGroupRoster`, `TxGroupWrap`, `TxGroupLeave`,
-`TxGroupKick`. Sync handshake
-uses the handshake payloads and `TxSyncDek`. Synchronization durable payloads are engine
-payloads and device `TxName`. Engine payloads are the `TxEngine*` sorts.
+`TxGroupKick`. Sync handshake payloads are `TxNotice`, `TxSyncInviterIntro`,
+`TxSyncInviteeIntro`, `TxConfirm`, `TxReject`, and `TxSyncDek`. Synchronization
+durable payloads are engine payloads and device `TxName`. Engine payloads are
+the `TxEngine*` sorts.
 
 #### TxNotice
 
@@ -996,6 +999,30 @@ TxInviteeIntro = {
 }
 ```
 
+#### TxSyncInviterIntro
+
+Sync inviter intro. `device_id` is that device.
+
+```
+TxSyncInviterIntro = {
+  intro: TxInviterIntro,
+  device_id: DeviceId,
+}
+```
+
+#### TxSyncInviteeIntro
+
+Sync invitee intro. `device_id` is that device.
+
+```
+TxSyncInviteeIntro = {
+  intro: TxInviteeIntro,
+  device_id: DeviceId,
+}
+```
+
+`J` writes the intro members and `device_id` on one object.
+
 `seed_ct` is `wrap` to the peer intake `pk` of a `random32()` seed. `shared`
 is `unwrap` of that `kem_ct`. Spawn secret:
 
@@ -1016,7 +1043,8 @@ fingerprint = mac(expand(ticket.secret, established_label),
 ```
 
 `intro_lo` / `intro_hi` are the inviter and invitee intro values ordered by
-`signing_pk` bytes. `established_label` is `"chuchotez/1/handshake-dm-established"` or
+`signing_pk` bytes. On a sync handshake those values are `TxSyncInviterIntro`
+and `TxSyncInviteeIntro`. `established_label` is `"chuchotez/1/handshake-dm-established"` or
 `"chuchotez/1/handshake-sync-established"`. `confirmationDigest` is
 `text(fingerprint)`.
 
@@ -1454,6 +1482,8 @@ refuses an unknown `"type"`.
 | TxNotice | `"v1-handshake-notice"` |
 | TxInviterIntro | `"v1-handshake-inviter-intro"` |
 | TxInviteeIntro | `"v1-handshake-invitee-intro"` |
+| TxSyncInviterIntro | `"v1-sync-inviter-intro"` |
+| TxSyncInviteeIntro | `"v1-sync-invitee-intro"` |
 | TxConfirm | `"v1-handshake-confirm"` |
 | TxReject | `"v1-handshake-reject"` |
 | TxText | `"v1-text"` |

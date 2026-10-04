@@ -171,6 +171,8 @@ pub(crate) fn payload_type(payload: &TxPayload) -> &'static str {
     match payload {
         TxPayload::Notice(_) => "v1-handshake-notice",
         TxPayload::InviterIntro(_) => "v1-handshake-inviter-intro",
+        TxPayload::SyncInviterIntro(_) => "v1-sync-inviter-intro",
+        TxPayload::SyncInviteeIntro(_) => "v1-sync-invitee-intro",
         TxPayload::InviteeIntro(_) => "v1-handshake-invitee-intro",
         TxPayload::Confirm => "v1-handshake-confirm",
         TxPayload::Reject => "v1-handshake-reject",
@@ -365,6 +367,14 @@ pub(crate) fn payload_to_json(b64u: &dyn Base64Url, payload: &TxPayload) -> Json
         }
         TxPayload::InviterIntro(i) => members.extend(intro_fields(b64u, i, false)),
         TxPayload::InviteeIntro(i) => members.extend(invitee_fields(b64u, i)),
+        TxPayload::SyncInviterIntro(s) => {
+            members.extend(intro_fields(b64u, &s.intro, false));
+            members.push(("device_id".into(), bstr(b64u, s.device_id.as_bytes())));
+        }
+        TxPayload::SyncInviteeIntro(s) => {
+            members.extend(invitee_fields(b64u, &s.intro));
+            members.push(("device_id".into(), bstr(b64u, s.device_id.as_bytes())));
+        }
         TxPayload::Media(m) => members.extend(media_fields(b64u, m)),
         TxPayload::Prefs(p) => members.extend(prefs_fields(b64u, p)),
         TxPayload::GroupInvite(g) => members.extend(group_invite_fields(b64u, g)),
@@ -763,77 +773,87 @@ fn parse_opt_str(value: &Json) -> Result<Option<String>, ()> {
     }
 }
 
-fn parse_intro(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxInviterIntro, ()> {
-    extra_ok(
-        m,
-        &[
-            "type",
-            "name",
-            "profile_pic",
-            "send_tag_key",
-            "eph_send_tag_key",
-            "encryption_pk",
-            "signing_pk",
-            "seed_ct",
-            "prefs",
-        ],
-    )?;
+fn take_enc(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    key: &str,
+) -> Result<crate::protocol::v1::EncryptionPublicKey, ()> {
+    #[rustfmt::skip]
+    let pk = crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(b64u, m, key)?);
+    Ok(pk)
+}
+
+fn take_sign(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    key: &str,
+) -> Result<crate::protocol::v1::SigningPublicKey, ()> {
+    #[rustfmt::skip]
+    let pk = crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(b64u, m, key)?);
+    Ok(pk)
+}
+
+fn parse_intro(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    sync: bool,
+) -> Result<TxInviterIntro, ()> {
+    let mut keys = vec![
+        "type",
+        "name",
+        "profile_pic",
+        "send_tag_key",
+        "eph_send_tag_key",
+        "encryption_pk",
+        "signing_pk",
+        "seed_ct",
+        "prefs",
+    ];
+    if sync {
+        keys.push("device_id");
+    }
+    extra_ok(m, &keys)?;
     Ok(TxInviterIntro {
         name: parse_name(get_str(m, "name")?)?,
         profile_pic: parse_pic(b64u, get(m, "profile_pic")?)?,
         send_tag_key: id32(get_bstr(b64u, m, "send_tag_key")?, TagKey::from_bytes)?,
         eph_send_tag_key: id32(get_bstr(b64u, m, "eph_send_tag_key")?, TagKey::from_bytes)?,
-        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(
-            b64u,
-            m,
-            "encryption_pk",
-        )?),
-        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(
-            b64u,
-            m,
-            "signing_pk",
-        )?),
+        encryption_pk: take_enc(b64u, m, "encryption_pk")?,
+        signing_pk: take_sign(b64u, m, "signing_pk")?,
         seed_ct: get_bstr(b64u, m, "seed_ct")?,
         prefs: parse_prefs(b64u, get(m, "prefs")?)?,
     })
 }
 
-fn parse_invitee(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxInviteeIntro, ()> {
-    extra_ok(
-        m,
-        &[
-            "type",
-            "name",
-            "profile_pic",
-            "send_tag_key",
-            "eph_send_tag_key",
-            "encryption_pk",
-            "signing_pk",
-            "intake_pk",
-            "seed_ct",
-            "prefs",
-        ],
-    )?;
+fn parse_invitee(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    sync: bool,
+) -> Result<TxInviteeIntro, ()> {
+    let mut keys = vec![
+        "type",
+        "name",
+        "profile_pic",
+        "send_tag_key",
+        "eph_send_tag_key",
+        "encryption_pk",
+        "signing_pk",
+        "intake_pk",
+        "seed_ct",
+        "prefs",
+    ];
+    if sync {
+        keys.push("device_id");
+    }
+    extra_ok(m, &keys)?;
     Ok(TxInviteeIntro {
         name: parse_name(get_str(m, "name")?)?,
         profile_pic: parse_pic(b64u, get(m, "profile_pic")?)?,
         send_tag_key: id32(get_bstr(b64u, m, "send_tag_key")?, TagKey::from_bytes)?,
         eph_send_tag_key: id32(get_bstr(b64u, m, "eph_send_tag_key")?, TagKey::from_bytes)?,
-        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(
-            b64u,
-            m,
-            "encryption_pk",
-        )?),
-        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(
-            b64u,
-            m,
-            "signing_pk",
-        )?),
-        intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(
-            b64u,
-            m,
-            "intake_pk",
-        )?),
+        encryption_pk: take_enc(b64u, m, "encryption_pk")?,
+        signing_pk: take_sign(b64u, m, "signing_pk")?,
+        intake_pk: take_enc(b64u, m, "intake_pk")?,
         seed_ct: get_bstr(b64u, m, "seed_ct")?,
         prefs: parse_prefs(b64u, get(m, "prefs")?)?,
     })
@@ -885,20 +905,12 @@ fn parse_group_invite(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxGr
     )?;
     Ok(TxGroupInvite {
         group_id: id32(get_bstr(b64u, m, "group_id")?, ConversationId::from_bytes)?,
-        owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(
-            b64u,
-            m,
-            "owner_signing_pk",
-        )?),
+        owner_signing_pk: take_sign(b64u, m, "owner_signing_pk")?,
         persistents: parse_durable_list(get(m, "persistents")?)?,
         ephemerals: parse_ephemeral_list(get(m, "ephemerals")?)?,
         name: parse_name(get_str(m, "name")?)?,
         photo: parse_pic(b64u, get(m, "photo")?)?,
-        invitee_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(
-            b64u,
-            m,
-            "invitee_signing_pk",
-        )?),
+        invitee_signing_pk: take_sign(b64u, m, "invitee_signing_pk")?,
         group_secret_ct: get_bstr(b64u, m, "group_secret_ct")?,
     })
 }
@@ -921,16 +933,8 @@ fn parse_roster(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxGroupRos
             ],
         )?;
         members.push(GroupMember {
-            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(
-                b64u,
-                im,
-                "signing_pk",
-            )?),
-            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(
-                b64u,
-                im,
-                "encryption_pk",
-            )?),
+            signing_pk: take_sign(b64u, im, "signing_pk")?,
+            encryption_pk: take_enc(b64u, im, "encryption_pk")?,
             send_tag_key: id32(get_bstr(b64u, im, "send_tag_key")?, TagKey::from_bytes)?,
             eph_send_tag_key: id32(get_bstr(b64u, im, "eph_send_tag_key")?, TagKey::from_bytes)?,
         });
@@ -960,18 +964,26 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
             )?;
             Ok(TxPayload::Notice(TxNotice {
                 policy: parse_policy(get_str(m, "policy")?).ok_or(())?,
-                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(
-                    b64u,
-                    m,
-                    "intake_pk",
-                )?),
+                intake_pk: take_enc(b64u, m, "intake_pk")?,
                 persistents: parse_durable_list(get(m, "persistents")?)?,
                 ephemerals: parse_ephemeral_list(get(m, "ephemerals")?)?,
                 expires: UnixSeconds::from_u64(get_u64(m, "expires")?),
             }))
         }
-        "v1-handshake-inviter-intro" => Ok(TxPayload::InviterIntro(parse_intro(b64u, m)?)),
-        "v1-handshake-invitee-intro" => Ok(TxPayload::InviteeIntro(parse_invitee(b64u, m)?)),
+        "v1-handshake-inviter-intro" => Ok(TxPayload::InviterIntro(parse_intro(b64u, m, false)?)),
+        "v1-sync-inviter-intro" => Ok(TxPayload::SyncInviterIntro(
+            super::payload::SyncInviterIntro {
+                intro: parse_intro(b64u, m, true)?,
+                device_id: id32(get_bstr(b64u, m, "device_id")?, DeviceId::from_bytes)?,
+            },
+        )),
+        "v1-sync-invitee-intro" => Ok(TxPayload::SyncInviteeIntro(
+            super::payload::SyncInviteeIntro {
+                intro: parse_invitee(b64u, m, true)?,
+                device_id: id32(get_bstr(b64u, m, "device_id")?, DeviceId::from_bytes)?,
+            },
+        )),
+        "v1-handshake-invitee-intro" => Ok(TxPayload::InviteeIntro(parse_invitee(b64u, m, false)?)),
         "v1-handshake-confirm" => {
             extra_ok(m, &["type"])?;
             Ok(TxPayload::Confirm)
@@ -1025,11 +1037,7 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
         "v1-advertise" => {
             extra_ok(m, &["type", "encaps_pk"])?;
             Ok(TxPayload::Advertise {
-                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(
-                    b64u,
-                    m,
-                    "encaps_pk",
-                )?),
+                encaps_pk: take_enc(b64u, m, "encaps_pk")?,
             })
         }
         "v1-wrap" => {
@@ -1089,11 +1097,7 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
         "v1-group-kick" => {
             extra_ok(m, &["type", "signing_pk"])?;
             Ok(TxPayload::GroupKick {
-                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(
-                    b64u,
-                    m,
-                    "signing_pk",
-                )?),
+                signing_pk: take_sign(b64u, m, "signing_pk")?,
             })
         }
         "v1-engine-init" => {

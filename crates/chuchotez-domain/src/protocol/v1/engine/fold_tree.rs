@@ -241,16 +241,14 @@ fn device_conv_json(b64u: &dyn Base64Url, cid: ConversationId, node: &DeviceNode
                 secret,
                 parent,
                 peer,
-            } => {
-                let mut row = vec![
+            } => (
+                "synchronization".into(),
+                Json::Object(vec![
                     ("secret".into(), bstr(b64u, secret.as_bytes())),
                     ("parent".into(), bstr(b64u, parent.as_bytes())),
-                ];
-                if let Some(id) = peer {
-                    row.push(("peer".into(), bstr(b64u, id.as_bytes())));
-                }
-                ("synchronization".into(), Json::Object(row))
-            }
+                    ("peer".into(), bstr(b64u, peer.as_bytes())),
+                ]),
+            ),
         },
     ];
     members.extend(chains_json(b64u, cid, &node.chains));
@@ -680,13 +678,8 @@ fn parse_device_conv(
         DeviceConversation::Synchronization {
             secret: Secret::from_bytes(decode_fold32(b64u, field(d, "secret")?)?),
             parent: ConversationId::from_bytes(decode_fold32(b64u, field(d, "parent")?)?),
-            peer: if let Some(value) = optional(d, "peer") {
-                #[rustfmt::skip]
-                let id = super::super::DeviceId::from_bytes(decode_fold32(b64u, value)?);
-                Some(id)
-            } else {
-                None
-            },
+            #[rustfmt::skip]
+            peer: super::super::DeviceId::from_bytes(decode_fold32(b64u, field(d, "peer")?)?),
         }
     } else {
         return Err(EngineError::MalformedPersist);

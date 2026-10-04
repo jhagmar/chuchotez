@@ -40,6 +40,7 @@ pub(super) fn invitee_intro_for(
 ) -> Option<&TxInviteeIntro> {
     state.txs.values().find_map(|t| match &t.payload {
         TxPayload::InviteeIntro(i) if t.conversation_id == conversation_id => Some(i),
+        TxPayload::SyncInviteeIntro(s) if t.conversation_id == conversation_id => Some(&s.intro),
         _ => None,
     })
 }
@@ -49,8 +50,33 @@ pub(super) fn invitee_intro_tx_id(
     conversation_id: ConversationId,
 ) -> Option<Tag> {
     state.txs.iter().find_map(|(id, t)| match &t.payload {
-        TxPayload::InviteeIntro(_) if t.conversation_id == conversation_id => Some(*id),
+        TxPayload::InviteeIntro(_) | TxPayload::SyncInviteeIntro(_)
+            if t.conversation_id == conversation_id =>
+        {
+            Some(*id)
+        }
         _ => None,
+    })
+}
+
+pub(super) fn sync_peer_device(
+    state: &EngineState,
+    handshake: ConversationId,
+) -> Option<super::super::DeviceId> {
+    let ours = state.device.keys.as_ref().and_then(|keys| keys.id);
+    state.txs.values().find_map(|tx| {
+        if tx.conversation_id != handshake {
+            return None;
+        }
+        match &tx.payload {
+            TxPayload::SyncInviterIntro(intro) if ours != Some(intro.device_id) => {
+                Some(intro.device_id)
+            }
+            TxPayload::SyncInviteeIntro(intro) if ours != Some(intro.device_id) => {
+                Some(intro.device_id)
+            }
+            _ => None,
+        }
     })
 }
 
@@ -60,6 +86,7 @@ pub(super) fn inviter_intro_for(
 ) -> Option<&TxInviterIntro> {
     state.txs.values().find_map(|t| match &t.payload {
         TxPayload::InviterIntro(i) if t.conversation_id == conversation_id => Some(i),
+        TxPayload::SyncInviterIntro(s) if t.conversation_id == conversation_id => Some(&s.intro),
         _ => None,
     })
 }
