@@ -178,11 +178,11 @@ Cryptographic adapters take seeds. This workspace never implements `Rng`.
 `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes. `KemSeed` /
 `SignSeed` are 64 bytes from two `Random32` draws.
 
-Query `get_conversation` returns a `Conversation` enum: `Handshake`
-(`HandshakeInviter`, `HandshakeInvitee`, `FailedReason`), `DirectMessageQuery`,
-`GroupQuery`, or `SynchronizationQuery`. `list_conversations` rows carry that
-same `Conversation`. Ticket secret, DEK, and secret keys stay out of that
-query.
+Query `get_conversation` returns a `Conversation` enum: `HandshakeDm` or
+`HandshakeSync` (`HandshakeInviter`, `HandshakeInvitee`, `FailedReason`), an
+established direct message, `GroupQuery`, or an established synchronization.
+`list_conversations` rows carry that same `Conversation`. Ticket secret, DEK,
+and secret keys stay out of that query.
 
 ## Call the library
 

@@ -140,7 +140,7 @@ impl Engine {
         let now = state.ticked.expect("ticked");
         for cid in established_cids(state) {
             let due: Vec<LivePending> = state
-                .chains(cid)
+                .established(cid)
                 .expect("row")
                 .live_pending
                 .iter()
@@ -170,7 +170,7 @@ impl Engine {
                     }
                 }
             }
-            let chains = state.chains_mut(cid).expect("row");
+            let chains = state.established_mut(cid).expect("row");
             if let Some(last) = due.last() {
                 chains
                     .send
@@ -243,11 +243,11 @@ impl Engine {
                 needed: 1,
             };
             state
-                .chains_mut(cid)
+                .established_mut(cid)
                 .expect("row")
                 .live_pending
                 .push(pending);
-        } else if let Some(chains) = state.chains_mut(cid) {
+        } else if let Some(chains) = state.established_mut(cid) {
             chains.send.insert(route.actor, chain);
         }
         Ok(())
@@ -281,7 +281,7 @@ impl Engine {
         chain: &SendChain,
         now: UnixSeconds,
     ) -> Result<(), EngineError> {
-        let chains = state.chains(cid).expect("row");
+        let chains = state.established(cid).expect("row");
         let live = chains.live_until.is_some_and(|until| now < until);
         if live || chains.presence_sent {
             return Ok(());
@@ -295,7 +295,7 @@ impl Engine {
         );
         let sealed = seal_packet(&self.suite, rng, &eph_mk(self.suite.hmac(), chain), &packet)?;
         self.push_eph(state, route, now, sealed);
-        state.chains_mut(cid).expect("row").presence_sent = true;
+        state.established_mut(cid).expect("row").presence_sent = true;
         Ok(())
     }
 
@@ -353,7 +353,7 @@ impl Engine {
         secret: &Secret,
         route: &LiveRoute,
     ) -> Result<SendChain, EngineError> {
-        if let Some(tip) = state.chains(cid).and_then(|chains| {
+        if let Some(tip) = state.established(cid).and_then(|chains| {
             chains
                 .live_pending
                 .last()
@@ -362,7 +362,7 @@ impl Engine {
             return Ok(tip);
         }
         if let Some(existing) = state
-            .chains(cid)
+            .established(cid)
             .and_then(|chains| chains.send.get(&route.actor).cloned())
         {
             return Ok(existing);
@@ -613,7 +613,7 @@ impl Engine {
             #[rustfmt::skip]
             let joined = join(self.suite.hmac(), secret.as_bytes(), sort, &actor_bytes)?;
             let start = state
-                .chains(cid)
+                .established(cid)
                 .and_then(|chains| chains.recv.get(&actor).cloned())
                 .unwrap_or(joined);
             if !persistent {
@@ -628,7 +628,7 @@ impl Engine {
                 }
             } else if let Ok(opened) = open_at(&self.suite, &start, None, &[], now.as_u64(), body) {
                 state
-                    .chains_mut(cid)
+                    .established_mut(cid)
                     .expect("row")
                     .recv
                     .insert(actor, opened.chain);
@@ -736,7 +736,7 @@ impl Engine {
                 .and_then(|sort| super::helpers::actor_for(sort, &packet_actor(packet)))
                 .unwrap_or_else(Actor::handshake);
             state
-                .chains_mut(cid)
+                .established_mut(cid)
                 .expect("row")
                 .chat_senders
                 .insert(part.tx_id, sender);
@@ -770,7 +770,7 @@ pub(super) fn local_material(
 ) -> Option<(Actor, Vec<u8>)> {
     if state.is_sync(cid) {
         let keys = state.device.keys.as_ref()?;
-        let id = keys.id?;
+        let id = keys.id;
         return Some((Actor::device(id), keys.sign.public_bytes().to_vec()));
     }
     let (user, identity) = state.owner(cid)?;
@@ -805,7 +805,7 @@ fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>>
 
 fn sync_open_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
     let mut actors = Vec::new();
-    if let Some(id) = state.device.keys.as_ref().and_then(|keys| keys.id) {
+    if let Some(id) = state.device.keys.as_ref().map(|keys| keys.id) {
         actors.push(id.as_bytes().to_vec());
     }
     if let Some(node) = state.device.conversations.get(&cid)

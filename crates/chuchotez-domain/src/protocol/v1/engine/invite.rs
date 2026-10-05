@@ -226,11 +226,11 @@ impl Engine {
             .device
             .keys
             .as_ref()
-            .and_then(|k| k.id)
+            .map(|k| k.id)
             .unwrap_or_else(|| DeviceId::from(rng.random32()));
         if state.device.keys.is_none() {
             state.device.keys = Some(DeviceKeys {
-                id: Some(device_id),
+                id: device_id,
                 enc: self
                     .suite
                     .kem()
@@ -242,8 +242,6 @@ impl Engine {
                     .generate(policy, &SignSeed::from_pair(rng.random32(), rng.random32()))
                     .map_err(|_| EngineError::MalformedPayload)?,
             });
-        } else if let Some(keys) = state.device.keys.as_mut() {
-            keys.id = Some(device_id);
         }
         let intake = self
             .suite

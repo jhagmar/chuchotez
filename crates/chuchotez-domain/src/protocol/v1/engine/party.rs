@@ -3,7 +3,7 @@
 use super::super::kem::KeyPair;
 use super::super::payload::Ticket;
 use super::super::{Policy, Secret, TimeBin};
-use super::query::FailedReason;
+use super::query::{FailedReason, GroupEnd};
 use super::row_log::{DmTx, LiveGroupTx, SyncHandshakeTx, SyncTx, TxLog};
 
 /// Failure stored on a handshake. Group reasons are not members.
@@ -647,11 +647,13 @@ pub(super) enum IdentityConversation {
     DmHandshake {
         party: DmParty,
         log: TxLog<super::row_log::DmHandshakeTx>,
+        chains: super::chains::PacketChains,
     },
     DirectMessage {
         secret: Secret,
         parent: super::super::ConversationId,
         log: TxLog<DmTx>,
+        chains: super::chains::EstablishedChains,
     },
     Group(GroupPhase),
 }
@@ -660,11 +662,11 @@ pub(super) enum IdentityConversation {
 #[derive(Clone, Debug)]
 pub(super) enum GroupPhase {
     /// Owner or accepted member.
-    Live(GroupLive),
+    Live(Box<GroupLive>),
     /// Invitee has the wrapped secret and has not accepted.
     Offer(GroupOffer),
     /// Terminal group failure.
-    Failed(FailedReason),
+    Failed(GroupEnd),
 }
 
 /// Established group membership.
@@ -680,6 +682,7 @@ pub(super) struct GroupLive {
     pub(super) pending: Vec<GroupPending>,
     pub(super) epoch: u64,
     pub(super) log: TxLog<LiveGroupTx>,
+    pub(super) chains: super::chains::EstablishedChains,
 }
 
 /// Incoming group offer.
@@ -708,11 +711,13 @@ pub(super) enum DeviceConversation {
     SyncHandshake {
         party: SyncParty,
         log: TxLog<SyncHandshakeTx>,
+        chains: super::chains::PacketChains,
     },
     Synchronization {
         secret: Secret,
         parent: super::super::ConversationId,
         peer: super::super::DeviceId,
         log: TxLog<SyncTx>,
+        chains: super::chains::EstablishedChains,
     },
 }

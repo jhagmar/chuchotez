@@ -1,15 +1,16 @@
 //! Folded engine CRDT and local identity directory.
 
-use super::super::chain::{CachedMk, SendChain};
+#[cfg(test)]
+use super::super::Actor;
 use super::super::kem::KeyPair;
 use super::super::payload::{ConversationSort, DurableBody, Ticket};
 use super::super::sign::SigningKeyPair;
 use super::super::{
-    Actor, ConversationId, DeviceId, DisplayName, DurableChannel, FragIndex, IdentityId,
-    PersistSeq, ProfilePic, Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
+    ConversationId, DeviceId, DisplayName, DurableChannel, FragIndex, IdentityId, PersistSeq,
+    ProfilePic, Secret, Tag, TagKey, TimeBin, UnixSeconds, UserId,
 };
 use super::party::{
-    DeviceConversation, DmParty, HandshakeFailure, IdentityConversation, InviteePhase,
+    DeviceConversation, DmParty, GroupPhase, HandshakeFailure, IdentityConversation, InviteePhase,
     InviterPhase, PartyMut, PartyRef, SyncParty,
 };
 use super::query::{BlobPut, DurableWrite, EphemeralWrite, FailedReason};
@@ -48,129 +49,21 @@ pub(super) struct HandshakeHit {
     pub(super) tag_key: TagKey,
 }
 
-/// Advertised encaps secret key not yet used to unwrap a wrap.
-#[derive(Clone)]
-pub(super) struct UnusedSk {
-    pub(super) tx_id: Tag,
-    pub(super) pk: super::super::EncryptionPublicKey,
-    pub(super) sk: Vec<u8>,
-}
+pub(super) use super::chains::{
+    EstablishedChains, Heal, HealProbe, KnownShared, LivePending, PacketChains, Ratchet,
+    TypingNote, UnusedSk,
+};
 
-/// Shared secret from a wrap, waiting to mix or already recorded.
-#[derive(Clone)]
-pub(super) struct KnownShared {
-    pub(super) wrap_tx: Tag,
-    pub(super) shared: Secret,
-    pub(super) ct_hash: Tag,
-    pub(super) from_us: bool,
-    pub(super) encaps_pk: super::super::EncryptionPublicKey,
-}
-
-/// Advertise, wrap, ack, and mix bookkeeping for one conversation.
-#[derive(Clone, Default)]
-pub(super) struct Ratchet {
-    /// Durable packets sealed since the last advertise, wrap, or ack we minted.
-    pub(super) since: u64,
-    /// Ratchet txs this device minted.
-    pub(super) minted: BTreeSet<Tag>,
-    /// Unused advertised secret keys, oldest first. Length at most 8.
-    pub(super) unused: Vec<UnusedSk>,
-    /// Shared secrets from wraps this device sent or unwrapped.
-    pub(super) known: Vec<KnownShared>,
-}
-
-impl core::fmt::Debug for Ratchet {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Ratchet")
-            .field("since", &self.since)
-            .field("unused", &self.unused.len())
-            .field("known", &self.known.len())
-            .finish()
-    }
-}
-
-/// One outstanding heal range. `hi` of all-`0xff` bytes is +∞.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum HealProbe {
-    /// XOR of local ids in `[lo, hi)`.
-    Half { lo: Tag, hi: Tag },
-    /// Ids this device wants in `[lo, hi)`.
-    Want { lo: Tag, hi: Tag, ids: Vec<Tag> },
-    /// Ids this device has in `[lo, hi)`.
-    Have { lo: Tag, hi: Tag, ids: Vec<Tag> },
-}
-
-/// Durable packet bodies held until a live XOR-ack or the 3-second fallback.
-#[derive(Clone, Debug)]
-pub(super) struct LivePending {
-    pub(super) set_xor: Tag,
-    pub(super) sent_at: UnixSeconds,
-    pub(super) bodies: Vec<Vec<u8>>,
-    pub(super) sealed_to: SendChain,
-    pub(super) actor: Actor,
-    pub(super) acks: u8,
-    pub(super) needed: u8,
-}
-
-/// Heal search waiting for an answer, plus durable bodies sealed for fallback.
-#[derive(Clone, Debug, Default)]
-pub(super) struct Heal {
-    pub(super) probes: Vec<HealProbe>,
-    pub(super) sent_at: Option<UnixSeconds>,
-    /// In-flight probes were posted on Ephemeral.
-    pub(super) on_ephemeral: bool,
-    /// Fallback to Persistent already ran for this search.
-    pub(super) fell_back: bool,
-    /// Durable ciphertexts sealed at `sealed_from`, posted when the fallback is due.
-    pub(super) ready: Vec<Vec<u8>>,
-    pub(super) sealed_from: Option<SendChain>,
-    pub(super) sealed_to: Option<SendChain>,
-    pub(super) needs_reseal: bool,
-}
-
-/// Packet chains, skip-ahead `mk`s, last Persistent acks, and ratchet state.
-#[derive(Clone, Debug, Default)]
-pub(super) struct ConversationChains {
-    pub(super) send: BTreeMap<Actor, SendChain>,
-    pub(super) recv: BTreeMap<Actor, SendChain>,
-    pub(super) skipped_mks: BTreeMap<Actor, Vec<CachedMk>>,
-    pub(super) last_acks: BTreeMap<Actor, BTreeSet<Tag>>,
-    pub(super) ratchet: Ratchet,
-    /// Heal search still waiting for an answer.
-    pub(super) heal: Heal,
-    /// Ticked instant until which this conversation is live. `None` before a live ack.
-    pub(super) live_until: Option<UnixSeconds>,
-    /// Durable packet bodies waiting for a live XOR-ack.
-    pub(super) live_pending: Vec<LivePending>,
-    /// A presence probe was sent since this process came online.
-    pub(super) presence_sent: bool,
-    /// Sender of a chat tx, for query `messages`.
-    pub(super) chat_senders: BTreeMap<Tag, super::super::Actor>,
-    /// Latest composing signal. Not folded.
-    pub(super) typing: Option<TypingNote>,
-    /// Latest presence time. Not folded.
-    pub(super) presence_at: Option<UnixSeconds>,
-}
-
-/// Ephemeral composing signal kept until query or reload.
-#[derive(Clone, Debug)]
-pub(super) struct TypingNote {
-    pub(super) composing: bool,
-    pub(super) at: UnixSeconds,
-}
-
-/// DM conversation row: phase plus packet chains.
+/// DM conversation row.
 #[derive(Clone, Debug)]
 pub(super) struct IdentityNode {
     pub(super) kind: IdentityConversation,
-    pub(super) chains: ConversationChains,
 }
 
-/// Sync conversation row: phase plus packet chains.
+/// Sync conversation row.
 #[derive(Clone, Debug)]
 pub(super) struct DeviceNode {
     pub(super) kind: DeviceConversation,
-    pub(super) chains: ConversationChains,
 }
 
 impl IdentityNode {
@@ -179,8 +72,8 @@ impl IdentityNode {
             kind: IdentityConversation::DmHandshake {
                 party,
                 log: BTreeMap::new(),
+                chains: PacketChains::default(),
             },
-            chains: ConversationChains::default(),
         }
     }
 
@@ -190,8 +83,8 @@ impl IdentityNode {
                 secret,
                 parent,
                 log: BTreeMap::new(),
+                chains: EstablishedChains::default(),
             },
-            chains: ConversationChains::default(),
         }
     }
 }
@@ -202,8 +95,8 @@ impl DeviceNode {
             kind: DeviceConversation::SyncHandshake {
                 party,
                 log: BTreeMap::new(),
+                chains: PacketChains::default(),
             },
-            chains: ConversationChains::default(),
         }
     }
 
@@ -218,8 +111,8 @@ impl DeviceNode {
                 parent,
                 peer,
                 log: BTreeMap::new(),
+                chains: EstablishedChains::default(),
             },
-            chains: ConversationChains::default(),
         }
     }
 }
@@ -250,12 +143,21 @@ pub(super) struct Device {
     pub(super) kicked: Vec<DeviceId>,
 }
 
-/// Encryption and signing keys for this device. `id` is set when this device invites.
+/// Encryption and signing keys for this device.
 #[derive(Clone, Debug)]
 pub(super) struct DeviceKeys {
-    pub(super) id: Option<DeviceId>,
+    pub(super) id: DeviceId,
     pub(super) enc: KeyPair,
     pub(super) sign: SigningKeyPair,
+}
+
+/// Peer stored when a handshake confirms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SpawnPeer {
+    /// Direct-message child. The identity row has no device peer.
+    Direct,
+    /// Sync child. The device id is the other device.
+    Sync(super::super::DeviceId),
 }
 
 /// Where a conversation row lives.
@@ -318,6 +220,68 @@ pub struct EngineState {
     pub(super) users: BTreeMap<UserId, User>,
     /// This device and its Sync conversations.
     pub(super) device: Device,
+}
+
+fn packet_of_identity(kind: &IdentityConversation) -> Option<&PacketChains> {
+    match kind {
+        IdentityConversation::DmHandshake { chains, .. } => Some(chains),
+        IdentityConversation::DirectMessage { chains, .. } => Some(&chains.packet),
+        IdentityConversation::Group(GroupPhase::Live(live)) => Some(&live.chains.packet),
+        IdentityConversation::Group(_) => None,
+    }
+}
+
+fn packet_mut_of_identity(kind: &mut IdentityConversation) -> Option<&mut PacketChains> {
+    match kind {
+        IdentityConversation::DmHandshake { chains, .. } => Some(chains),
+        IdentityConversation::DirectMessage { chains, .. } => Some(&mut chains.packet),
+        IdentityConversation::Group(GroupPhase::Live(live)) => Some(&mut live.chains.packet),
+        IdentityConversation::Group(_) => None,
+    }
+}
+
+fn established_of_identity(kind: &IdentityConversation) -> Option<&EstablishedChains> {
+    match kind {
+        IdentityConversation::DirectMessage { chains, .. } => Some(chains),
+        IdentityConversation::Group(GroupPhase::Live(live)) => Some(&live.chains),
+        IdentityConversation::DmHandshake { .. } | IdentityConversation::Group(_) => None,
+    }
+}
+
+fn established_mut_of_identity(kind: &mut IdentityConversation) -> Option<&mut EstablishedChains> {
+    match kind {
+        IdentityConversation::DirectMessage { chains, .. } => Some(chains),
+        IdentityConversation::Group(GroupPhase::Live(live)) => Some(&mut live.chains),
+        IdentityConversation::DmHandshake { .. } | IdentityConversation::Group(_) => None,
+    }
+}
+
+fn packet_of_device(kind: &DeviceConversation) -> Option<&PacketChains> {
+    match kind {
+        DeviceConversation::SyncHandshake { chains, .. } => Some(chains),
+        DeviceConversation::Synchronization { chains, .. } => Some(&chains.packet),
+    }
+}
+
+fn packet_mut_of_device(kind: &mut DeviceConversation) -> Option<&mut PacketChains> {
+    match kind {
+        DeviceConversation::SyncHandshake { chains, .. } => Some(chains),
+        DeviceConversation::Synchronization { chains, .. } => Some(&mut chains.packet),
+    }
+}
+
+fn established_of_device(kind: &DeviceConversation) -> Option<&EstablishedChains> {
+    match kind {
+        DeviceConversation::Synchronization { chains, .. } => Some(chains),
+        DeviceConversation::SyncHandshake { .. } => None,
+    }
+}
+
+fn established_mut_of_device(kind: &mut DeviceConversation) -> Option<&mut EstablishedChains> {
+    match kind {
+        DeviceConversation::Synchronization { chains, .. } => Some(chains),
+        DeviceConversation::SyncHandshake { .. } => None,
+    }
 }
 
 impl EngineState {
@@ -484,54 +448,122 @@ impl EngineState {
             })
     }
 
-    pub(super) fn chains(&self, cid: ConversationId) -> Option<&ConversationChains> {
+    /// Send and receive chains for a handshake or an established row.
+    pub(super) fn chains(&self, cid: ConversationId) -> Option<&PacketChains> {
+        self.packet_of(cid)
+    }
+
+    /// Send and receive chains for a handshake or an established row.
+    pub(super) fn chains_mut(&mut self, cid: ConversationId) -> Option<&mut PacketChains> {
+        self.packet_mut_of(cid)
+    }
+
+    /// Ratchet, heal, live path, and chat notes. Handshake, offer, and failed rows have none.
+    pub(super) fn established(&self, cid: ConversationId) -> Option<&EstablishedChains> {
+        self.established_of(cid)
+    }
+
+    /// Ratchet, heal, live path, and chat notes. Handshake, offer, and failed rows have none.
+    pub(super) fn established_mut(
+        &mut self,
+        cid: ConversationId,
+    ) -> Option<&mut EstablishedChains> {
+        self.established_mut_of(cid)
+    }
+
+    fn packet_of(&self, cid: ConversationId) -> Option<&PacketChains> {
         for user in self.users.values() {
             for ident in user.identities.values() {
                 if let Some(node) = ident.conversations.get(&cid) {
-                    return Some(&node.chains);
+                    return packet_of_identity(&node.kind);
                 }
             }
         }
-        self.device.conversations.get(&cid).map(|n| &n.chains)
+        self.device
+            .conversations
+            .get(&cid)
+            .and_then(|n| packet_of_device(&n.kind))
     }
 
-    pub(super) fn chains_mut(&mut self, cid: ConversationId) -> Option<&mut ConversationChains> {
+    fn packet_mut_of(&mut self, cid: ConversationId) -> Option<&mut PacketChains> {
         if let Some(chains) = self.users.values_mut().find_map(|user| {
-            user.identities
-                .values_mut()
-                .find_map(|ident| ident.conversations.get_mut(&cid).map(|n| &mut n.chains))
+            user.identities.values_mut().find_map(|ident| {
+                ident
+                    .conversations
+                    .get_mut(&cid)
+                    .and_then(|n| packet_mut_of_identity(&mut n.kind))
+            })
         }) {
             return Some(chains);
         }
         self.device
             .conversations
             .get_mut(&cid)
-            .map(|n| &mut n.chains)
+            .and_then(|n| packet_mut_of_device(&mut n.kind))
     }
 
-    pub(super) fn for_each_chains<F: FnMut(ConversationId, &ConversationChains)>(&self, mut f: F) {
+    fn established_of(&self, cid: ConversationId) -> Option<&EstablishedChains> {
+        for user in self.users.values() {
+            for ident in user.identities.values() {
+                if let Some(node) = ident.conversations.get(&cid) {
+                    return established_of_identity(&node.kind);
+                }
+            }
+        }
+        self.device
+            .conversations
+            .get(&cid)
+            .and_then(|n| established_of_device(&n.kind))
+    }
+
+    fn established_mut_of(&mut self, cid: ConversationId) -> Option<&mut EstablishedChains> {
+        if let Some(chains) = self.users.values_mut().find_map(|user| {
+            user.identities.values_mut().find_map(|ident| {
+                ident
+                    .conversations
+                    .get_mut(&cid)
+                    .and_then(|n| established_mut_of_identity(&mut n.kind))
+            })
+        }) {
+            return Some(chains);
+        }
+        self.device
+            .conversations
+            .get_mut(&cid)
+            .and_then(|n| established_mut_of_device(&mut n.kind))
+    }
+
+    pub(super) fn for_each_chains<F: FnMut(ConversationId, &PacketChains)>(&self, mut f: F) {
         for user in self.users.values() {
             for ident in user.identities.values() {
                 for (cid, node) in &ident.conversations {
-                    f(*cid, &node.chains);
+                    if let Some(chains) = packet_of_identity(&node.kind) {
+                        f(*cid, chains);
+                    }
                 }
             }
         }
         for (cid, node) in &self.device.conversations {
-            f(*cid, &node.chains);
+            if let Some(chains) = packet_of_device(&node.kind) {
+                f(*cid, chains);
+            }
         }
     }
 
-    pub(super) fn each_chains_mut<F: FnMut(&mut ConversationChains)>(&mut self, mut f: F) {
+    pub(super) fn each_chains_mut<F: FnMut(&mut PacketChains)>(&mut self, mut f: F) {
         for user in self.users.values_mut() {
             for ident in user.identities.values_mut() {
                 for node in ident.conversations.values_mut() {
-                    f(&mut node.chains);
+                    if let Some(chains) = packet_mut_of_identity(&mut node.kind) {
+                        f(chains);
+                    }
                 }
             }
         }
         for node in self.device.conversations.values_mut() {
-            f(&mut node.chains);
+            if let Some(chains) = packet_mut_of_device(&mut node.kind) {
+                f(chains);
+            }
         }
     }
 
@@ -703,13 +735,13 @@ impl EngineState {
         handshake: ConversationId,
         child: ConversationId,
         secret: Secret,
-        peer: Option<super::super::DeviceId>,
+        peer: SpawnPeer,
     ) {
         if self.child_of(handshake).is_some() {
             return;
         }
-        match self.scope_of(handshake) {
-            Some(ConversationScope::Identity { user, identity }) => {
+        match (self.scope_of(handshake), peer) {
+            (Some(ConversationScope::Identity { user, identity }), SpawnPeer::Direct) => {
                 self.put_dm(
                     user,
                     identity,
@@ -717,11 +749,10 @@ impl EngineState {
                     IdentityNode::direct(secret, handshake),
                 );
             }
-            Some(ConversationScope::Device) => {
-                let peer = peer.expect("sync peer");
+            (Some(ConversationScope::Device), SpawnPeer::Sync(peer)) => {
                 self.put_sync(child, DeviceNode::sync(secret, handshake, peer));
             }
-            None => {}
+            _ => {}
         }
     }
 
@@ -825,31 +856,46 @@ impl EngineState {
                 ident
                     .conversations
                     .values()
-                    .any(|n| !n.chains.last_acks.is_empty())
+                    .any(|n| packet_of_identity(&n.kind).is_some_and(|c| !c.last_acks.is_empty()))
             })
         }) || self
             .device
             .conversations
             .values()
-            .any(|n| !n.chains.last_acks.is_empty())
+            .any(|n| packet_of_device(&n.kind).is_some_and(|c| !c.last_acks.is_empty()))
     }
 
     #[cfg(test)]
-    pub(crate) fn put_skipped(&mut self, cid: ConversationId, actor: Actor, entry: CachedMk) {
+    pub(crate) fn put_skipped(
+        &mut self,
+        cid: ConversationId,
+        actor: super::super::Actor,
+        entry: super::super::chain::CachedMk,
+    ) {
         if let Some(chains) = self.chains_mut(cid) {
             chains.skipped_mks.entry(actor).or_default().push(entry);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn put_send_chain(&mut self, cid: ConversationId, actor: Actor, chain: SendChain) {
+    pub(crate) fn put_send_chain(
+        &mut self,
+        cid: ConversationId,
+        actor: super::super::Actor,
+        chain: super::super::chain::SendChain,
+    ) {
         if let Some(chains) = self.chains_mut(cid) {
             chains.send.insert(actor, chain);
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn put_recv_chain(&mut self, cid: ConversationId, actor: Actor, chain: SendChain) {
+    pub(crate) fn put_recv_chain(
+        &mut self,
+        cid: ConversationId,
+        actor: super::super::Actor,
+        chain: super::super::chain::SendChain,
+    ) {
         if let Some(chains) = self.chains_mut(cid) {
             chains.recv.insert(actor, chain);
         }
@@ -879,12 +925,16 @@ impl EngineState {
         for user in self.users.values() {
             for ident in user.identities.values() {
                 for (id, node) in &ident.conversations {
-                    out.insert(*id, node.chains.last_acks.clone());
+                    if let Some(chains) = packet_of_identity(&node.kind) {
+                        out.insert(*id, chains.last_acks.clone());
+                    }
                 }
             }
         }
         for (id, node) in &self.device.conversations {
-            out.insert(*id, node.chains.last_acks.clone());
+            if let Some(chains) = packet_of_device(&node.kind) {
+                out.insert(*id, chains.last_acks.clone());
+            }
         }
         out
     }
@@ -895,7 +945,7 @@ impl EngineState {
         for (id, body) in self.body_pairs() {
             by_cid.entry(body.conversation_id).or_default().insert(id);
         }
-        let apply = |cid: ConversationId, chains: &mut ConversationChains| {
+        let apply = |cid: ConversationId, chains: &mut PacketChains| {
             if let Some(ids) = by_cid.get(&cid) {
                 for set in chains.last_acks.values_mut() {
                     *set = ids.clone();
@@ -905,12 +955,16 @@ impl EngineState {
         for user in self.users.values_mut() {
             for ident in user.identities.values_mut() {
                 for (cid, node) in ident.conversations.iter_mut() {
-                    apply(*cid, &mut node.chains);
+                    if let Some(chains) = packet_mut_of_identity(&mut node.kind) {
+                        apply(*cid, chains);
+                    }
                 }
             }
         }
         for (cid, node) in self.device.conversations.iter_mut() {
-            apply(*cid, &mut node.chains);
+            if let Some(chains) = packet_mut_of_device(&mut node.kind) {
+                apply(*cid, chains);
+            }
         }
     }
 }

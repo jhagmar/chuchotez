@@ -466,7 +466,7 @@ fn fallback_due(state: &EngineState, cid: ConversationId, now: UnixSeconds) -> b
     })
 }
 
-fn sealed_matches(chains: &super::state::ConversationChains) -> bool {
+fn sealed_matches(chains: &super::state::PacketChains) -> bool {
     let Some(from) = &chains.heal.sealed_from else {
         return false;
     };

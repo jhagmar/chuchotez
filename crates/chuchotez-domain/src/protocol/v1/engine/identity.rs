@@ -235,7 +235,12 @@ impl Engine {
         _rng: &dyn Rng,
         device_id: DeviceId,
     ) -> Result<MutateOk, EngineError> {
-        if state.device.keys.as_ref().and_then(|k| k.id) == Some(device_id) {
+        if state
+            .device
+            .keys
+            .as_ref()
+            .is_some_and(|k| k.id == device_id)
+        {
             return Err(EngineError::WrongPhase);
         }
         let known = state.device.conversations.values().any(|node| {
@@ -338,7 +343,12 @@ impl Engine {
             return Ok(());
         }
         state.device.kicked.push(device_id);
-        if state.device.keys.as_ref().and_then(|keys| keys.id) == Some(device_id) {
+        if state
+            .device
+            .keys
+            .as_ref()
+            .is_some_and(|keys| keys.id == device_id)
+        {
             state
                 .device
                 .conversations
@@ -363,7 +373,7 @@ impl Engine {
                 continue;
             }
             let node = state.device.conversations.get_mut(&cid).expect("row");
-            let DeviceConversation::Synchronization { secret, .. } = &mut node.kind else {
+            let DeviceConversation::Synchronization { secret, chains, .. } = &mut node.kind else {
                 continue;
             };
             let mut info = b"chuchotez/1/sync-rekey".to_vec();
@@ -375,10 +385,10 @@ impl Engine {
             )
             .into_bytes();
             *secret = Secret::from_bytes(next);
-            node.chains.send.clear();
-            node.chains.recv.clear();
-            node.chains.skipped_mks.clear();
-            node.chains.live_pending.clear();
+            chains.send.clear();
+            chains.recv.clear();
+            chains.skipped_mks.clear();
+            chains.live_pending.clear();
         }
         Ok(())
     }
@@ -393,7 +403,7 @@ impl Engine {
             return;
         };
         let id = DeviceId::from_bytes(bytes);
-        if state.device.keys.as_ref().and_then(|keys| keys.id) == Some(id) {
+        if state.device.keys.as_ref().is_some_and(|keys| keys.id == id) {
             return;
         }
         let Some(node) = state.device.conversations.get_mut(&cid) else {

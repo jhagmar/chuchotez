@@ -35,11 +35,11 @@ pub use defaults::{
     PERSISTENT_MIN_COUNT, PROFILE_PIC_MAX_LEN, ProfilePic, ProfilePicError, Wake, WakeError,
 };
 pub use engine::{
-    BlobGet, BlobPut, BlockedIdentity, BlockedMissing, Conversation, ConversationListRow,
-    ConversationRef, DirectMessageQuery, DmEstablished, DurableLocator, DurableWrite, Engine,
-    EngineState, EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupQuery, Handshake,
+    BlobGet, BlobPut, BlockedIdentity, BlockedMissing, ChatItem, Conversation, ConversationListRow,
+    ConversationRef, DmEstablished, DurableLocator, DurableWrite, Engine, EngineState,
+    EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupEnd, GroupQuery, Handshake,
     HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk, PingTarget, Poll,
-    PresenceView, SynchronizationQuery, TypingView, WrapDekOk,
+    PresenceView, TypingView, WrapDekOk,
 };
 pub use error::EngineError;
 pub use hash::{HashBytes, Sha256};

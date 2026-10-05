@@ -193,6 +193,12 @@ impl core::fmt::Debug for KeyPair {
     }
 }
 
+impl Drop for KeyPair {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
+}
+
 /// Failure from [`Kem`] methods.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KemError {

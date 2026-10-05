@@ -182,12 +182,20 @@ impl core::fmt::Display for WakeError {
 impl std::error::Error for WakeError {}
 
 /// Web Push subscription the peer’s host POSTs to in order to wake this device.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Wake {
     endpoint: String,
     p256dh: [u8; 65],
     auth: [u8; 16],
     vapid_pk: Option<Vec<u8>>,
+}
+
+impl core::fmt::Debug for Wake {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Wake")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Wake {
@@ -534,6 +542,7 @@ mod tests {
             Some(vec![1, 2]),
         )
         .expect("w");
+        assert!(format!("{wake:?}").contains("https://push.example/x"));
         assert_eq!(wake.endpoint(), "https://push.example/x");
         assert_eq!(wake.p256dh()[0], 3);
         assert_eq!(wake.auth()[0], 4);

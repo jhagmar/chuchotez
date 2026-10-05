@@ -1299,20 +1299,21 @@ if absent, then their payload. `TxEngineInit` is minted once.
 One durable row in query `messages`.
 
 ```
+ChatItem = Text(TxText) / Edit(TxEdit) / Remove({ target: Tag }) /
+  Reaction(TxReaction) / Read({ up_to: Tag }) / Delivered({ up_to: Tag }) /
+  Media(TxMedia)
+
 HistoryItem = {
   tx_id: Tag,
   sender: bstr,
   hlc: Hlc,
-  payload: TxPayload,
+  item: ChatItem,
   expire_at: UnixSeconds / nil,
 }
 ```
 
 `sender` is `SigningPublicKey` or `DeviceId`. `messages` is the most recent
-1000 durable items after `(hlc, tx_id)` sort. Handshake payloads,
-`TxAdvertise`, `TxWrap`, `TxAck`, `TxName`, `TxPhoto`, `TxPrefs`, `TxGroupInvite`,
-`TxGroupAccept`, `TxGroupReject`, `TxGroupRoster`, `TxGroupWrap`, and engine
-payloads are omitted from `messages`.
+1000 durable items after `(hlc, tx_id)` sort.
 
 #### Sending chain
 
@@ -1715,11 +1716,20 @@ type MediaDraft = {
   address: Address
 }
 
+type ChatItem =
+  | { kind: "Text"; value: TxText }
+  | { kind: "Edit"; value: TxEdit }
+  | { kind: "Remove"; target: Uint8Array }
+  | { kind: "Reaction"; value: TxReaction }
+  | { kind: "Read"; upTo: Uint8Array }
+  | { kind: "Delivered"; upTo: Uint8Array }
+  | { kind: "Media"; value: TxMedia }
+
 type HistoryItem = {
   txId: Uint8Array
   sender: Uint8Array
   hlc: { wallMs: number; counter: number }
-  payload: unknown
+  item: ChatItem
   expireAt: UnixSeconds | null
 }
 
@@ -1829,35 +1839,25 @@ type FailedReason =
   | { reason: "DuplicateIntro" }
   | { reason: "ConfirmationRejected" }
   | { reason: "Equivocation" }
-  | { reason: "OfferRejected" }
-  | { reason: "Kicked" }
-  | { reason: "Left" }
+
+type GroupEnd = { reason: "OfferRejected" } | { reason: "Kicked" } | { reason: "Left" }
 
 type Handshake =
   | ({ role: "Inviter" } & HandshakeInviter)
   | ({ role: "Invitee" } & HandshakeInvitee)
   | ({ role: "Failed" } & FailedReason)
 
-type DirectMessageQuery =
-  | { phase: "Established"; value: DmEstablished }
-  | { phase: "Failed"; value: FailedReason }
-
 type GroupQuery =
   | { phase: "GroupOffer"; value: GroupOffer }
   | { phase: "GroupEstablished"; value: GroupEstablished }
-  | { phase: "GroupFailed"; value: FailedReason }
-
-type SynchronizationQuery =
-  | { phase: "Handshake"; value: Handshake }
-  | { phase: "SyncEstablished"; value: SyncEstablished }
-  | { phase: "Failed"; value: FailedReason }
+  | { phase: "GroupFailed"; value: GroupEnd }
 
 type Conversation =
   | { sort: "HandshakeDm"; value: Handshake }
   | { sort: "HandshakeSync"; value: Handshake }
-  | { sort: "DirectMessage"; value: DirectMessageQuery }
+  | { sort: "DirectMessage"; value: DmEstablished }
   | { sort: "Group"; value: GroupQuery }
-  | { sort: "Synchronization"; value: SynchronizationQuery }
+  | { sort: "Synchronization"; value: SyncEstablished }
 
 declare class Engine {
   constructor(defaults: Defaults)
