@@ -28,7 +28,7 @@ libcrux-kem = "0.0.9"
 libcrux-ed25519 = "0.0.9"
 libcrux-ml-dsa = { version = "0.0.10", default-features = false, features = ["mldsa65"] }
 libcrux-sha2 = "0.0.8"
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 unicode-normalization = "0.1.25"
 
 [workspace.lints.rust]
