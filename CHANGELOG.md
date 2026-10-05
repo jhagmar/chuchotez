@@ -10,8 +10,9 @@ records `nonce || lock(DEK, DurableBody)` with empty AAD. `wrap_dek` /
 `unlock` / `lock` hold the DEK under Argon2id or a PRF wrap. `tick` is
 required before `poll` and mints. Ticket host strings are
 `text(packed(Ticket))`. Query `Conversation` / `Handshake` are enums
-(`HandshakeInviter`, `HandshakeInvitee`, `FailedReason`, `DirectMessageQuery`,
-`GroupQuery`, `SynchronizationQuery`); `ConversationListRow` carries
+(`HandshakeInviter`, `HandshakeInvitee`, `FailedReason`, `GroupQuery`);
+an established direct message and an established synchronization are their
+own `Conversation` arms. `ConversationListRow` carries
 `Conversation`. The stored row is that phase. Fold version 1 writes users,
 identities, and those conversations, with Sync on the device. `std_suite` adds SHA-256 (`LibcruxSha256`) and
 Argon2id (`RustcryptoArgon2id`). Kem wrap/unwrap and Sign sign/verify ship
@@ -61,7 +62,7 @@ Persistent; `tick` after 3 seconds enqueues it. `TxAdvertise`, `TxWrap`, and
 only. `sendText` and the other DM chat mutators require an established DM.
 `sendTyping` and `sendPresence` are also legal on established Sync. Query
 `messages` is the newest 1000 chat items. Typing clears after 6 ticked
-seconds. A durable DM tx pings the peer Wake when set. A signing key, an encryption key, and a packet actor are their own sorts. A sync intro carries that device's id, and the established row stores the peer. Kicking an unknown device id leaves the other links alone. Each conversation row stores only the transactions legal for its phase.
+seconds. A durable DM tx pings the peer Wake when set. A signing key, an encryption key, and a packet actor are their own sorts. A sync intro carries that device's id, and the established row stores the peer. Kicking an unknown device id leaves the other links alone. Each conversation row stores only the transactions legal for its phase. A handshake keeps packet chains, and an established row adds the ratchet and chat notes.
 `sendMedia` takes the blob kind and address from the caller, seals each
 attachment under `media_key`, and `open_media` checks `hash`. `create_group`
 takes 1..=31 established DMs. `accept_group` posts `TxGroupAccept`, and the

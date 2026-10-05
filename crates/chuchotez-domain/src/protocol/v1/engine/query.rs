@@ -1,6 +1,6 @@
 //! Conversation query ADTs, poll locators, and mutation results.
 
-use super::super::payload::{Hlc, TxPayload};
+use super::super::payload::Hlc;
 use super::super::{
     Address, ConversationId, DisplayName, IdentityId, Kind, PersistSeq, Policy, Tag, UnixSeconds,
     UserId,
@@ -43,7 +43,7 @@ impl MutateOk {
 }
 
 /// Web Push target from a peer Wake.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PingTarget {
     /// Endpoint.
     pub endpoint: String,
@@ -53,6 +53,14 @@ pub struct PingTarget {
     pub auth: [u8; 16],
     /// Optional VAPID pk.
     pub vapid_pk: Option<Vec<u8>>,
+}
+
+impl core::fmt::Debug for PingTarget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PingTarget")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Vault header bytes.
@@ -307,6 +315,11 @@ pub enum FailedReason {
     ConfirmationRejected,
     /// Same `tx_id` with a disagreeing payload.
     Equivocation,
+}
+
+/// Terminal group row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupEnd {
     /// `rejectGroup`.
     OfferRejected,
     /// Roster omitted local `signing_pk`.
@@ -326,6 +339,34 @@ pub enum Handshake {
     Failed(FailedReason),
 }
 
+/// Chat row in query `messages`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChatItem {
+    /// Text.
+    Text(super::super::payload::TxText),
+    /// Edit.
+    Edit(super::super::payload::TxEdit),
+    /// Remove.
+    Remove {
+        /// Target tx id.
+        target: Tag,
+    },
+    /// Reaction.
+    Reaction(super::super::payload::TxReaction),
+    /// Read up to.
+    Read {
+        /// Target tx id.
+        up_to: Tag,
+    },
+    /// Delivered up to.
+    Delivered {
+        /// Target tx id.
+        up_to: Tag,
+    },
+    /// Media pointer.
+    Media(super::super::payload::TxMedia),
+}
+
 /// One durable row in query `messages`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryItem {
@@ -335,8 +376,8 @@ pub struct HistoryItem {
     pub sender: super::super::Actor,
     /// Presentation timestamp.
     pub hlc: Hlc,
-    /// Chat payload.
-    pub payload: TxPayload,
+    /// Chat record.
+    pub item: ChatItem,
     /// Disappear time, or never.
     pub expire_at: Option<UnixSeconds>,
 }
@@ -450,16 +491,6 @@ pub fn ping_posts(pings: &[PingTarget]) -> Vec<PingPost> {
         .collect()
 }
 
-/// Established or failed DM query.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DirectMessageQuery {
-    /// Child DM after both confirms.
-    Established(DmEstablished),
-    /// Failed DM.
-    Failed(FailedReason),
-}
-
 /// Group query.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -469,7 +500,7 @@ pub enum GroupQuery {
     /// Owner or accepted member roster.
     GroupEstablished(GroupEstablishedView),
     /// Failed group.
-    GroupFailed(FailedReason),
+    GroupFailed(GroupEnd),
 }
 
 /// Incoming group offer.
@@ -570,18 +601,6 @@ pub struct SyncEstablishedView {
     pub last_active: Option<UnixSeconds>,
 }
 
-/// Synchronization query.
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SynchronizationQuery {
-    /// Sync handshake.
-    Handshake(Handshake),
-    /// Linked devices.
-    SyncEstablished(SyncEstablishedView),
-    /// Failed Synchronization.
-    Failed(FailedReason),
-}
-
 /// Query conversation ADT.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -590,10 +609,10 @@ pub enum Conversation {
     HandshakeDm(Handshake),
     /// Sync handshake.
     HandshakeSync(Handshake),
-    /// Established or failed DM.
-    DirectMessage(DirectMessageQuery),
+    /// Established DM.
+    DirectMessage(DmEstablished),
     /// Group.
     Group(GroupQuery),
-    /// Synchronization.
-    Synchronization(SynchronizationQuery),
+    /// Established Synchronization.
+    Synchronization(SyncEstablishedView),
 }

@@ -38,11 +38,11 @@ impl Engine {
             return;
         };
         let minted = state
-            .chains(cid)
+            .established(cid)
             .map(|c| c.ratchet.minted.clone())
             .unwrap_or_default();
         let known: Vec<Tag> = state
-            .chains(cid)
+            .established(cid)
             .map(|c| c.ratchet.known.iter().map(|k| k.wrap_tx).collect())
             .unwrap_or_default();
         let wraps: Vec<(Tag, Vec<u8>)> = state
@@ -64,7 +64,7 @@ impl Engine {
                 continue;
             }
             let unused = state
-                .chains(cid)
+                .established(cid)
                 .map(|c| c.ratchet.unused.clone())
                 .unwrap_or_default();
             for (index, sk) in unused.iter().enumerate() {
@@ -76,7 +76,7 @@ impl Engine {
                 }
                 let mut bytes = [0u8; 32];
                 bytes.copy_from_slice(&shared);
-                if let Some(chains) = state.chains_mut(cid) {
+                if let Some(chains) = state.established_mut(cid) {
                     chains.ratchet.unused.remove(index);
                     chains.ratchet.known.push(KnownShared {
                         wrap_tx,
@@ -101,7 +101,7 @@ impl Engine {
         if state.is_sync(cid) || state.established_secret(cid).is_none() {
             return Ok(None);
         }
-        let since = state.chains(cid).map(|c| c.ratchet.since).unwrap_or(0);
+        let since = state.established(cid).map(|c| c.ratchet.since).unwrap_or(0);
         if since < OWED_PACKETS {
             return Ok(None);
         }
@@ -112,7 +112,7 @@ impl Engine {
             return Ok(None);
         };
         let (tx_id, _, _) = self.merge_tx(state, secret, cid, minted.payload)?;
-        let chains = state.chains_mut(cid).expect("conversation");
+        let chains = state.established_mut(cid).expect("conversation");
         chains.ratchet.since = 0;
         chains.ratchet.minted.insert(tx_id);
         match minted.effect {
@@ -158,7 +158,7 @@ impl Engine {
     }
 
     pub(super) fn note_sent_packet(&self, state: &mut EngineState, cid: ConversationId) {
-        if let Some(chains) = state.chains_mut(cid) {
+        if let Some(chains) = state.established_mut(cid) {
             chains.ratchet.since = chains.ratchet.since.saturating_add(1);
         }
     }
@@ -189,7 +189,7 @@ impl Engine {
     }
 
     fn ack_of_wrap(&self, state: &EngineState, cid: ConversationId) -> Option<TxPayload> {
-        let chains = state.chains(cid)?;
+        let chains = state.established(cid)?;
         for known in &chains.ratchet.known {
             if known.from_us || !tx_watermarked(state, known.wrap_tx) {
                 continue;
@@ -213,7 +213,7 @@ impl Engine {
         cid: ConversationId,
         policy: Policy,
     ) -> Option<TxPayload> {
-        let minted = &state.chains(cid)?.ratchet.minted;
+        let minted = &state.established(cid)?.ratchet.minted;
         for (id, body) in state.body_pairs() {
             let TxPayload::Advertise { encaps_pk } = &body.payload else {
                 continue;
@@ -240,7 +240,7 @@ impl Engine {
         cid: ConversationId,
         policy: Policy,
     ) -> Option<Minted> {
-        let chains = state.chains(cid)?;
+        let chains = state.established(cid)?;
         let minted = chains.ratchet.minted.clone();
         let wrapped: Vec<super::super::EncryptionPublicKey> = chains
             .ratchet
@@ -325,7 +325,7 @@ fn next_shared(
 }
 
 fn agreed_shareds(state: &EngineState, cid: ConversationId, from_us: bool) -> Vec<Secret> {
-    let Some(chains) = state.chains(cid) else {
+    let Some(chains) = state.established(cid) else {
         return Vec::new();
     };
     let mut rows: Vec<(Tag, Secret)> = chains

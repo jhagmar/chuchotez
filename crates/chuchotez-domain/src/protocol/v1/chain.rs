@@ -56,13 +56,20 @@ impl core::fmt::Debug for CachedMk {
 }
 
 /// Successful skip-ahead open.
-#[derive(Debug)]
 pub(crate) struct Opened {
     pub packet: PacketPlain,
     pub chain: SendChain,
     pub skipped: Vec<CachedMk>,
     pub from_cache: bool,
     pub mk: [u8; 32],
+}
+
+impl core::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Opened")
+            .field("from_cache", &self.from_cache)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn join(
@@ -634,6 +641,7 @@ mod tests {
         let b1 = seal_packet(&s, &rng, &mk(s.hmac(), &chain), &p1).expect("s1");
         let start = join(s.hmac(), &[3u8; 32], ConversationSort::HandshakeDm, &[]).expect("r");
         let opened0 = open_skip_ahead(&s, &start, &[], 10, &b0).expect("o0");
+        let _ = format!("{opened0:?}");
         assert!(!opened0.from_cache);
         assert_eq!(opened0.packet, p0);
         assert_eq!(opened0.chain.packet_seq, PacketSeq::from_u64(1));

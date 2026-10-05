@@ -684,7 +684,7 @@ fn library_edges() {
             .kick_device(
                 sync_ok.state.clone(),
                 &rng,
-                sync_ok.state.device.keys.as_ref().unwrap().id.unwrap()
+                sync_ok.state.device.keys.as_ref().unwrap().id
             )
             .unwrap_err(),
         EngineError::WrongPhase
@@ -2033,8 +2033,8 @@ fn library_edges() {
 #[test]
 fn query_adt_debug() {
     use super::{
-        BlockedIdentity, BlockedMissing, Conversation, DirectMessageQuery, FailedReason,
-        GroupQuery, Handshake, HandshakeInvitee, HandshakeInviter, SynchronizationQuery,
+        BlockedIdentity, BlockedMissing, Conversation, FailedReason, GroupEnd, GroupQuery,
+        Handshake, HandshakeInvitee, HandshakeInviter, PingTarget,
     };
     let expires = UnixSeconds::from_u64(1);
     let digest = String::new();
@@ -2075,21 +2075,21 @@ fn query_adt_debug() {
         FailedReason::DuplicateIntro,
         FailedReason::ConfirmationRejected,
         FailedReason::Equivocation,
-        FailedReason::OfferRejected,
-        FailedReason::Kicked,
-        FailedReason::Left,
     ] {
         let _ = format!("{reason:?}");
+    }
+    for end in [GroupEnd::OfferRejected, GroupEnd::Kicked, GroupEnd::Left] {
+        let _ = format!("{end:?}");
     }
     let _ = format!(
         "{:?}",
         Handshake::Inviter(HandshakeInviter::InviteCreated { expires })
     );
     let _ = format!("{:?}", Handshake::Invitee(HandshakeInvitee::TicketReceived));
-    let _ = format!("{:?}", Handshake::Failed(FailedReason::Left));
+    let _ = format!("{:?}", Handshake::Failed(FailedReason::Equivocation));
     let _ = format!(
         "{:?}",
-        DirectMessageQuery::Established(super::DmEstablished {
+        super::DmEstablished {
             name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
             profile_pic: None,
             encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![]),
@@ -2120,9 +2120,8 @@ fn query_adt_debug() {
                 vapid_pk: None,
             },
             messages: vec![],
-        })
+        }
     );
-    let _ = format!("{:?}", DirectMessageQuery::Failed(FailedReason::Left));
     let _ = format!(
         "{:?}",
         GroupQuery::GroupOffer(super::GroupOfferView {
@@ -2155,9 +2154,17 @@ fn query_adt_debug() {
             messages: vec![],
         })
     );
-    let _ = format!("{:?}", GroupQuery::GroupFailed(FailedReason::Kicked));
-    let hs = Handshake::Invitee(HandshakeInvitee::TicketReceived);
-    let sync_established = SynchronizationQuery::SyncEstablished(super::SyncEstablishedView {
+    let _ = format!("{:?}", GroupQuery::GroupFailed(GroupEnd::Kicked));
+    let _ = format!(
+        "{:?}",
+        PingTarget {
+            endpoint: "https://push.example".into(),
+            p256dh: [1; 65],
+            auth: [2; 16],
+            vapid_pk: None,
+        }
+    );
+    let sync_established = super::SyncEstablishedView {
         device_name: crate::protocol::v1::DisplayName::try_from("G").expect("n"),
         members: vec![super::SyncMemberView {
             device_id: crate::protocol::v1::DeviceId::from_bytes([2; 32]),
@@ -2169,10 +2176,8 @@ fn query_adt_debug() {
         persistents: vec![],
         ephemerals: vec![],
         last_active: None,
-    });
-    let _ = format!("{:?}", SynchronizationQuery::Handshake(hs));
-    let _ = format!("{:?}", sync_established);
-    let _ = format!("{:?}", SynchronizationQuery::Failed(FailedReason::Left));
+    };
+    let _ = format!("{sync_established:?}");
     let _ = format!(
         "{:?}",
         Conversation::HandshakeDm(Handshake::Inviter(HandshakeInviter::InviteCreated {
@@ -2184,10 +2189,6 @@ fn query_adt_debug() {
         Conversation::HandshakeSync(Handshake::Inviter(HandshakeInviter::InviteCreated {
             expires
         }))
-    );
-    let _ = format!(
-        "{:?}",
-        Conversation::DirectMessage(DirectMessageQuery::Failed(FailedReason::Left))
     );
     let _ = format!(
         "{:?}",
@@ -3275,8 +3276,7 @@ fn handshake_intros_confirming_and_failures() {
     };
     use super::party::InviteePhase;
     use super::{
-        Conversation, ConversationRef, DirectMessageQuery, FailedReason, Handshake,
-        HandshakeInvitee, HandshakeInviter,
+        Conversation, ConversationRef, FailedReason, Handshake, HandshakeInvitee, HandshakeInviter,
     };
     use crate::protocol::v1::{DisplayName, OnWirePrefs, Tag, TagKey};
     let mut engine = test_engine();
@@ -3462,9 +3462,7 @@ fn handshake_intros_confirming_and_failures() {
     let child_ie = rows_ie
         .iter()
         .find_map(|r| match r.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
-                Some(r.conversation_id)
-            }
+            Conversation::DirectMessage(_) => Some(r.conversation_id),
             _ => None,
         })
         .expect("iechild");
@@ -3510,9 +3508,7 @@ fn handshake_intros_confirming_and_failures() {
     let child = rows
         .iter()
         .find_map(|r| match r.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
-                Some(r.conversation_id)
-            }
+            Conversation::DirectMessage(_) => Some(r.conversation_id),
             _ => None,
         })
         .expect("child");
@@ -3521,7 +3517,7 @@ fn handshake_intros_confirming_and_failures() {
         engine
             .get_conversation(&confirmed.state, uid, iid, child)
             .expect("chq"),
-        Conversation::DirectMessage(DirectMessageQuery::Established(_))
+        Conversation::DirectMessage(_)
     ));
     assert!(confirmed.state.party(child).is_none());
     let mut spawned = confirmed.state.clone();
@@ -3550,7 +3546,7 @@ fn handshake_intros_confirming_and_failures() {
         engine
             .get_conversation(&restored_c, uid, iid, child)
             .expect("chf"),
-        Conversation::DirectMessage(DirectMessageQuery::Established(_))
+        Conversation::DirectMessage(_)
     ));
     let mut no_map = confirmed.state.clone();
     no_map.cover_last_acks();
@@ -4469,7 +4465,6 @@ fn handshake_intros_confirming_and_failures() {
 fn handshake_sync_intros() {
     use super::{
         Conversation, ConversationRef, FailedReason, Handshake, HandshakeInvitee, HandshakeInviter,
-        SynchronizationQuery,
     };
     let mut engine = test_engine();
     let rng = CounterRng::new();
@@ -4644,9 +4639,7 @@ fn handshake_sync_intros() {
     let child = rows
         .iter()
         .find_map(|r| match r.conversation {
-            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(_)) => {
-                Some(r.conversation_id)
-            }
+            Conversation::Synchronization(_) => Some(r.conversation_id),
             _ => None,
         })
         .expect("schild");
@@ -4654,7 +4647,7 @@ fn handshake_sync_intros() {
         engine
             .get_conversation(&confirmed.state, zeros, zid, child)
             .expect("schq"),
-        Conversation::Synchronization(SynchronizationQuery::SyncEstablished(_))
+        Conversation::Synchronization(_)
     ));
     let mut fold_s = confirmed.state.clone();
     fold_s.cover_last_acks();
@@ -5497,14 +5490,17 @@ fn fold_tree_phases_and_parse_errors() {
     );
     sync_state.device.name = Some(crate::protocol::v1::DisplayName::try_from("phone").expect("dn"));
     sync_state.device.keys = Some(super::state::DeviceKeys {
-        id: None,
+        id: crate::protocol::v1::DeviceId::from_bytes([8; 32]),
         enc: intake.clone(),
         sign: crate::protocol::v1::SigningKeyPair::from_parts(vec![3; 32], vec![4; 32]),
     });
     let folded = engine.fold(sync_state).expect("fsync");
     let back = engine.apply_folded(&folded.snapshot).expect("async");
     assert!(back.is_sync(cid));
-    assert!(back.device.keys.as_ref().unwrap().id.is_none());
+    assert_eq!(
+        back.device.keys.as_ref().unwrap().id,
+        crate::protocol::v1::DeviceId::from_bytes([8; 32])
+    );
     let (sync_ok, _) = engine
         .create_sync_invite(
             pictured.state,
@@ -6264,7 +6260,6 @@ fn advertise_wrap_ack_and_mix() {
     let tag = poll.write_durable[0].tag;
 
     let mut owed = invited.state.clone();
-    owed.chains_mut(cid).expect("chains").ratchet.since = 50;
     engine
         .post_handshake_packets(&mut owed, &rng, cid, &secret, notice_tx)
         .expect("adv");
@@ -6273,29 +6268,7 @@ fn advertise_wrap_ack_and_mix() {
             .iter()
             .all(|body| !matches!(body.payload, TxPayload::Advertise { .. }))
     );
-    assert!(owed.chains(cid).expect("c").ratchet.since >= 50);
-
-    let mut full = owed.clone();
-    {
-        let chains = full.chains_mut(cid).expect("chains");
-        chains.ratchet.unused.clear();
-        for i in 0..8u8 {
-            let id = Tag::from_bytes([i; 32]);
-            chains.ratchet.minted.insert(id);
-            chains.ratchet.unused.push(UnusedSk {
-                tx_id: id,
-                pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![i]),
-                sk: vec![i],
-            });
-        }
-        chains.ratchet.since = 50;
-    }
-    engine
-        .post_handshake_packets(&mut full, &rng, cid, &secret, notice_tx)
-        .expect("drop");
-    let unused = &full.chains(cid).expect("c").ratchet.unused;
-    assert_eq!(unused.len(), 8);
-    assert!(unused.iter().any(|sk| sk.tx_id == Tag::from_bytes([0; 32])));
+    assert!(owed.established(cid).is_none());
 
     let dm = ConversationId::from_bytes([0xd1; 32]);
     let dm_secret = Secret::from_bytes([0xd2; 32]);
@@ -6322,7 +6295,7 @@ fn advertise_wrap_ack_and_mix() {
         },
     )
     .expect("tx");
-    acks.chains_mut(dm).expect("c").ratchet.since = 50;
+    acks.established_mut(dm).expect("c").ratchet.since = 50;
     engine
         .mint_if_owed(&mut acks, &rng, dm, &dm_secret)
         .expect("ackad");
@@ -6331,12 +6304,12 @@ fn advertise_wrap_ack_and_mix() {
         &body.payload,
         TxPayload::Ack { ratchet_ack } if *ratchet_ack == pk_hash
     )));
-    acks.chains_mut(dm).expect("c").ratchet.since = 50;
+    acks.established_mut(dm).expect("c").ratchet.since = 50;
     engine
         .mint_if_owed(&mut acks, &rng, dm, &dm_secret)
         .expect("wrap");
     assert!(
-        acks.chains(dm)
+        acks.established(dm)
             .expect("c")
             .ratchet
             .known
@@ -6353,7 +6326,7 @@ fn advertise_wrap_ack_and_mix() {
     );
     let sk_tx = Tag::from_bytes([0x41; 32]);
     {
-        let chains = peer_wrap.chains_mut(dm).expect("c");
+        let chains = peer_wrap.established_mut(dm).expect("c");
         chains.ratchet.minted.insert(sk_tx);
         chains.ratchet.unused.push(UnusedSk {
             tx_id: sk_tx,
@@ -6434,7 +6407,7 @@ fn advertise_wrap_ack_and_mix() {
         .expect("ackwrap");
     assert!(
         peer_wrap
-            .chains(dm)
+            .established(dm)
             .expect("c")
             .ratchet
             .known
@@ -6455,21 +6428,6 @@ fn advertise_wrap_ack_and_mix() {
     let hash_b = Tag::from_bytes([0x25; 32]);
     {
         let chains = skipped_ack.chains_mut(cid).expect("c");
-        chains.ratchet.known.push(KnownShared {
-            wrap_tx: wrap_a,
-            shared: Secret::from_bytes([2; 32]),
-            ct_hash: hash_a,
-            from_us: false,
-            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
-        });
-        chains.ratchet.known.push(KnownShared {
-            wrap_tx: wrap_b,
-            shared: Secret::from_bytes([3; 32]),
-            ct_hash: hash_b,
-            from_us: false,
-            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
-        });
-        chains.ratchet.since = 50;
         chains
             .last_acks
             .insert(Actor::handshake(), BTreeSet::from([wrap_a, wrap_b, ack_a]));
@@ -6520,7 +6478,6 @@ fn advertise_wrap_ack_and_mix() {
     quiet.edit_bodies(|txs| {
         txs.get_mut(&notice_tx).expect("n").payload = TxPayload::Confirm;
     });
-    quiet.chains_mut(cid).expect("c").ratchet.since = 50;
     engine
         .post_handshake_packets(&mut quiet, &rng, cid, &secret, notice_tx)
         .expect("identity-policy");
@@ -6530,7 +6487,7 @@ fn advertise_wrap_ack_and_mix() {
         dm,
         super::state::IdentityNode::direct(dm_secret, cid),
     );
-    quiet.chains_mut(dm).expect("c").ratchet.since = 50;
+    quiet.established_mut(dm).expect("c").ratchet.since = 50;
     engine
         .mint_if_owed(&mut quiet, &rng, dm, &dm_secret)
         .expect("quiet-ad");
@@ -6557,7 +6514,7 @@ fn advertise_wrap_ack_and_mix() {
         ),
     );
     assert_eq!(quiet.established_parent(sync_child), Some(cid));
-    let _ = format!("{:?}", quiet.chains(cid).expect("c").ratchet);
+    let _ = format!("{:?}", quiet.established(dm).expect("dm").ratchet);
     assert_eq!(
         super::ratchet::conversation_policy(&quiet, ConversationId::from_bytes([9; 32])),
         None
@@ -6590,7 +6547,6 @@ fn advertise_wrap_ack_and_mix() {
             },
         )
         .expect("tx");
-    quiet.chains_mut(sync_cid).expect("sc").ratchet.since = 50;
     let sync_len = quiet.tx_count();
     engine
         .post_handshake_packets(&mut quiet, &rng, sync_cid, &ticket.secret, sync_tx)
@@ -6633,11 +6589,11 @@ fn advertise_wrap_ack_and_mix() {
         )
         .expect("tx");
     hidden
-        .chains_mut(dm)
+        .established_mut(dm)
         .expect("c")
         .last_acks
         .insert(Actor::handshake(), BTreeSet::from([notice_tx]));
-    hidden.chains_mut(dm).expect("c").ratchet.since = 50;
+    hidden.established_mut(dm).expect("c").ratchet.since = 50;
     let ads_before = hidden
         .bodies()
         .iter()
@@ -6652,7 +6608,7 @@ fn advertise_wrap_ack_and_mix() {
         .filter(|body| matches!(body.payload, TxPayload::Advertise { .. }))
         .count();
     assert!(ads_after > ads_before);
-    assert!(hidden.chains(dm).expect("c").ratchet.known.is_empty());
+    assert!(hidden.established(dm).expect("c").ratchet.known.is_empty());
 
     let mut mix_state = invited.state.clone();
     mix_state.put_dm(
@@ -6662,7 +6618,7 @@ fn advertise_wrap_ack_and_mix() {
         super::state::IdentityNode::direct(dm_secret, cid),
     );
     {
-        let chains = mix_state.chains_mut(dm).expect("c");
+        let chains = mix_state.established_mut(dm).expect("c");
         let mut chain = super::super::chain::join(
             engine.suite.hmac(),
             dm_secret.as_bytes(),
@@ -6717,7 +6673,7 @@ fn advertise_wrap_ack_and_mix() {
             .expect("tx");
     }
     let before = mix_state
-        .chains(dm)
+        .established(dm)
         .expect("c")
         .send
         .get(&Actor::handshake())
@@ -6740,13 +6696,6 @@ fn advertise_wrap_ack_and_mix() {
         let mut chain = chains.send.get(&Actor::handshake()).expect("send").clone();
         chain.packet_seq = PacketSeq::from_u64(8);
         chains.send.insert(Actor::handshake(), chain);
-        chains.ratchet.known.push(KnownShared {
-            wrap_tx: Tag::from_bytes([0x91; 32]),
-            shared: Secret::from_bytes([9; 32]),
-            ct_hash: Tag::from_bytes([0x92; 32]),
-            from_us: true,
-            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
-        });
     }
     let _ = few.insert_body(
         Tag::from_bytes([0x91; 32]),
@@ -6793,17 +6742,6 @@ fn advertise_wrap_ack_and_mix() {
         let mut chain = chains.send.get(&Actor::handshake()).expect("send").clone();
         chain.packet_seq = PacketSeq::from_u64(8);
         chains.recv.insert(Actor::handshake(), chain.clone());
-        for i in 0..8u8 {
-            let wrap_tx = Tag::from_bytes([0x60 + i; 32]);
-            let ct_hash = Tag::from_bytes([0x70 + i; 32]);
-            chains.ratchet.known.push(KnownShared {
-                wrap_tx,
-                shared: Secret::from_bytes([i; 32]),
-                ct_hash,
-                from_us: false,
-                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(Vec::new()),
-            });
-        }
         chain
     };
     for i in 0..8u8 {
@@ -6870,23 +6808,14 @@ fn advertise_wrap_ack_and_mix() {
     );
 
     let mut folded = invited.state.clone();
+    folded.put_dm(
+        uid,
+        iid,
+        dm,
+        super::state::IdentityNode::direct(dm_secret, cid),
+    );
     {
         let chains = folded.chains_mut(cid).expect("c");
-        chains.ratchet.since = 4;
-        let id = Tag::from_bytes([1; 32]);
-        chains.ratchet.minted.insert(id);
-        chains.ratchet.unused.push(UnusedSk {
-            tx_id: id,
-            pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
-            sk: vec![2],
-        });
-        chains.ratchet.known.push(KnownShared {
-            wrap_tx: Tag::from_bytes([2; 32]),
-            shared: Secret::from_bytes([3; 32]),
-            ct_hash: Tag::from_bytes([4; 32]),
-            from_us: true,
-            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![5]),
-        });
         chains.skipped_mks.insert(
             Actor::handshake(),
             vec![super::super::chain::CachedMk {
@@ -6895,13 +6824,39 @@ fn advertise_wrap_ack_and_mix() {
                 tx_id: None,
             }],
         );
+        let est = folded.established_mut(dm).expect("dm");
+        est.ratchet.since = 4;
+        let id = Tag::from_bytes([1; 32]);
+        est.ratchet.minted.insert(id);
+        est.ratchet.unused.push(UnusedSk {
+            tx_id: id,
+            pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
+            sk: vec![2],
+        });
+        est.ratchet.known.push(KnownShared {
+            wrap_tx: Tag::from_bytes([2; 32]),
+            shared: Secret::from_bytes([3; 32]),
+            ct_hash: Tag::from_bytes([4; 32]),
+            from_us: true,
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![5]),
+        });
     }
     folded.cover_last_acks();
     let snap = engine.fold(folded).expect("fold");
     let back = engine.apply_folded(&snap.snapshot).expect("apply");
-    assert_eq!(back.chains(cid).expect("c").ratchet.since, 4);
-    assert_eq!(back.chains(cid).expect("c").ratchet.unused.len(), 1);
-    assert_eq!(back.chains(cid).expect("c").ratchet.known.len(), 1);
+    assert!(back.established(cid).is_none());
+    assert_eq!(
+        back.chains(cid)
+            .expect("c")
+            .skipped_mks
+            .get(&Actor::handshake())
+            .expect("skip")
+            .len(),
+        1
+    );
+    assert_eq!(back.established(dm).expect("dm").ratchet.since, 4);
+    assert_eq!(back.established(dm).expect("dm").ratchet.unused.len(), 1);
+    assert_eq!(back.established(dm).expect("dm").ratchet.known.len(), 1);
     let bare = super::super::chain::join(
         engine.suite.hmac(),
         secret.as_bytes(),
@@ -6955,7 +6910,6 @@ fn advertise_wrap_ack_and_mix() {
             },
         },
     );
-    boom_state.chains_mut(cid).expect("c").ratchet.since = 50;
     let boom_len = boom_state.tx_count();
     boom.post_handshake_packets(&mut boom_state, &rng, cid, &secret, notice_tx)
         .expect("boom");
@@ -6998,7 +6952,7 @@ fn advertise_wrap_ack_and_mix() {
             },
         )
         .expect("boom-ack");
-    boom_state.chains_mut(dm).expect("c").ratchet.since = 50;
+    boom_state.established_mut(dm).expect("c").ratchet.since = 50;
     assert!(
         boom.mint_if_owed(&mut boom_state, &rng, dm, &dm_secret)
             .expect("boom-mint")
@@ -7022,7 +6976,7 @@ fn advertise_wrap_ack_and_mix() {
     let old_pk = vec![8u8; 32];
     let new_pk = vec![9u8; 32];
     short_state
-        .chains_mut(cid)
+        .established_mut(dm)
         .expect("c")
         .ratchet
         .known
@@ -7093,12 +7047,12 @@ fn advertise_wrap_ack_and_mix() {
             },
         )
         .expect("tx");
-    short_state.chains_mut(dm).expect("c").ratchet.since = 50;
-    let unused_before = short_state.chains(dm).expect("c").ratchet.unused.len();
+    short_state.established_mut(dm).expect("c").ratchet.since = 50;
+    let unused_before = short_state.established(dm).expect("c").ratchet.unused.len();
     short
         .mint_if_owed(&mut short_state, &rng, dm, &dm_secret)
         .expect("short");
-    assert!(short_state.chains(dm).expect("c").ratchet.unused.len() > unused_before);
+    assert!(short_state.established(dm).expect("c").ratchet.unused.len() > unused_before);
 
     let b64 = engine.suite.b64u();
     let z = super::super::codec::bstr(b64, &[0u8; 32]);
@@ -7214,7 +7168,6 @@ fn advertise_wrap_ack_and_mix() {
     huge.wrap_dek(&rng, &UnlockSecret::Passphrase("passpass".into()))
         .expect("hwrap");
     let mut huge_state = invited.state.clone();
-    huge_state.chains_mut(cid).expect("c").ratchet.since = 50;
     assert_eq!(
         huge.post_handshake_packets(&mut huge_state, &rng, cid, &secret, notice_tx)
             .unwrap_err(),
@@ -7819,7 +7772,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
 fn live_path_waits_then_falls_back() {
     use super::super::chain::{eph_mk, join, mk, seal_packet};
     use super::super::payload::{ConversationSort, PacketPlain, PacketXorAck};
-    use super::{Conversation, ConversationRef, DirectMessageQuery, GroupQuery};
+    use super::{Conversation, ConversationRef, GroupQuery};
     use crate::protocol::v1::fixtures::sample_durable;
     use crate::protocol::v1::{
         Address, Defaults, EphemeralChannel, Kind, NotificationPrivacy, Tag,
@@ -7945,9 +7898,7 @@ fn live_path_waits_then_falls_back() {
         .expect("list")
         .into_iter()
         .find_map(|row| match row.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
-                Some(row.conversation_id)
-            }
+            Conversation::DirectMessage(_) => Some(row.conversation_id),
             _ => None,
         })
         .expect("child");
@@ -7956,9 +7907,7 @@ fn live_path_waits_then_falls_back() {
         .expect("ielist")
         .into_iter()
         .find_map(|row| match row.conversation {
-            Conversation::DirectMessage(DirectMessageQuery::Established(_)) => {
-                Some(row.conversation_id)
-            }
+            Conversation::DirectMessage(_) => Some(row.conversation_id),
             _ => None,
         })
         .expect("iechild");
@@ -7983,14 +7932,14 @@ fn live_path_waits_then_falls_back() {
     assert!(ada.writes.len() == durable_before);
     let first_eph = ada.eph_writes.len();
     assert!(first_eph >= 2);
-    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
+    assert_eq!(ada.established(child).expect("c").live_pending.len(), 1);
     ada = engine
         .send_text(ada, &rng, ada_ids, "second", None)
         .expect("s2")
         .state;
     let text_eph = ada.eph_writes.len() - first_eph;
     assert!(text_eph < first_eph);
-    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 2);
+    assert_eq!(ada.established(child).expect("c").live_pending.len(), 2);
     bob = engine
         .send_text(bob, &rng, bob_ids, "from-bob", None)
         .expect("sb")
@@ -8055,7 +8004,7 @@ fn live_path_waits_then_falls_back() {
         &invitee_pk,
     )
     .expect("join");
-    let set_xor = ada.chains(child).expect("c").live_pending[1].set_xor;
+    let set_xor = ada.established(child).expect("c").live_pending[1].set_xor;
     let ack = seal_packet(
         &engine.suite,
         &rng,
@@ -8071,8 +8020,8 @@ fn live_path_waits_then_falls_back() {
         .ingest_ephemeral_packet(ada, &rng, channel.clone(), bob_tag, &ack)
         .expect("live-ack")
         .state;
-    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
-    assert!(ada.chains(child).expect("c").live_until.is_some());
+    assert_eq!(ada.established(child).expect("c").live_pending.len(), 1);
+    assert!(ada.established(child).expect("c").live_until.is_some());
     let mut stripped = ada.clone();
     stripped.retain_bodies(|_, body| {
         !matches!(
@@ -8099,7 +8048,7 @@ fn live_path_waits_then_falls_back() {
     assert_eq!(ada.writes.len(), held);
     ada = engine.tick(ada, now + 3).expect("due").state;
     assert!(ada.writes.len() > held);
-    assert!(ada.chains(child).expect("c").live_pending.is_empty());
+    assert!(ada.established(child).expect("c").live_pending.is_empty());
     let durable_ch = ada.writes.last().expect("dw").channel.clone();
     let durable_tag = ada.writes.last().expect("dw").tag;
     let durable_body = ada.writes.last().expect("dw").body.clone();
@@ -8306,24 +8255,20 @@ fn live_path_waits_then_falls_back() {
         .expect("view");
     let view = engine.dm_view(&ada, child);
     assert!(view.messages.iter().any(|item| {
-        matches!(&item.payload, TxPayload::Text(text) if text.body == "hi")
+        matches!(&item.item, super::ChatItem::Text(text) if text.body == "hi")
             && !item.sender.as_bytes().is_empty()
     }));
     assert!(view.messages.iter().any(|item| {
-        matches!(&item.payload, TxPayload::Text(text) if text.body == "bare")
+        matches!(&item.item, super::ChatItem::Text(text) if text.body == "bare")
             && item.sender.as_bytes().is_empty()
     }));
-    assert!(view.messages.iter().all(|item| !matches!(
-        item.payload,
-        TxPayload::Advertise { .. } | TxPayload::Name { .. }
-    )));
     assert!(view.typing.is_some());
     assert!(view.presence.is_some());
     ada = engine.tick(ada, now + 4).expect("expire").state;
     let view = engine.dm_view(&ada, child);
     let mut saw_hi = false;
     for item in &view.messages {
-        if let TxPayload::Text(text) = &item.payload {
+        if let super::ChatItem::Text(text) = &item.item {
             assert_ne!(text.body, "gone");
             if text.body == "hi" {
                 saw_hi = true;
@@ -9110,7 +9055,7 @@ fn live_path_waits_then_falls_back() {
 
 #[test]
 fn live_path_sync_uses_device_actor() {
-    use super::{Conversation, ConversationRef, SynchronizationQuery};
+    use super::{Conversation, ConversationRef};
     use crate::protocol::v1::fixtures::sample_durable;
     use crate::protocol::v1::{
         Address, Defaults, EphemeralChannel, IdentityId, Kind, NotificationPrivacy, UserId,
@@ -9245,9 +9190,7 @@ fn live_path_sync_uses_device_actor() {
         .expect("list")
         .into_iter()
         .find_map(|row| match row.conversation {
-            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(_)) => {
-                Some(row.conversation_id)
-            }
+            Conversation::Synchronization(_) => Some(row.conversation_id),
             _ => None,
         })
         .expect("child");
@@ -9277,7 +9220,7 @@ fn live_path_sync_uses_device_actor() {
         .expect("post");
     assert_eq!(ada.writes.len(), before);
     assert!(!ada.eph_writes.is_empty());
-    assert_eq!(ada.chains(child).expect("c").live_pending.len(), 1);
+    assert_eq!(ada.established(child).expect("c").live_pending.len(), 1);
     let write = ada.eph_writes[0].clone();
     ada = engine
         .ingest_ephemeral_packet(ada, &rng, write.channel, write.tag, &write.body)
@@ -9303,7 +9246,7 @@ fn live_path_sync_uses_device_actor() {
             matches!(&tx.payload, TxPayload::Name { name } if name.as_str() == "Phone")
         })
     );
-    assert!(ada.chains(child).expect("c").live_pending.is_empty());
+    assert!(ada.established(child).expect("c").live_pending.is_empty());
     let eph_before = ada.eph_writes.len();
     ada = engine
         .send_presence(ada, &rng, child_ids)
@@ -9332,26 +9275,16 @@ fn live_path_sync_uses_device_actor() {
         with_user.state.established_secret(child).expect("still"),
         secret_before
     );
-    let local_device = with_user
-        .state
-        .device
-        .keys
-        .as_ref()
-        .expect("keys")
-        .id
-        .expect("id");
+    let local_device = with_user.state.device.keys.as_ref().expect("keys").id;
     let peer_id = engine
         .list_conversations(&with_user.state, zeros, zid)
         .expect("peers")
         .into_iter()
         .find_map(|row| match row.conversation {
-            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(view))
-                if row.conversation_id == child =>
-            {
-                view.members.into_iter().find_map(|member| {
-                    (member.device_id != local_device).then_some(member.device_id)
-                })
-            }
+            Conversation::Synchronization(view) if row.conversation_id == child => view
+                .members
+                .into_iter()
+                .find_map(|member| (member.device_id != local_device).then_some(member.device_id)),
             _ => None,
         })
         .expect("peer-id");
@@ -9390,7 +9323,7 @@ fn live_path_sync_uses_device_actor() {
         other.as_bytes(),
     );
     engine.note_sync_peer(&mut two, sid, other.as_bytes());
-    let local_id = two.device.keys.as_ref().expect("keys").id.expect("id");
+    let local_id = two.device.keys.as_ref().expect("keys").id;
     engine.note_sync_peer(&mut two, child, local_id.as_bytes());
     engine.note_sync_peer(&mut two, child, other.as_bytes());
     engine.note_sync_peer(&mut two, child, other.as_bytes());
@@ -9402,7 +9335,7 @@ fn live_path_sync_uses_device_actor() {
         .expect("list-peer")
         .into_iter()
         .any(|row| match row.conversation {
-            Conversation::Synchronization(SynchronizationQuery::SyncEstablished(view)) => {
+            Conversation::Synchronization(view) => {
                 view.members.iter().any(|member| member.device_id == other)
             }
             _ => false,
@@ -9430,18 +9363,11 @@ fn live_path_sync_uses_device_actor() {
         crate::protocol::v1::ConversationId::from_bytes([1; 32]),
         crate::protocol::v1::ConversationId::from_bytes([2; 32]),
         crate::protocol::v1::Secret::from_bytes([3; 32]),
-        None,
+        super::state::SpawnPeer::Direct,
     );
     assert!(named_self.established_secret(child).is_none());
     assert!(named_self.device.conversations.contains_key(&sid));
-    let mine = kicked
-        .state
-        .device
-        .keys
-        .as_ref()
-        .expect("keys")
-        .id
-        .expect("id");
+    let mine = kicked.state.device.keys.as_ref().expect("keys").id;
     assert_eq!(
         engine
             .kick_device(kicked.state.clone(), &rng, mine)
@@ -9600,11 +9526,12 @@ fn actor_sort_and_watermark_edges() {
         IdentityId::from_bytes([4; 32]),
         gid,
         IdentityNode {
-            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::FailedReason::Left)),
-            chains: Default::default(),
+            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::GroupEnd::Left)),
         },
     );
     assert_eq!(state.sort_of(gid), Some(ConversationSort::Group));
+    assert!(state.chains(gid).is_none());
+    assert!(state.chains_mut(gid).is_none());
     let sid = ConversationId::from_bytes([8; 32]);
     state.put_sync(
         sid,
@@ -9725,7 +9652,7 @@ fn a_row_rejects_another_phases_transaction() {
         ident,
         group,
         IdentityNode {
-            kind: IdentityConversation::Group(GroupPhase::Live(GroupLive {
+            kind: IdentityConversation::Group(GroupPhase::Live(Box::new(GroupLive {
                 secret: Secret::from_bytes([4; 32]),
                 name: DisplayName::try_from("G").expect("n"),
                 photo: None,
@@ -9736,8 +9663,8 @@ fn a_row_rejects_another_phases_transaction() {
                 pending: Vec::new(),
                 epoch: 0,
                 log: std::collections::BTreeMap::new(),
-            })),
-            chains: Default::default(),
+                chains: super::chains::EstablishedChains::default(),
+            }))),
         },
     );
     state.put_dm(
@@ -9745,8 +9672,7 @@ fn a_row_rejects_another_phases_transaction() {
         ident,
         failed,
         IdentityNode {
-            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::FailedReason::Left)),
-            chains: Default::default(),
+            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::GroupEnd::Left)),
         },
     );
     state.put_sync(
@@ -9832,7 +9758,7 @@ fn a_row_rejects_another_phases_transaction() {
         )
         .expect("ack2");
     {
-        let chains = state.chains_mut(dm).expect("dm-chains");
+        let chains = state.established_mut(dm).expect("dm-chains");
         chains.ratchet.known.push(super::state::KnownShared {
             wrap_tx,
             shared: Secret::from_bytes([1; 32]),
@@ -9879,7 +9805,7 @@ fn a_row_rejects_another_phases_transaction() {
         .mint_if_owed(&mut state, &rng, dm, &Secret::from_bytes([3; 32]))
         .expect("continues");
     {
-        let chains = state.chains_mut(dm).expect("dm-chains");
+        let chains = state.established_mut(dm).expect("dm-chains");
         for i in 0..8u8 {
             chains.ratchet.unused.push(super::state::UnusedSk {
                 tx_id: Tag::from_bytes([0x40 + i; 32]),
@@ -9920,8 +9846,7 @@ fn a_row_rejects_another_phases_transaction() {
         ident,
         group,
         IdentityNode {
-            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::FailedReason::Left)),
-            chains: Default::default(),
+            kind: IdentityConversation::Group(GroupPhase::Failed(super::query::GroupEnd::Left)),
         },
     );
     assert!(state.body(&group_id).is_none());
@@ -10000,7 +9925,7 @@ fn a_row_rejects_another_phases_transaction() {
             ConversationId::from_bytes([21; 32]),
         ),
     );
-    state.chains_mut(bare).expect("bare").ratchet.since = 50;
+    state.established_mut(bare).expect("bare").ratchet.since = 50;
     assert!(
         engine
             .mint_if_owed(&mut state, &rng, bare, &Secret::from_bytes([7; 32]))

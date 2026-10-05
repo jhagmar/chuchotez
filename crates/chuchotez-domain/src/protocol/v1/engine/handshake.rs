@@ -94,11 +94,11 @@ impl Engine {
         if state.established_secret(conversation_id).is_some() {
             if state.is_sync(conversation_id) {
                 return Some(Conversation::Synchronization(
-                    SynchronizationQuery::SyncEstablished(self.sync_view(state, conversation_id)),
+                    self.sync_view(state, conversation_id),
                 ));
             }
             return Some(Conversation::DirectMessage(
-                DirectMessageQuery::Established(self.dm_view(state, conversation_id)),
+                self.dm_view(state, conversation_id),
             ));
         }
         let party = state.party(conversation_id)?;
@@ -126,9 +126,7 @@ impl Engine {
         let mut members = Vec::new();
         if let Some(keys) = &state.device.keys {
             members.push(super::SyncMemberView {
-                device_id: keys
-                    .id
-                    .unwrap_or(super::super::DeviceId::from_bytes([0; 32])),
+                device_id: keys.id,
                 signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(
                     keys.sign.public_bytes().to_vec(),
                 ),
@@ -144,14 +142,15 @@ impl Engine {
             .keys
             .as_ref()
             .map(|keys| keys.sign.public_bytes().to_vec());
-        let peer_device = match state.device.conversations.get(&cid) {
-            Some(node) => match &node.kind {
-                super::party::DeviceConversation::Synchronization { peer, .. } => *peer,
-                _ => super::super::DeviceId::from_bytes([0; 32]),
-            },
-            None => super::super::DeviceId::from_bytes([0; 32]),
-        };
-        if let Some(parent) = parent {
+        let peer_device = state
+            .device
+            .conversations
+            .get(&cid)
+            .and_then(|node| match &node.kind {
+                super::party::DeviceConversation::Synchronization { peer, .. } => Some(*peer),
+                super::party::DeviceConversation::SyncHandshake { .. } => None,
+            });
+        if let (Some(parent), Some(peer_device)) = (parent, peer_device) {
             if let Some(intro) = inviter_intro_for(state, parent)
                 && local_sign
                     .as_ref()
@@ -162,7 +161,7 @@ impl Engine {
                     signing_pk: intro.signing_pk.clone(),
                     encryption_pk: intro.encryption_pk.clone(),
                     name: intro.name.clone(),
-                    last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                    last_active: state.established(cid).and_then(|chains| chains.presence_at),
                 });
             } else if let Some(intro) = invitee_intro_for(state, parent) {
                 members.push(super::SyncMemberView {
@@ -170,7 +169,7 @@ impl Engine {
                     signing_pk: intro.signing_pk.clone(),
                     encryption_pk: intro.encryption_pk.clone(),
                     name: intro.name.clone(),
-                    last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                    last_active: state.established(cid).and_then(|chains| chains.presence_at),
                 });
             }
         }
@@ -181,7 +180,7 @@ impl Engine {
                 .map(|row| row.persistents.clone())
                 .unwrap_or_default(),
             ephemerals: notice.map(|row| row.ephemerals.clone()).unwrap_or_default(),
-            last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+            last_active: state.established(cid).and_then(|chains| chains.presence_at),
         }
     }
 
@@ -317,9 +316,9 @@ impl Engine {
         let peer = if state.is_sync(handshake) {
             #[rustfmt::skip]
             let id = super::helpers::sync_peer_device(state, handshake).ok_or(EngineError::WrongPhase)?;
-            Some(id)
+            super::state::SpawnPeer::Sync(id)
         } else {
-            None
+            super::state::SpawnPeer::Direct
         };
         state.spawn_established(cid, child, spawn_secret, peer);
         Ok(())
@@ -458,7 +457,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         if state.device.keys.is_none() {
             state.device.keys = Some(super::state::DeviceKeys {
-                id: None,
+                id: super::super::DeviceId::from(rng.random32()),
                 enc: self
                     .suite
                     .kem()
@@ -568,21 +567,11 @@ impl Engine {
             prefs: self.on_wire_prefs(),
         };
         let payload = if state.is_sync(conversation_id) {
-            if state
-                .device
-                .keys
-                .as_ref()
-                .and_then(|keys| keys.id)
-                .is_none()
-                && let Some(keys) = state.device.keys.as_mut()
-            {
-                keys.id = Some(super::super::DeviceId::from(rng.random32()));
-            }
             let device_id = state
                 .device
                 .keys
                 .as_ref()
-                .and_then(|keys| keys.id)
+                .map(|keys| keys.id)
                 .ok_or(EngineError::WrongPhase)?;
             TxPayload::SyncInviteeIntro(super::super::payload::SyncInviteeIntro {
                 intro,
@@ -660,7 +649,7 @@ impl Engine {
                 .device
                 .keys
                 .as_ref()
-                .and_then(|keys| keys.id)
+                .map(|keys| keys.id)
                 .ok_or(EngineError::WrongPhase)?;
             TxPayload::SyncInviterIntro(super::super::payload::SyncInviterIntro {
                 intro,

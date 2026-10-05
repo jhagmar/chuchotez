@@ -94,7 +94,7 @@ impl Engine {
     pub(super) fn remember_sender(&self, state: &mut EngineState, cid: ConversationId, tx_id: Tag) {
         let (actor, _) = local_material(self, state, cid).expect("actor");
         state
-            .chains_mut(cid)
+            .established_mut(cid)
             .expect("row")
             .chat_senders
             .insert(tx_id, actor);
@@ -117,7 +117,7 @@ impl Engine {
         composing: bool,
         at: UnixSeconds,
     ) {
-        state.chains_mut(cid).expect("row").typing = Some(TypingNote { composing, at });
+        state.established_mut(cid).expect("row").typing = Some(TypingNote { composing, at });
     }
 
     pub(super) fn note_presence(
@@ -126,7 +126,7 @@ impl Engine {
         cid: ConversationId,
         at: UnixSeconds,
     ) {
-        state.chains_mut(cid).expect("row").presence_at = Some(at);
+        state.established_mut(cid).expect("row").presence_at = Some(at);
     }
 
     pub(super) fn note_packet_signal(
@@ -160,7 +160,7 @@ impl Engine {
 
     pub(super) fn dm_view(&self, state: &EngineState, cid: ConversationId) -> DmEstablished {
         let now = state.ticked.unwrap_or(UnixSeconds::from_u64(0));
-        let chains = state.chains(cid).expect("row");
+        let chains = state.established(cid).expect("row");
         let typing = chains.typing.as_ref().and_then(|note| {
             (now < note.at.saturating_add(TYPING_SECS)).then_some(TypingView {
                 composing: note.composing,
@@ -355,7 +355,7 @@ fn group_member_pings(state: &EngineState, cid: ConversationId) -> Vec<PingTarge
         .iter()
         .map(|member| member.signing_pk.as_bytes().to_vec())
         .collect();
-    let senders = state.chains(cid).expect("row").chat_senders.clone();
+    let senders = state.established(cid).expect("row").chat_senders.clone();
     let mut rows = Vec::new();
     for (id, tx) in state.body_pairs() {
         if tx.conversation_id != cid {
@@ -456,14 +456,17 @@ fn peer_wake(engine: &Engine, state: &EngineState, cid: ConversationId) -> Optio
 
 fn history(state: &EngineState, cid: ConversationId, now: UnixSeconds) -> Vec<HistoryItem> {
     let senders = state
-        .chains(cid)
+        .established(cid)
         .map(|chains| &chains.chat_senders)
         .expect("row");
     let mut items = Vec::new();
     for (id, tx) in state.body_pairs() {
-        if tx.conversation_id != cid || !in_history(&tx.payload) || expired(&tx.payload, now) {
+        if tx.conversation_id != cid || expired(&tx.payload, now) {
             continue;
         }
+        let Some(item) = chat_item(&tx.payload) else {
+            continue;
+        };
         items.push(HistoryItem {
             tx_id: id,
             sender: senders
@@ -471,24 +474,24 @@ fn history(state: &EngineState, cid: ConversationId, now: UnixSeconds) -> Vec<Hi
                 .cloned()
                 .unwrap_or_else(super::super::Actor::handshake),
             hlc: tx.hlc,
-            payload: tx.payload.clone(),
+            item,
             expire_at: expire_of(&tx.payload),
         });
     }
     trim_recent(items)
 }
 
-fn in_history(payload: &TxPayload) -> bool {
-    matches!(
-        payload,
-        TxPayload::Text(_)
-            | TxPayload::Edit(_)
-            | TxPayload::Remove { .. }
-            | TxPayload::Reaction(_)
-            | TxPayload::Read { .. }
-            | TxPayload::Delivered { .. }
-            | TxPayload::Media(_)
-    )
+fn chat_item(payload: &TxPayload) -> Option<super::query::ChatItem> {
+    Some(match payload {
+        TxPayload::Text(text) => super::query::ChatItem::Text(text.clone()),
+        TxPayload::Edit(edit) => super::query::ChatItem::Edit(edit.clone()),
+        TxPayload::Remove { target } => super::query::ChatItem::Remove { target: *target },
+        TxPayload::Reaction(reaction) => super::query::ChatItem::Reaction(reaction.clone()),
+        TxPayload::Read { up_to } => super::query::ChatItem::Read { up_to: *up_to },
+        TxPayload::Delivered { up_to } => super::query::ChatItem::Delivered { up_to: *up_to },
+        TxPayload::Media(media) => super::query::ChatItem::Media(media.clone()),
+        _ => return None,
+    })
 }
 
 fn expire_of(payload: &TxPayload) -> Option<UnixSeconds> {
@@ -533,7 +536,7 @@ mod tests {
                     wall_ms: n,
                     counter: 0,
                 },
-                payload: TxPayload::Text(TxText {
+                item: super::super::query::ChatItem::Text(TxText {
                     body: ".".into(),
                     reply_to: None,
                     expire_at: None,
@@ -617,6 +620,7 @@ mod tests {
                 },
             )
             .expect("tx");
+        let _ = super::history(&state, cid, super::super::super::UnixSeconds::from_u64(0));
         state
             .insert_body(
                 Tag::from_bytes([4; 32]),
@@ -740,6 +744,7 @@ mod tests {
             reply_to: None,
             expire_at: Some(super::super::super::UnixSeconds::from_u64(4)),
         });
+        let _ = super::chat_item(&media);
         assert_eq!(
             super::expire_of(&media),
             Some(super::super::super::UnixSeconds::from_u64(4))
@@ -816,7 +821,7 @@ mod tests {
             IdentityId::from_bytes([4; 32]),
             cid,
             IdentityNode {
-                kind: IdentityConversation::Group(GroupPhase::Live(GroupLive {
+                kind: IdentityConversation::Group(GroupPhase::Live(Box::new(GroupLive {
                     secret: Secret::from_bytes([5; 32]),
                     name: DisplayName::try_from("G").expect("n"),
                     photo: None,
@@ -829,8 +834,8 @@ mod tests {
                     pending: Vec::new(),
                     epoch: 0,
                     log: std::collections::BTreeMap::new(),
-                })),
-                chains: Default::default(),
+                    chains: super::super::chains::EstablishedChains::default(),
+                }))),
             },
         );
         let wake = |endpoint: &str| {
@@ -912,7 +917,7 @@ mod tests {
                 },
             )
             .expect("tx");
-        let chains = state.chains_mut(cid).expect("chains");
+        let chains = state.established_mut(cid).expect("chains");
         chains
             .chat_senders
             .insert(id(0), super::super::super::Actor::signing(owner.clone()));

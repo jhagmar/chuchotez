@@ -718,12 +718,21 @@ pub const VAULT_T: u32 = 2;
 pub const VAULT_P: u32 = 1;
 
 /// Unlock secret.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum UnlockSecret {
     /// Passphrase.
     Passphrase(String),
     /// WebAuthn PRF output.
     Prf([u8; 32]),
+}
+
+impl core::fmt::Debug for UnlockSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Passphrase(_) => "Passphrase(..)",
+            Self::Prf(_) => "Prf(..)",
+        })
+    }
 }
 
 pub(crate) fn policy_str(policy: Policy) -> &'static str {
@@ -773,6 +782,8 @@ mod tests {
 
     #[test]
     fn helpers() {
+        let _ = format!("{:?}", super::UnlockSecret::Passphrase("passpass".into()));
+        let _ = format!("{:?}", super::UnlockSecret::Prf([1; 32]));
         assert_eq!(time_bin(super::UnixSeconds::from_u64(3600)).as_u64(), 1);
         assert_eq!(PACKET_LEN, 512);
         assert_eq!(AEAD_TAG_LEN, 16);

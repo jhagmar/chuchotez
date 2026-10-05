@@ -104,7 +104,7 @@ impl Engine {
             identity_id,
             group_id,
             IdentityNode {
-                kind: IdentityConversation::Group(GroupPhase::Live(GroupLive {
+                kind: IdentityConversation::Group(GroupPhase::Live(Box::new(GroupLive {
                     secret,
                     name,
                     photo,
@@ -115,8 +115,8 @@ impl Engine {
                     pending,
                     epoch: 0,
                     log: std::collections::BTreeMap::new(),
-                })),
-                chains: Default::default(),
+                    chains: super::chains::EstablishedChains::default(),
+                }))),
             },
         );
         let mut ok = MutateOk {
@@ -216,7 +216,7 @@ impl Engine {
             eph_send_tag_key: TagKey::from(rng.random32()),
         };
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Live(GroupLive {
+            *phase = GroupPhase::Live(Box::new(GroupLive {
                 secret: offer.secret,
                 name: offer.name,
                 photo: offer.photo,
@@ -227,7 +227,8 @@ impl Engine {
                 pending: Vec::new(),
                 epoch: 0,
                 log: std::collections::BTreeMap::new(),
-            });
+                chains: super::chains::EstablishedChains::default(),
+            }));
         }
         let _ = sign_pk;
         Ok(ok)
@@ -250,7 +251,7 @@ impl Engine {
         #[rustfmt::skip]
         let mut ok = self.mint_on(state, rng, &ConversationRef { conversation_id: offer.from_conversation_id, ..ids }, payload)?;
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Failed(super::query::FailedReason::OfferRejected);
+            *phase = GroupPhase::Failed(super::query::GroupEnd::OfferRejected);
         }
         Ok(ok)
     }
@@ -317,7 +318,7 @@ impl Engine {
         }
         let mut ok = self.mint_on(state, rng, &ids, TxPayload::GroupLeave)?;
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Failed(super::query::FailedReason::Left);
+            *phase = GroupPhase::Failed(super::query::GroupEnd::Left);
         }
         Ok(ok)
     }
@@ -377,7 +378,7 @@ impl Engine {
             )
             .ok()?;
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Failed(super::query::FailedReason::Left);
+            *phase = GroupPhase::Failed(super::query::GroupEnd::Left);
         }
         Some(ok)
     }
@@ -438,7 +439,7 @@ impl Engine {
                     .collect(),
                 persistents: live.persistents.clone(),
                 ephemerals: live.ephemerals.clone(),
-                last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                last_active: state.established(cid).and_then(|chains| chains.presence_at),
                 local_prefs: super::chat::local_prefs(self, state, cid),
                 messages: self.dm_view(state, cid).messages,
             }),
@@ -507,7 +508,6 @@ impl Engine {
                         .dm_with_peer(state, user, identity, &invite.owner_signing_pk)
                         .unwrap_or(invite.group_id),
                 })),
-                chains: Default::default(),
             },
         );
         Ok(())
@@ -582,12 +582,12 @@ impl Engine {
             .any(|m| m.signing_pk.as_bytes() == sign_pk.as_slice())
         {
             if let Some(phase) = group_phase_mut(state, cid) {
-                *phase = GroupPhase::Failed(super::query::FailedReason::Kicked);
+                *phase = GroupPhase::Failed(super::query::GroupEnd::Kicked);
             }
             return Ok(());
         }
         if let Some(phase) = group_phase_mut(state, cid) {
-            *phase = GroupPhase::Live(GroupLive {
+            *phase = GroupPhase::Live(Box::new(GroupLive {
                 secret,
                 name,
                 photo,
@@ -598,7 +598,8 @@ impl Engine {
                 pending: Vec::new(),
                 epoch: roster.epoch,
                 log,
-            });
+                chains: super::chains::EstablishedChains::default(),
+            }));
         }
         Ok(())
     }
@@ -973,7 +974,7 @@ pub(super) fn parse_group(
             .ok_or(EngineError::MalformedPersist)
     };
     if m.iter().any(|(k, _)| k == "failed") {
-        return Ok(GroupPhase::Failed(super::query::FailedReason::Left));
+        return Ok(GroupPhase::Failed(super::query::GroupEnd::Left));
     }
     let secret = Secret::from_bytes(decode32(b64u, field("secret")?)?);
     let name = match field("name")? {
@@ -997,7 +998,7 @@ pub(super) fn parse_group(
         Json::Number(n) => *n,
         _ => return Err(EngineError::MalformedPersist),
     };
-    Ok(GroupPhase::Live(GroupLive {
+    Ok(GroupPhase::Live(Box::new(GroupLive {
         secret,
         name,
         photo: match optional_field(m, "photo") {
@@ -1028,7 +1029,8 @@ pub(super) fn parse_group(
         },
         epoch,
         log: std::collections::BTreeMap::new(),
-    }))
+        chains: super::chains::EstablishedChains::default(),
+    })))
 }
 
 fn optional_field<'a>(

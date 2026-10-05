@@ -150,6 +150,12 @@ impl core::fmt::Debug for SigningKeyPair {
     }
 }
 
+impl Drop for SigningKeyPair {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
+}
+
 /// Failure from [`Sign::generate`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignError {

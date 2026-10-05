@@ -81,7 +81,7 @@ pub(super) fn sync_peer_device(
     state: &EngineState,
     handshake: ConversationId,
 ) -> Option<super::super::DeviceId> {
-    let ours = state.device.keys.as_ref().and_then(|keys| keys.id);
+    let ours = state.device.keys.as_ref().map(|keys| keys.id);
     state.bodies().iter().find_map(|tx| {
         if tx.conversation_id != handshake {
             return None;
@@ -430,9 +430,6 @@ pub(super) fn parse_failed(
         "DuplicateIntro" => FailedReason::DuplicateIntro,
         "ConfirmationRejected" => FailedReason::ConfirmationRejected,
         "Equivocation" => FailedReason::Equivocation,
-        "OfferRejected" => FailedReason::OfferRejected,
-        "Kicked" => FailedReason::Kicked,
-        "Left" => FailedReason::Left,
         _ => return Err(EngineError::MalformedPersist),
     };
     Ok((ConversationId::from_bytes(cid), parsed))
