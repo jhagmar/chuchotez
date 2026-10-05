@@ -10,7 +10,7 @@ use super::super::payload::{
     PacketTyping, PacketTypingActive, TxPayload, time_bin,
 };
 use super::super::{
-    ActorId, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex, Secret, Tag,
+    Actor, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex, Secret, Tag,
     TagKey, TimeBin, UnixSeconds,
 };
 use super::Engine;
@@ -36,7 +36,7 @@ struct LiveRoute {
     ephemerals: Vec<EphemeralChannel>,
     send_tag_key: TagKey,
     eph_send_tag_key: TagKey,
-    actor: ActorId,
+    actor: Actor,
 }
 
 pub(super) fn live_persistent_only(sort: ConversationSort, payload: &TxPayload) -> bool {
@@ -70,7 +70,7 @@ fn presence_plain(
     }
 }
 
-fn bin_tag(hmac: &dyn HmacSha256, key: TagKey, label: &[u8], bin: TimeBin) -> Tag {
+pub(super) fn bin_tag(hmac: &dyn HmacSha256, key: TagKey, label: &[u8], bin: TimeBin) -> Tag {
     let mut info = label.to_vec();
     info.extend_from_slice(&bin.as_u64().to_be_bytes());
     Tag::from_bytes(expand(hmac, &HmacSha256Key::from_bytes(*key.as_bytes()), &info).into_bytes())
@@ -140,7 +140,7 @@ impl Engine {
         let now = state.ticked.expect("ticked");
         for cid in established_cids(state) {
             let due: Vec<LivePending> = state
-                .chains(cid)
+                .established(cid)
                 .expect("row")
                 .live_pending
                 .iter()
@@ -170,7 +170,7 @@ impl Engine {
                     }
                 }
             }
-            let chains = state.chains_mut(cid).expect("row");
+            let chains = state.established_mut(cid).expect("row");
             if let Some(last) = due.last() {
                 chains
                     .send
@@ -200,9 +200,13 @@ impl Engine {
         if wait {
             self.probe_presence(state, rng, cid, &route, &chain, now)?;
         }
-        let body = state.txs.get(&tx_id).expect("tx").clone();
+        if let Some(owed) = self.mint_if_owed(state, rng, cid, secret)? {
+            let owed_payload = state.body(&owed).expect("owed").payload.clone();
+            self.post_live(state, rng, cid, secret, owed, &owed_payload)?;
+        }
+        let body = state.body(&tx_id).expect("tx").clone();
         let mut packed = super::super::chain::packed_tx(&self.suite, &body);
-        let set_xor = set_xor_for(&state.txs, cid);
+        let set_xor = set_xor_for(state.body_pairs(), cid);
         let eph_key = eph_mk(self.suite.hmac(), &chain);
         let mut frag_i = 0u64;
         let mut durable = Vec::new();
@@ -239,11 +243,11 @@ impl Engine {
                 needed: 1,
             };
             state
-                .chains_mut(cid)
+                .established_mut(cid)
                 .expect("row")
                 .live_pending
                 .push(pending);
-        } else if let Some(chains) = state.chains_mut(cid) {
+        } else if let Some(chains) = state.established_mut(cid) {
             chains.send.insert(route.actor, chain);
         }
         Ok(())
@@ -277,7 +281,7 @@ impl Engine {
         chain: &SendChain,
         now: UnixSeconds,
     ) -> Result<(), EngineError> {
-        let chains = state.chains(cid).expect("row");
+        let chains = state.established(cid).expect("row");
         let live = chains.live_until.is_some_and(|until| now < until);
         if live || chains.presence_sent {
             return Ok(());
@@ -291,7 +295,7 @@ impl Engine {
         );
         let sealed = seal_packet(&self.suite, rng, &eph_mk(self.suite.hmac(), chain), &packet)?;
         self.push_eph(state, route, now, sealed);
-        state.chains_mut(cid).expect("row").presence_sent = true;
+        state.established_mut(cid).expect("row").presence_sent = true;
         Ok(())
     }
 
@@ -349,7 +353,7 @@ impl Engine {
         secret: &Secret,
         route: &LiveRoute,
     ) -> Result<SendChain, EngineError> {
-        if let Some(tip) = state.chains(cid).and_then(|chains| {
+        if let Some(tip) = state.established(cid).and_then(|chains| {
             chains
                 .live_pending
                 .last()
@@ -358,7 +362,7 @@ impl Engine {
             return Ok(tip);
         }
         if let Some(existing) = state
-            .chains(cid)
+            .established(cid)
             .and_then(|chains| chains.send.get(&route.actor).cloned())
         {
             return Ok(existing);
@@ -416,9 +420,12 @@ impl Engine {
     }
 
     fn live_route(&self, state: &EngineState, cid: ConversationId) -> Option<LiveRoute> {
+        if let Some(route) = self.group_route(state, cid) {
+            return Some(route);
+        }
         let parent = state.established_parent(cid)?;
         let notice = notice_for(state, parent)?;
-        let (actor_bytes, signing) = local_material(self, state, cid)?;
+        let (actor, signing) = local_material(self, state, cid)?;
         let (send_tag_key, eph_send_tag_key) = intro_tag_keys(state, parent, &signing)?;
         let sort = if state.is_sync(cid) {
             ConversationSort::Synchronization
@@ -431,7 +438,7 @@ impl Engine {
             ephemerals: notice.ephemerals.clone(),
             send_tag_key,
             eph_send_tag_key,
-            actor: ActorId::from_bytes(actor_bytes),
+            actor,
         })
     }
 
@@ -456,6 +463,23 @@ impl Engine {
         Err(EngineError::UnknownTag)
     }
 
+    fn group_route(&self, state: &EngineState, cid: ConversationId) -> Option<LiveRoute> {
+        let live = super::group::group_live(state, cid)?;
+        let (actor, signing) = local_material(self, state, cid)?;
+        let member = live
+            .members
+            .iter()
+            .find(|member| member.signing_pk.as_bytes() == signing.as_slice())?;
+        Some(LiveRoute {
+            sort: ConversationSort::Group,
+            persistents: live.persistents.clone(),
+            ephemerals: Vec::new(),
+            send_tag_key: member.send_tag_key,
+            eph_send_tag_key: member.eph_send_tag_key,
+            actor,
+        })
+    }
+
     fn established_match(
         &self,
         state: &EngineState,
@@ -463,6 +487,9 @@ impl Engine {
         tag: &Tag,
         now: UnixSeconds,
     ) -> Option<(ConversationId, Secret, ConversationSort)> {
+        if let Some(hit) = self.group_match(state, channel, tag, now) {
+            return Some(hit);
+        }
         for cid in established_cids(state) {
             let parent = state.established_parent(cid)?;
             let notice = notice_for(state, parent)?;
@@ -478,6 +505,43 @@ impl Engine {
             let persistent = matches!(channel, LiveChannel::Durable(_));
             if matches_ch && self.tag_hits(state, parent, sort, persistent, tag, now) {
                 return Some((cid, state.established_secret(cid)?, sort));
+            }
+        }
+        None
+    }
+
+    fn group_match(
+        &self,
+        state: &EngineState,
+        channel: &LiveChannel<'_>,
+        tag: &Tag,
+        now: UnixSeconds,
+    ) -> Option<(ConversationId, Secret, ConversationSort)> {
+        let LiveChannel::Durable(durable) = channel else {
+            return None;
+        };
+        let label = ConversationSort::Group.persist_label()?;
+        let bins = listen_bins(time_bin(now));
+        for user in state.users.values() {
+            for ident in user.identities.values() {
+                for (cid, node) in &ident.conversations {
+                    let live = match &node.kind {
+                        super::party::IdentityConversation::Group(
+                            super::party::GroupPhase::Live(live),
+                        ) => live,
+                        _ => continue,
+                    };
+                    if !live.persistents.iter().any(|item| item == *durable) {
+                        continue;
+                    }
+                    for member in &live.members {
+                        for bin in bins {
+                            if bin_tag(self.suite.hmac(), member.send_tag_key, label, bin) == *tag {
+                                return Some((*cid, live.secret, ConversationSort::Group));
+                            }
+                        }
+                    }
+                }
             }
         }
         None
@@ -536,13 +600,20 @@ impl Engine {
         persistent: bool,
         now: UnixSeconds,
     ) -> Result<Option<Vec<Vec<u8>>>, EngineError> {
-        let parent = state.established_parent(cid).expect("parent");
-        for actor_bytes in open_actors(state, parent, sort) {
-            let actor = ActorId::from_bytes(actor_bytes.clone());
+        let actors = if sort == ConversationSort::Group {
+            group_member_actors(state, cid)
+        } else if sort == ConversationSort::Synchronization {
+            sync_open_actors(state, cid)
+        } else {
+            let parent = state.established_parent(cid).expect("parent");
+            open_actors(state, parent, sort)
+        };
+        for actor_bytes in actors {
+            let actor = super::helpers::actor_for(sort, &actor_bytes).expect("actor");
             #[rustfmt::skip]
             let joined = join(self.suite.hmac(), secret.as_bytes(), sort, &actor_bytes)?;
             let start = state
-                .chains(cid)
+                .established(cid)
                 .and_then(|chains| chains.recv.get(&actor).cloned())
                 .unwrap_or(joined);
             if !persistent {
@@ -557,7 +628,7 @@ impl Engine {
                 }
             } else if let Ok(opened) = open_at(&self.suite, &start, None, &[], now.as_u64(), body) {
                 state
-                    .chains_mut(cid)
+                    .established_mut(cid)
                     .expect("row")
                     .recv
                     .insert(actor, opened.chain);
@@ -646,8 +717,7 @@ impl Engine {
             #[rustfmt::skip]
         let durable = durable_body_from_json(self.suite.b64u(), &json).map_err(|_| EngineError::MalformedPayload)?;
             if state
-                .txs
-                .get(&part.tx_id)
+                .body(&part.tx_id)
                 .is_some_and(|existing| existing.payload == durable.payload)
             {
                 return Ok(Vec::new());
@@ -659,20 +729,25 @@ impl Engine {
         let rec = self.persist_record(seq, &durable)?;
             state.persist_log.insert(seq, part.tx_id);
             state.next_seq = state.next_seq.saturating_add(1);
-            state.txs.insert(part.tx_id, durable.clone());
+            state.insert_body(part.tx_id, durable.clone())?;
             self.on_group_payload(state, rng, cid, &durable.payload)?;
-            if let TxPayload::EngineKickDevice { device_id } = &durable.payload {
-                #[rustfmt::skip]
-                self.note_device_kick(state, *device_id)?;
-            }
+            let sender = state
+                .sort_of(cid)
+                .and_then(|sort| super::helpers::actor_for(sort, &packet_actor(packet)))
+                .unwrap_or_else(Actor::handshake);
             state
-                .chains_mut(cid)
+                .established_mut(cid)
                 .expect("row")
                 .chat_senders
-                .insert(part.tx_id, packet_actor(packet));
+                .insert(part.tx_id, sender);
             if persistent && let PacketPlain::TxFragLast(last) = packet {
                 store_durable_last_ack(state, cid, &last.actor_id, last.set_xor);
                 self.note_set_xor(state, rng, cid, last.set_xor)?;
+            }
+            self.note_sync_peer(state, cid, &packet_actor(packet));
+            if let TxPayload::EngineKickDevice { device_id } = &durable.payload {
+                #[rustfmt::skip]
+                self.note_device_kick(state, *device_id)?;
             }
             out.push(rec);
         }
@@ -692,15 +767,15 @@ pub(super) fn local_material(
     engine: &Engine,
     state: &EngineState,
     cid: ConversationId,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> Option<(Actor, Vec<u8>)> {
     if state.is_sync(cid) {
         let keys = state.device.keys.as_ref()?;
-        let id = keys.id?;
-        return Some((id.as_bytes().to_vec(), keys.sign.public_bytes().to_vec()));
+        let id = keys.id;
+        return Some((Actor::device(id), keys.sign.public_bytes().to_vec()));
     }
     let (user, identity) = state.owner(cid)?;
     let (_, _, signing) = engine.identity_keys(state, &user, &identity)?;
-    Some((signing.clone(), signing))
+    Some((Actor::signing(signing.clone()), signing))
 }
 
 fn intro_tag_keys(
@@ -709,12 +784,36 @@ fn intro_tag_keys(
     signing: &[u8],
 ) -> Option<(TagKey, TagKey)> {
     if let Some(intro) = inviter_intro_for(state, parent)
-        && intro.signing_pk == signing
+        && intro.signing_pk == crate::protocol::v1::SigningPublicKey::from_bytes(signing)
     {
         return Some((intro.send_tag_key, intro.eph_send_tag_key));
     }
     let intro = invitee_intro_for(state, parent)?;
-    (intro.signing_pk == signing).then_some((intro.send_tag_key, intro.eph_send_tag_key))
+    (intro.signing_pk.as_bytes() == signing).then_some((intro.send_tag_key, intro.eph_send_tag_key))
+}
+
+fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
+    super::group::group_live(state, cid)
+        .map(|live| {
+            live.members
+                .iter()
+                .map(|member| member.signing_pk.as_bytes().to_vec())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn sync_open_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
+    let mut actors = Vec::new();
+    if let Some(id) = state.device.keys.as_ref().map(|keys| keys.id) {
+        actors.push(id.as_bytes().to_vec());
+    }
+    if let Some(node) = state.device.conversations.get(&cid)
+        && let DeviceConversation::Synchronization { peer, .. } = &node.kind
+    {
+        actors.push(peer.as_bytes().to_vec());
+    }
+    actors
 }
 
 fn open_actors(
@@ -724,16 +823,12 @@ fn open_actors(
 ) -> Vec<Vec<u8>> {
     let mut actors = Vec::new();
     if let Some(intro) = invitee_intro_for(state, parent) {
-        actors.push(intro.signing_pk.clone());
+        actors.push(intro.signing_pk.as_bytes().to_vec());
     }
     if let Some(intro) = inviter_intro_for(state, parent) {
-        actors.push(intro.signing_pk.clone());
+        actors.push(intro.signing_pk.as_bytes().to_vec());
     }
-    if sort == ConversationSort::Synchronization
-        && let Some(id) = state.device.keys.as_ref().and_then(|keys| keys.id)
-    {
-        actors.push(id.as_bytes().to_vec());
-    }
+    let _ = sort;
     actors
 }
 
@@ -752,7 +847,9 @@ mod tests {
         ));
         assert!(live_persistent_only(
             ConversationSort::DirectMessage,
-            &TxPayload::Advertise { encaps_pk: vec![] }
+            &TxPayload::Advertise {
+                encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![])
+            }
         ));
         assert!(live_persistent_only(
             ConversationSort::Synchronization,

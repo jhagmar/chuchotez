@@ -4,8 +4,8 @@ use super::super::hmac::{HmacSha256, HmacSha256Key, expand};
 use super::super::payload::{PACKET_NONCE_LEN, TxEdit, TxMedia, TxPayload, TxReaction};
 use super::super::unicode::is_combining;
 use super::super::{
-    Address, AeadKey, AeadNonce, ConversationId, DisplayName, DurableChannel, EngineError,
-    IdentityId, Kind, Tag, UserId,
+    AeadKey, AeadNonce, ConversationId, DisplayName, DurableChannel, EngineError, IdentityId, Tag,
+    UserId,
 };
 use super::helpers::*;
 use super::party::HandshakeFailure;
@@ -67,6 +67,17 @@ impl Engine {
             self.spawn_child(&mut ok.state, ids.conversation_id)?;
             if inviter {
                 self.wrap_sync_dek(&mut ok.state, _rng, ids.conversation_id)?;
+                let ct = ok
+                    .state
+                    .device
+                    .dek_ct
+                    .clone()
+                    .ok_or(EngineError::WrongPhase)?;
+                #[rustfmt::skip]
+                let (tx_id, _, rec) = self.merge_tx(&mut ok.state, &secret, ids.conversation_id, TxPayload::SyncDek { ct })?;
+                ok.persist.push(rec);
+                #[rustfmt::skip]
+                self.post_handshake_packets(&mut ok.state, _rng, ids.conversation_id, &secret, tx_id)?;
             }
             return Ok(ok);
         }
@@ -169,8 +180,8 @@ impl Engine {
         for att in attachments {
             let hash = Tag::from_bytes(self.suite.hash().hash(&att.media_bytes));
             let tag = Tag::from(rng.random32());
-            let kind = Kind::try_from("blossom").expect("kind");
-            let address = Address::try_from("https://blob.example").expect("address");
+            let kind = att.kind.clone();
+            let address = att.address.clone();
             let body = seal_media(
                 &self.suite,
                 rng,

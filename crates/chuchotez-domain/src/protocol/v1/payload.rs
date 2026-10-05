@@ -340,6 +340,10 @@ pub enum TxPayload {
     InviterIntro(TxInviterIntro),
     /// Invitee calling information.
     InviteeIntro(TxInviteeIntro),
+    /// Sync inviter calling information, including this device's id.
+    SyncInviterIntro(SyncInviterIntro),
+    /// Sync invitee calling information, including this device's id.
+    SyncInviteeIntro(SyncInviteeIntro),
     /// Handshake confirm.
     Confirm,
     /// Handshake reject.
@@ -370,7 +374,7 @@ pub enum TxPayload {
     /// Encaps advertise.
     Advertise {
         /// Encaps public key.
-        encaps_pk: Vec<u8>,
+        encaps_pk: super::kem::EncryptionPublicKey,
     },
     /// Encaps wrap.
     Wrap {
@@ -415,7 +419,7 @@ pub enum TxPayload {
     /// Group kick.
     GroupKick {
         /// Member signing pk.
-        signing_pk: Vec<u8>,
+        signing_pk: super::sign::SigningPublicKey,
     },
     /// Engine init.
     EngineInit,
@@ -489,6 +493,11 @@ pub enum TxPayload {
         /// Device id.
         device_id: DeviceId,
     },
+    /// Sealed vault DEK for the other device.
+    SyncDek {
+        /// KEM ciphertext, nonce, and AEAD of the DEK.
+        ct: Vec<u8>,
+    },
 }
 
 /// Handshake advertisement.
@@ -497,7 +506,7 @@ pub struct TxNotice {
     /// Policy.
     pub policy: Policy,
     /// Intake public key.
-    pub intake_pk: Vec<u8>,
+    pub intake_pk: super::kem::EncryptionPublicKey,
     /// Persistent channels.
     pub persistents: Vec<DurableChannel>,
     /// Ephemeral channels.
@@ -518,13 +527,31 @@ pub struct TxInviterIntro {
     /// Eph tag key.
     pub eph_send_tag_key: TagKey,
     /// Encryption pk.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::kem::EncryptionPublicKey,
     /// Signing pk.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::sign::SigningPublicKey,
     /// Wrap of seed to invitee intake.
     pub seed_ct: Vec<u8>,
     /// Prefs.
     pub prefs: OnWirePrefs,
+}
+
+/// Sync inviter intro. The inner intro is the calling card. `device_id` is this device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncInviterIntro {
+    /// Calling card.
+    pub intro: TxInviterIntro,
+    /// This device.
+    pub device_id: DeviceId,
+}
+
+/// Sync invitee intro. The inner intro is the calling card. `device_id` is this device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncInviteeIntro {
+    /// Calling card.
+    pub intro: TxInviteeIntro,
+    /// This device.
+    pub device_id: DeviceId,
 }
 
 /// Invitee intro.
@@ -539,11 +566,11 @@ pub struct TxInviteeIntro {
     /// Eph tag key.
     pub eph_send_tag_key: TagKey,
     /// Encryption pk.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::kem::EncryptionPublicKey,
     /// Signing pk.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::sign::SigningPublicKey,
     /// Invitee intake pk.
-    pub intake_pk: Vec<u8>,
+    pub intake_pk: super::kem::EncryptionPublicKey,
     /// Wrap of seed to inviter notice intake.
     pub seed_ct: Vec<u8>,
     /// Prefs.
@@ -610,7 +637,7 @@ pub struct TxGroupInvite {
     /// Group id.
     pub group_id: ConversationId,
     /// Owner signing pk.
-    pub owner_signing_pk: Vec<u8>,
+    pub owner_signing_pk: super::sign::SigningPublicKey,
     /// Persistents.
     pub persistents: Vec<DurableChannel>,
     /// Ephemerals.
@@ -620,7 +647,7 @@ pub struct TxGroupInvite {
     /// Photo.
     pub photo: Option<ProfilePic>,
     /// Invitee signing pk.
-    pub invitee_signing_pk: Vec<u8>,
+    pub invitee_signing_pk: super::sign::SigningPublicKey,
     /// Wrap of group secret.
     pub group_secret_ct: Vec<u8>,
 }
@@ -629,9 +656,9 @@ pub struct TxGroupInvite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GroupMember {
     /// Signing pk.
-    pub signing_pk: Vec<u8>,
+    pub signing_pk: super::sign::SigningPublicKey,
     /// Encryption pk.
-    pub encryption_pk: Vec<u8>,
+    pub encryption_pk: super::kem::EncryptionPublicKey,
     /// Persist tag key.
     pub send_tag_key: TagKey,
     /// Eph tag key.
@@ -653,9 +680,9 @@ pub struct TxGroupRoster {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TxGroupWrap {
     /// Recipient signing pk.
-    pub to: Vec<u8>,
+    pub to: super::sign::SigningPublicKey,
     /// Sender signing pk.
-    pub from: Vec<u8>,
+    pub from: super::sign::SigningPublicKey,
     /// Wrap ciphertext.
     pub kem_ct: Vec<u8>,
 }
@@ -691,12 +718,21 @@ pub const VAULT_T: u32 = 2;
 pub const VAULT_P: u32 = 1;
 
 /// Unlock secret.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum UnlockSecret {
     /// Passphrase.
     Passphrase(String),
     /// WebAuthn PRF output.
     Prf([u8; 32]),
+}
+
+impl core::fmt::Debug for UnlockSecret {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Passphrase(_) => "Passphrase(..)",
+            Self::Prf(_) => "Prf(..)",
+        })
+    }
 }
 
 pub(crate) fn policy_str(policy: Policy) -> &'static str {
@@ -746,6 +782,8 @@ mod tests {
 
     #[test]
     fn helpers() {
+        let _ = format!("{:?}", super::UnlockSecret::Passphrase("passpass".into()));
+        let _ = format!("{:?}", super::UnlockSecret::Prf([1; 32]));
         assert_eq!(time_bin(super::UnixSeconds::from_u64(3600)).as_u64(), 1);
         assert_eq!(PACKET_LEN, 512);
         assert_eq!(AEAD_TAG_LEN, 16);

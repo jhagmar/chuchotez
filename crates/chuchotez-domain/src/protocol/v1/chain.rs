@@ -7,7 +7,7 @@ use super::payload::{
     PACKET_PAD_LEN, PacketPlain, PacketTxFragLast, PacketTxFragMore, unpad,
 };
 use super::{
-    ActorId, AeadKey, AeadNonce, Base64Url, ConversationId, EngineError, Json, PacketEpoch,
+    Actor, AeadKey, AeadNonce, Base64Url, ConversationId, EngineError, Json, PacketEpoch,
     PacketSeq, Suite, Tag, UnixSeconds,
 };
 use crate::protocol::Rng;
@@ -56,13 +56,20 @@ impl core::fmt::Debug for CachedMk {
 }
 
 /// Successful skip-ahead open.
-#[derive(Debug)]
 pub(crate) struct Opened {
     pub packet: PacketPlain,
     pub chain: SendChain,
     pub skipped: Vec<CachedMk>,
     pub from_cache: bool,
     pub mk: [u8; 32],
+}
+
+impl core::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Opened")
+            .field("from_cache", &self.from_cache)
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) fn join(
@@ -423,7 +430,7 @@ pub(crate) fn packed_tx(suite: &Suite, body: &DurableBody) -> Vec<u8> {
 }
 
 pub(crate) fn set_xor_for(
-    txs: &std::collections::BTreeMap<Tag, DurableBody>,
+    txs: impl IntoIterator<Item = (Tag, DurableBody)>,
     conversation_id: ConversationId,
 ) -> Tag {
     let mut acc = [0u8; 32];
@@ -440,7 +447,7 @@ pub(crate) fn set_xor_for(
 pub(crate) fn chain_to_json(
     b64u: &dyn Base64Url,
     conversation_id: ConversationId,
-    actor_id: &ActorId,
+    actor_id: &Actor,
     chain: &SendChain,
 ) -> Json {
     Json::Object(vec![
@@ -452,6 +459,7 @@ pub(crate) fn chain_to_json(
             "actor_id".into(),
             super::codec::bstr(b64u, actor_id.as_bytes()),
         ),
+        ("actor_role".into(), Json::String(actor_id.role().into())),
         ("root".into(), super::codec::bstr(b64u, &chain.root)),
         ("c".into(), super::codec::bstr(b64u, &chain.c)),
         ("epoch".into(), Json::Number(chain.epoch.as_u64())),
@@ -462,7 +470,7 @@ pub(crate) fn chain_to_json(
 pub(crate) fn chain_from_json(
     b64u: &dyn Base64Url,
     value: &Json,
-) -> Result<(ConversationId, ActorId, SendChain), EngineError> {
+) -> Result<(ConversationId, Actor, SendChain), EngineError> {
     let Json::Object(members) = value else {
         return Err(EngineError::MalformedPersist);
     };
@@ -475,6 +483,11 @@ pub(crate) fn chain_from_json(
         return Err(EngineError::MalformedPersist);
     }
     let actor_id = decode_bstr(b64u, get("actor_id").ok_or(EngineError::MalformedPersist)?)?;
+    let role = match get("actor_role") {
+        Some(Json::String(role)) => Some(role.as_str()),
+        Some(_) => return Err(EngineError::MalformedPersist),
+        None => None,
+    };
     let root = decode32(b64u, get("root").ok_or(EngineError::MalformedPersist)?)?;
     let c = decode32(b64u, get("c").ok_or(EngineError::MalformedPersist)?)?;
     let Json::Number(epoch) = get("epoch").ok_or(EngineError::MalformedPersist)? else {
@@ -487,7 +500,7 @@ pub(crate) fn chain_from_json(
         ConversationId::from_bytes(cid.try_into().map_err(|_| EngineError::MalformedPersist)?);
     Ok((
         cid,
-        ActorId::from_bytes(actor_id),
+        Actor::from_stored(role, actor_id).ok_or(EngineError::MalformedPersist)?,
         SendChain {
             root,
             c,
@@ -522,7 +535,7 @@ mod tests {
     use crate::protocol::v1::payload::{
         DurableBody, Hlc, PacketPlain, PacketTxFragLast, PacketXorAck, TxPayload,
     };
-    use crate::protocol::v1::{ActorId, PacketEpoch, PacketSeq, UnixSeconds};
+    use crate::protocol::v1::{Actor, PacketEpoch, PacketSeq, UnixSeconds};
     use crate::protocol::v1::{ConversationId, EngineError, Json, Tag};
     use std::collections::BTreeMap;
 
@@ -628,6 +641,7 @@ mod tests {
         let b1 = seal_packet(&s, &rng, &mk(s.hmac(), &chain), &p1).expect("s1");
         let start = join(s.hmac(), &[3u8; 32], ConversationSort::HandshakeDm, &[]).expect("r");
         let opened0 = open_skip_ahead(&s, &start, &[], 10, &b0).expect("o0");
+        let _ = format!("{opened0:?}");
         assert!(!opened0.from_cache);
         assert_eq!(opened0.packet, p0);
         assert_eq!(opened0.chain.packet_seq, PacketSeq::from_u64(1));
@@ -706,12 +720,21 @@ mod tests {
                 payload: TxPayload::Confirm,
             },
         );
-        assert_eq!(set_xor_for(&txs, cid), tx_id);
+        assert_eq!(set_xor_for(txs, cid), tx_id);
         let chain = join(s.hmac(), &[1u8; 32], ConversationSort::HandshakeDm, &[]).expect("j");
-        let json = chain_to_json(s.b64u(), cid, &ActorId::handshake(), &chain);
+        let json = chain_to_json(s.b64u(), cid, &Actor::handshake(), &chain);
         let (cid2, actor, c2) = chain_from_json(s.b64u(), &json).expect("parse");
         assert_eq!(cid2, cid);
-        assert_eq!(actor, ActorId::handshake());
+        assert_eq!(actor, Actor::handshake());
+        let bad_role = Json::Object(vec![
+            (
+                "conversation_id".into(),
+                Json::String(s.b64u().encode(cid.as_bytes())),
+            ),
+            ("actor_id".into(), Json::String(s.b64u().encode(&[]))),
+            ("actor_role".into(), Json::Number(1)),
+        ]);
+        assert!(chain_from_json(s.b64u(), &bad_role).is_err());
         assert_eq!(c2.root, chain.root);
         assert_eq!(c2.packet_seq, PacketSeq::from_u64(0));
         assert!(chain_from_json(s.b64u(), &Json::Null).is_err());

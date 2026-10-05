@@ -8,7 +8,7 @@ use super::super::payload::{
 };
 use super::super::sign::sign_pk_len;
 use super::super::{
-    ActorId, Address, ConversationId, DisplayName, DurableChannel, EngineError, FragIndex, Json,
+    Actor, Address, ConversationId, DisplayName, DurableChannel, EngineError, FragIndex, Json,
     Kind, Policy, Secret, Tag, TagKey, TimeBin, UnixSeconds,
 };
 use super::party::HandshakeFailure;
@@ -28,9 +28,17 @@ pub(super) fn notice_for(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<&TxNotice> {
-    state.txs.values().find_map(|t| match &t.payload {
-        TxPayload::Notice(n) if t.conversation_id == conversation_id => Some(n),
-        _ => None,
+    if let Some(log) = dm_handshake_log(state, conversation_id) {
+        return log.values().find_map(|row| match &row.payload {
+            super::row_log::DmHandshakeTx::Notice(notice) => Some(notice),
+            _ => None,
+        });
+    }
+    sync_handshake_log(state, conversation_id).and_then(|log| {
+        log.values().find_map(|row| match &row.payload {
+            super::row_log::SyncHandshakeTx::Notice(notice) => Some(notice),
+            _ => None,
+        })
     })
 }
 
@@ -38,9 +46,17 @@ pub(super) fn invitee_intro_for(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<&TxInviteeIntro> {
-    state.txs.values().find_map(|t| match &t.payload {
-        TxPayload::InviteeIntro(i) if t.conversation_id == conversation_id => Some(i),
-        _ => None,
+    if let Some(log) = dm_handshake_log(state, conversation_id) {
+        return log.values().find_map(|row| match &row.payload {
+            super::row_log::DmHandshakeTx::InviteeIntro(intro) => Some(intro),
+            _ => None,
+        });
+    }
+    sync_handshake_log(state, conversation_id).and_then(|log| {
+        log.values().find_map(|row| match &row.payload {
+            super::row_log::SyncHandshakeTx::InviteeIntro(intro) => Some(&intro.intro),
+            _ => None,
+        })
     })
 }
 
@@ -48,9 +64,37 @@ pub(super) fn invitee_intro_tx_id(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<Tag> {
-    state.txs.iter().find_map(|(id, t)| match &t.payload {
-        TxPayload::InviteeIntro(_) if t.conversation_id == conversation_id => Some(*id),
-        _ => None,
+    state
+        .body_pairs()
+        .into_iter()
+        .find_map(|(id, t)| match &t.payload {
+            TxPayload::InviteeIntro(_) | TxPayload::SyncInviteeIntro(_)
+                if t.conversation_id == conversation_id =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })
+}
+
+pub(super) fn sync_peer_device(
+    state: &EngineState,
+    handshake: ConversationId,
+) -> Option<super::super::DeviceId> {
+    let ours = state.device.keys.as_ref().map(|keys| keys.id);
+    state.bodies().iter().find_map(|tx| {
+        if tx.conversation_id != handshake {
+            return None;
+        }
+        match &tx.payload {
+            TxPayload::SyncInviterIntro(intro) if ours != Some(intro.device_id) => {
+                Some(intro.device_id)
+            }
+            TxPayload::SyncInviteeIntro(intro) if ours != Some(intro.device_id) => {
+                Some(intro.device_id)
+            }
+            _ => None,
+        }
     })
 }
 
@@ -58,10 +102,44 @@ pub(super) fn inviter_intro_for(
     state: &EngineState,
     conversation_id: ConversationId,
 ) -> Option<&TxInviterIntro> {
-    state.txs.values().find_map(|t| match &t.payload {
-        TxPayload::InviterIntro(i) if t.conversation_id == conversation_id => Some(i),
-        _ => None,
+    if let Some(log) = dm_handshake_log(state, conversation_id) {
+        return log.values().find_map(|row| match &row.payload {
+            super::row_log::DmHandshakeTx::InviterIntro(intro) => Some(intro),
+            _ => None,
+        });
+    }
+    sync_handshake_log(state, conversation_id).and_then(|log| {
+        log.values().find_map(|row| match &row.payload {
+            super::row_log::SyncHandshakeTx::InviterIntro(intro) => Some(&intro.intro),
+            _ => None,
+        })
     })
+}
+
+fn dm_handshake_log(
+    state: &EngineState,
+    cid: ConversationId,
+) -> Option<&super::row_log::TxLog<super::row_log::DmHandshakeTx>> {
+    for user in state.users.values() {
+        for ident in user.identities.values() {
+            if let Some(super::party::IdentityConversation::DmHandshake { log, .. }) =
+                ident.conversations.get(&cid).map(|node| &node.kind)
+            {
+                return Some(log);
+            }
+        }
+    }
+    None
+}
+
+fn sync_handshake_log(
+    state: &EngineState,
+    cid: ConversationId,
+) -> Option<&super::row_log::TxLog<super::row_log::SyncHandshakeTx>> {
+    match state.device.conversations.get(&cid).map(|node| &node.kind) {
+        Some(super::party::DeviceConversation::SyncHandshake { log, .. }) => Some(log),
+        _ => None,
+    }
 }
 
 pub(super) fn intro_keys_ok(
@@ -139,8 +217,7 @@ pub(super) fn invite_tag(hmac: &dyn HmacSha256, secret: &[u8; 32], bin: TimeBin)
 
 pub(super) fn progress_key(channel: &DurableChannel, tag_key: &TagKey) -> BinKey {
     BinKey {
-        kind: channel.kind().as_str().into(),
-        address: channel.address().as_str().into(),
+        channel: channel.clone(),
         tag_key: *tag_key,
     }
 }
@@ -353,9 +430,6 @@ pub(super) fn parse_failed(
         "DuplicateIntro" => FailedReason::DuplicateIntro,
         "ConfirmationRejected" => FailedReason::ConfirmationRejected,
         "Equivocation" => FailedReason::Equivocation,
-        "OfferRejected" => FailedReason::OfferRejected,
-        "Kicked" => FailedReason::Kicked,
-        "Left" => FailedReason::Left,
         _ => return Err(EngineError::MalformedPersist),
     };
     Ok((ConversationId::from_bytes(cid), parsed))
@@ -377,11 +451,24 @@ pub(super) fn parse_fold_channel(value: &Json) -> Result<DurableChannel, EngineE
     Ok(DurableChannel::new(kind, address))
 }
 
-pub(super) fn handshake_actor_key(actor_id: &[u8], local_inviter: bool) -> ActorId {
-    if actor_id.is_empty() {
-        ActorId::from_bytes(vec![u8::from(local_inviter)])
-    } else {
-        ActorId::from_bytes(actor_id)
+pub(super) fn actor_for(
+    sort: super::super::payload::ConversationSort,
+    bytes: &[u8],
+) -> Option<super::super::Actor> {
+    use super::super::Actor;
+    use super::super::payload::ConversationSort;
+    match sort {
+        ConversationSort::HandshakeDm | ConversationSort::HandshakeSync => {
+            bytes.is_empty().then_some(Actor::handshake())
+        }
+        ConversationSort::DirectMessage | ConversationSort::Group => {
+            (!bytes.is_empty()).then(|| Actor::signing(bytes.to_vec()))
+        }
+        ConversationSort::Synchronization => {
+            let id: [u8; 32] = bytes.try_into().ok()?;
+            Some(Actor::device(super::super::DeviceId::from_bytes(id)))
+        }
+        ConversationSort::Engine => None,
     }
 }
 
@@ -390,10 +477,10 @@ pub(super) fn conversation_tx_ids(
     conversation_id: ConversationId,
 ) -> BTreeSet<Tag> {
     state
-        .txs
-        .iter()
+        .body_pairs()
+        .into_iter()
         .filter(|(_, body)| body.conversation_id == conversation_id)
-        .map(|(id, _)| *id)
+        .map(|(id, _)| id)
         .collect()
 }
 
@@ -412,8 +499,7 @@ pub(super) fn watermark_of(state: &EngineState, conversation_id: ConversationId)
 
 pub(super) fn tx_watermarked(state: &EngineState, tx_id: Tag) -> bool {
     state
-        .txs
-        .get(&tx_id)
+        .body(&tx_id)
         .is_some_and(|body| watermark_of(state, body.conversation_id).contains(&tx_id))
 }
 
@@ -428,7 +514,7 @@ pub(super) fn payload_expire_at(payload: &TxPayload) -> Option<UnixSeconds> {
 pub(super) fn persist_outside_watermark(state: &EngineState) -> bool {
     let now = state.ticked.unwrap_or_default();
     state.persist_log.values().any(|tx_id| {
-        let Some(body) = state.txs.get(tx_id) else {
+        let Some(body) = state.body(tx_id) else {
             return false;
         };
         if payload_expire_at(&body.payload).is_some_and(|expires| expires <= now) {
@@ -444,11 +530,15 @@ pub(super) fn store_durable_last_ack(
     actor_id: &[u8],
     set_xor: Tag,
 ) {
-    if set_xor_for(&state.txs, conversation_id) != set_xor {
+    if set_xor_for(state.body_pairs(), conversation_id) != set_xor {
         return;
     }
-    let local_inviter = state.is_inviter(conversation_id);
-    let actor = handshake_actor_key(actor_id, local_inviter);
+    let Some(sort) = state.sort_of(conversation_id) else {
+        return;
+    };
+    let Some(actor) = actor_for(sort, actor_id) else {
+        return;
+    };
     let ids = conversation_tx_ids(state, conversation_id);
     if let Some(chains) = state.chains_mut(conversation_id) {
         chains.last_acks.insert(actor, ids);
@@ -482,7 +572,7 @@ pub(super) fn prune_cached_mks(state: &mut EngineState) {
 pub(super) fn annotate_cached_mk(
     state: &mut EngineState,
     cid: ConversationId,
-    actor: &ActorId,
+    actor: &Actor,
     mk: &[u8; 32],
     tx_id: Tag,
 ) {

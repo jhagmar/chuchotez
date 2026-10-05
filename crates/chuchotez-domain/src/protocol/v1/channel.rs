@@ -90,7 +90,7 @@ pub(crate) fn parse_address(value: &str) -> Result<String, AddressError> {
 }
 
 /// Mapper registry key.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Kind(String);
 
 impl Kind {
@@ -116,7 +116,7 @@ impl core::fmt::Debug for Kind {
 }
 
 /// Mapper coordinate. Unicode Normalization Form C, no NUL, no combining mark.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Address(String);
 
 impl Address {
@@ -142,7 +142,7 @@ impl core::fmt::Debug for Address {
 }
 
 /// A mapper destination that stores posted packets for `list`.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct DurableChannel {
     kind: Kind,
     address: Address,

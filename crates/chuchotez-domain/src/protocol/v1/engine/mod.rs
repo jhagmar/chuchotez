@@ -1,5 +1,6 @@
 //! Host-owned handle bound to a v1 [`Suite`] and [`Defaults`].
 
+mod chains;
 mod chat;
 mod fold_tree;
 mod group;
@@ -14,6 +15,7 @@ mod persist;
 mod poll;
 mod query;
 mod ratchet;
+mod row_log;
 mod session;
 mod state;
 mod vault;
@@ -22,12 +24,12 @@ mod vault;
 mod tests;
 
 pub use query::{
-    BlobGet, BlobPut, BlockedIdentity, BlockedMissing, Conversation, ConversationListRow,
-    ConversationRef, DirectMessageQuery, DmEstablished, DurableLocator, DurableWrite,
-    EphemeralLocator, EphemeralWrite, FailedReason, FoldOk, GroupEstablishedView, GroupOfferView,
-    GroupQuery, Handshake, HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk,
-    PingPost, PingTarget, Poll, PresenceView, QueryLocalPrefs, QueryPeerPrefs, SyncEstablishedView,
-    SyncMemberView, SynchronizationQuery, TypingView, WrapDekOk,
+    BlobGet, BlobPut, BlockedIdentity, BlockedMissing, ChatItem, Conversation, ConversationListRow,
+    ConversationRef, DmEstablished, DurableLocator, DurableWrite, EphemeralLocator, EphemeralWrite,
+    FailedReason, FoldOk, GroupEnd, GroupEstablishedView, GroupOfferView, GroupQuery, Handshake,
+    HandshakeInvitee, HandshakeInviter, HistoryItem, MediaDraft, MutateOk, PingPost, PingTarget,
+    Poll, PresenceView, QueryLocalPrefs, QueryPeerPrefs, SyncEstablishedView, SyncMemberView,
+    TypingView, WrapDekOk,
 };
 pub use state::EngineState;
 

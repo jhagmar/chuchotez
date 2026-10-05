@@ -3,8 +3,8 @@
 use super::super::hmac::{HmacSha256Key, expand};
 use super::super::payload::{PACKET_NONCE_LEN, TxPayload};
 use super::super::{
-    AeadKey, AeadNonce, Defaults, DeviceId, DisplayName, EngineError, IdentityId, KemSeed,
-    OnWirePrefs, Policy, Secret, SignSeed, UserId,
+    AeadKey, AeadNonce, ConversationId, Defaults, DeviceId, DisplayName, EngineError, IdentityId,
+    KemSeed, OnWirePrefs, Policy, Secret, SignSeed, UserId,
 };
 use super::helpers::{invitee_intro_for, notice_for};
 use super::party::DeviceConversation;
@@ -27,8 +27,8 @@ impl Engine {
         let mut payloads = Vec::new();
         payloads.extend(
             (!state
-                .txs
-                .values()
+                .bodies()
+                .iter()
                 .any(|t| matches!(t.payload, TxPayload::EngineInit)))
             .then_some(TxPayload::EngineInit),
         );
@@ -46,8 +46,8 @@ impl Engine {
         let user_id = UserId::from(rng.random32());
         let mut payloads = Vec::new();
         if !state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .any(|t| matches!(t.payload, TxPayload::EngineInit))
         {
             payloads.push(TxPayload::EngineInit);
@@ -67,7 +67,7 @@ impl Engine {
         policy: Policy,
     ) -> Result<(MutateOk, IdentityId), EngineError> {
         let secret = self.engine_secret()?;
-        if !state.txs.values().any(
+        if !state.bodies().iter().any(
             |t| matches!(&t.payload, TxPayload::EngineCreateUser { user_id: u } if u == &user_id),
         ) {
             return Err(EngineError::UnknownIds);
@@ -228,15 +228,29 @@ impl Engine {
         }
     }
 
-    /// Kick a linked device.
+    /// Kick a linked device. An id that is not a peer is `UnknownIds`.
     pub fn kick_device(
         &self,
         state: EngineState,
         _rng: &dyn Rng,
         device_id: DeviceId,
     ) -> Result<MutateOk, EngineError> {
-        if state.device.keys.as_ref().and_then(|k| k.id) == Some(device_id) {
+        if state
+            .device
+            .keys
+            .as_ref()
+            .is_some_and(|k| k.id == device_id)
+        {
             return Err(EngineError::WrongPhase);
+        }
+        let known = state.device.conversations.values().any(|node| {
+            matches!(
+                &node.kind,
+                DeviceConversation::Synchronization { peer, .. } if *peer == device_id
+            )
+        });
+        if !known {
+            return Err(EngineError::UnknownIds);
         }
         let secret = self.engine_secret()?;
         #[rustfmt::skip]
@@ -329,10 +343,37 @@ impl Engine {
             return Ok(());
         }
         state.device.kicked.push(device_id);
+        if state
+            .device
+            .keys
+            .as_ref()
+            .is_some_and(|keys| keys.id == device_id)
+        {
+            state
+                .device
+                .conversations
+                .retain(|_, node| !matches!(node.kind, DeviceConversation::Synchronization { .. }));
+            return Ok(());
+        }
         let cids: Vec<_> = state.device.conversations.keys().copied().collect();
+        let mut drop_ids = Vec::new();
+        for cid in &cids {
+            let node = state.device.conversations.get(cid).expect("row");
+            if let DeviceConversation::Synchronization { peer, .. } = &node.kind
+                && *peer == device_id
+            {
+                drop_ids.push(*cid);
+            }
+        }
+        for cid in &drop_ids {
+            state.device.conversations.remove(cid);
+        }
         for cid in cids {
+            if drop_ids.contains(&cid) {
+                continue;
+            }
             let node = state.device.conversations.get_mut(&cid).expect("row");
-            let DeviceConversation::Synchronization { secret, .. } = &mut node.kind else {
+            let DeviceConversation::Synchronization { secret, chains, .. } = &mut node.kind else {
                 continue;
             };
             let mut info = b"chuchotez/1/sync-rekey".to_vec();
@@ -344,12 +385,34 @@ impl Engine {
             )
             .into_bytes();
             *secret = Secret::from_bytes(next);
-            node.chains.send.clear();
-            node.chains.recv.clear();
-            node.chains.skipped_mks.clear();
-            node.chains.live_pending.clear();
+            chains.send.clear();
+            chains.recv.clear();
+            chains.skipped_mks.clear();
+            chains.live_pending.clear();
         }
         Ok(())
+    }
+
+    pub(super) fn note_sync_peer(
+        &self,
+        state: &mut EngineState,
+        cid: ConversationId,
+        actor: &[u8],
+    ) {
+        let Ok(bytes) = <[u8; 32]>::try_from(actor) else {
+            return;
+        };
+        let id = DeviceId::from_bytes(bytes);
+        if state.device.keys.as_ref().is_some_and(|keys| keys.id == id) {
+            return;
+        }
+        let Some(node) = state.device.conversations.get_mut(&cid) else {
+            return;
+        };
+        let DeviceConversation::Synchronization { peer, .. } = &mut node.kind else {
+            return;
+        };
+        *peer = id;
     }
 
     pub(super) fn wrap_sync_dek(
@@ -373,8 +436,8 @@ impl Engine {
     /// Open a sync DEK wrap with this device encryption key and hold that DEK.
     pub fn open_sync_dek(&mut self, state: &EngineState, ct: &[u8]) -> Result<(), EngineError> {
         let policy = state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .find_map(|tx| match &tx.payload {
                 TxPayload::Notice(notice) => Some(notice.policy),
                 _ => None,
@@ -391,6 +454,14 @@ impl Engine {
         let dek = open_sync_dek(self, policy, &sk, ct)?;
         self.dek = Some(AeadKey::from_bytes(dek));
         Ok(())
+    }
+
+    pub(super) fn hold_sync_dek(
+        &mut self,
+        state: &EngineState,
+        ct: &[u8],
+    ) -> Result<(), EngineError> {
+        self.open_sync_dek(state, ct)
     }
 
     /// Set conversation prefs.

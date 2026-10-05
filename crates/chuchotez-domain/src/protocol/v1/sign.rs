@@ -150,6 +150,12 @@ impl core::fmt::Debug for SigningKeyPair {
     }
 }
 
+impl Drop for SigningKeyPair {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
+}
+
 /// Failure from [`Sign::generate`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignError {
@@ -174,6 +180,50 @@ impl core::fmt::Display for SignError {
 }
 
 impl std::error::Error for SignError {}
+
+/// Verification key for one [`Policy`].
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SigningPublicKey(Vec<u8>);
+
+impl SigningPublicKey {
+    /// Bytes whose length already matches `policy`.
+    #[must_use]
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// Accept `bytes` when the length is `sign_pk_len(policy)`.
+    pub fn parse(policy: Policy, bytes: impl Into<Vec<u8>>) -> Option<Self> {
+        let bytes = bytes.into();
+        (bytes.len() == sign_pk_len(policy)).then_some(Self(bytes))
+    }
+
+    /// Raw verification key.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for SigningPublicKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::ops::Deref for SigningPublicKey {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for SigningPublicKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SigningPublicKey(..)")
+    }
+}
 
 /// Generate, sign, and verify for a [`Policy`]. Adapters supply the primitive.
 pub trait Sign {
@@ -202,8 +252,8 @@ pub trait Sign {
 #[cfg(test)]
 mod tests {
     use super::{
-        SIGN_SEED_LEN, SignError, SignSeed, SignSeedBytes, SigningKeyPair, sign_pk_len,
-        sign_sig_len, sign_sk_len,
+        SIGN_SEED_LEN, SignError, SignSeed, SignSeedBytes, SigningKeyPair, SigningPublicKey,
+        sign_pk_len, sign_sig_len, sign_sk_len,
     };
     use crate::protocol::{Policy, RANDOM32_LEN, Random32};
 
@@ -233,6 +283,13 @@ mod tests {
         assert_eq!(sign_sig_len(Policy::Hybrid), 3373);
         let keys = SigningKeyPair::from_parts(vec![1, 2], vec![3, 4]);
         assert_eq!(keys.public_bytes(), &[1, 2]);
+        let parsed = SigningPublicKey::parse(Policy::Classic, vec![0; 32]).expect("pk");
+        assert_eq!(parsed.as_ref(), &[0; 32]);
+        assert!(SigningPublicKey::parse(Policy::Classic, vec![0; 3]).is_none());
+        assert_eq!(
+            format!("{:?}", SigningPublicKey::from_bytes(vec![1])),
+            "SigningPublicKey(..)"
+        );
         assert_eq!(keys.secret_bytes(), &[3, 4]);
         assert_eq!(format!("{keys:?}"), "SigningKeyPair(..)");
         assert!(!format!("{keys:?}").contains('3'));

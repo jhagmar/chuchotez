@@ -1,6 +1,6 @@
 //! XOR binary search for a mismatched transaction set.
 
-use super::super::ActorId;
+use super::super::Actor;
 use super::super::chain::{SendChain, eph_mk, join, mk, seal_packet, set_xor_for, step};
 use super::super::payload::{
     ConversationSort, PacketHealHalfXor, PacketHealHave, PacketHealWant, PacketPlain, time_bin,
@@ -30,7 +30,7 @@ impl Engine {
         let already = state.chains(cid).is_some_and(|c| c.live_until.is_some());
         if let PacketPlain::XorAck(ack) = packet {
             self.settle_live(state, cid, ack.set_xor, now);
-            if set_xor_for(&state.txs, cid) == ack.set_xor {
+            if set_xor_for(state.body_pairs(), cid) == ack.set_xor {
                 self.note_live(state, cid, now);
             }
             self.note_set_xor(state, rng, cid, ack.set_xor)?;
@@ -79,7 +79,7 @@ impl Engine {
         cid: ConversationId,
         remote: Tag,
     ) -> Result<(), EngineError> {
-        let local = set_xor_for(&state.txs, cid);
+        let local = set_xor_for(state.body_pairs(), cid);
         if local == remote {
             if let Some(chains) = state.chains_mut(cid) {
                 chains.heal = Heal::default();
@@ -251,8 +251,7 @@ impl Engine {
             .copied()
             .filter(|id| {
                 state
-                    .txs
-                    .get(id)
+                    .body(id)
                     .is_some_and(|body| body.conversation_id == cid)
             })
             .collect();
@@ -275,8 +274,7 @@ impl Engine {
             .copied()
             .filter(|id| {
                 !state
-                    .txs
-                    .get(id)
+                    .body(id)
                     .is_some_and(|body| body.conversation_id == cid)
             })
             .take(ID_CAP)
@@ -336,7 +334,7 @@ impl Engine {
         } else {
             ConversationSort::HandshakeDm
         };
-        let actor = ActorId::handshake();
+        let actor = Actor::handshake();
         let tag = invite_tag(self.suite.hmac(), secret.as_bytes(), time_bin(now));
         let origin = match state.chains(cid).and_then(|c| c.send.get(&actor).cloned()) {
             Some(chain) => chain,
@@ -421,7 +419,7 @@ impl Engine {
         let chains = state.chains_mut(cid).expect("heal row");
         chains
             .send
-            .insert(ActorId::handshake(), sealed_to.expect("sealed"));
+            .insert(Actor::handshake(), sealed_to.expect("sealed"));
         chains.heal.ready.clear();
         chains.heal.sealed_from = None;
         chains.heal.sealed_to = None;
@@ -449,7 +447,7 @@ impl Engine {
             ConversationSort::HandshakeDm
         };
         let tag = invite_tag(self.suite.hmac(), secret.as_bytes(), time_bin(now));
-        let actor = ActorId::handshake();
+        let actor = Actor::handshake();
         for id in ids {
             #[rustfmt::skip]
             self.write_chain_packets(state, rng, cid, sort, &durable_ch, tag, *id, actor.clone(), false)?;
@@ -468,11 +466,11 @@ fn fallback_due(state: &EngineState, cid: ConversationId, now: UnixSeconds) -> b
     })
 }
 
-fn sealed_matches(chains: &super::state::ConversationChains) -> bool {
+fn sealed_matches(chains: &super::state::PacketChains) -> bool {
     let Some(from) = &chains.heal.sealed_from else {
         return false;
     };
-    match chains.send.get(&ActorId::handshake()) {
+    match chains.send.get(&Actor::handshake()) {
         Some(chain) => same_chain(chain, from),
         None => true,
     }
@@ -508,10 +506,10 @@ fn channels(
 
 fn conv_ids(state: &EngineState, cid: ConversationId) -> Vec<Tag> {
     let mut ids: Vec<Tag> = state
-        .txs
-        .iter()
+        .body_pairs()
+        .into_iter()
         .filter(|(_, body)| body.conversation_id == cid)
-        .map(|(id, _)| *id)
+        .map(|(id, _)| id)
         .collect();
     ids.sort();
     ids

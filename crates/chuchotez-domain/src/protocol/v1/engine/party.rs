@@ -3,7 +3,8 @@
 use super::super::kem::KeyPair;
 use super::super::payload::Ticket;
 use super::super::{Policy, Secret, TimeBin};
-use super::query::FailedReason;
+use super::query::{FailedReason, GroupEnd};
+use super::row_log::{DmTx, LiveGroupTx, SyncHandshakeTx, SyncTx, TxLog};
 
 /// Failure stored on a handshake. Group reasons are not members.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -643,10 +644,16 @@ impl PartyMut<'_> {
 /// Conversation stored on an identity.
 #[derive(Clone, Debug)]
 pub(super) enum IdentityConversation {
-    DmHandshake(DmParty),
+    DmHandshake {
+        party: DmParty,
+        log: TxLog<super::row_log::DmHandshakeTx>,
+        chains: super::chains::PacketChains,
+    },
     DirectMessage {
         secret: Secret,
         parent: super::super::ConversationId,
+        log: TxLog<DmTx>,
+        chains: super::chains::EstablishedChains,
     },
     Group(GroupPhase),
 }
@@ -655,11 +662,11 @@ pub(super) enum IdentityConversation {
 #[derive(Clone, Debug)]
 pub(super) enum GroupPhase {
     /// Owner or accepted member.
-    Live(GroupLive),
+    Live(Box<GroupLive>),
     /// Invitee has the wrapped secret and has not accepted.
     Offer(GroupOffer),
     /// Terminal group failure.
-    Failed(FailedReason),
+    Failed(GroupEnd),
 }
 
 /// Established group membership.
@@ -668,12 +675,14 @@ pub(super) struct GroupLive {
     pub(super) secret: Secret,
     pub(super) name: super::super::DisplayName,
     pub(super) photo: Option<super::super::ProfilePic>,
-    pub(super) owner_signing_pk: Vec<u8>,
+    pub(super) owner_signing_pk: super::super::SigningPublicKey,
     pub(super) persistents: Vec<super::super::DurableChannel>,
     pub(super) ephemerals: Vec<super::super::EphemeralChannel>,
     pub(super) members: Vec<super::super::payload::GroupMember>,
     pub(super) pending: Vec<GroupPending>,
     pub(super) epoch: u64,
+    pub(super) log: TxLog<LiveGroupTx>,
+    pub(super) chains: super::chains::EstablishedChains,
 }
 
 /// Incoming group offer.
@@ -682,15 +691,15 @@ pub(super) struct GroupOffer {
     pub(super) secret: Secret,
     pub(super) name: super::super::DisplayName,
     pub(super) photo: Option<super::super::ProfilePic>,
-    pub(super) owner_signing_pk: Vec<u8>,
+    pub(super) owner_signing_pk: super::super::SigningPublicKey,
     pub(super) from_conversation_id: super::super::ConversationId,
 }
 
 /// Invite not yet accepted.
 #[derive(Clone, Debug)]
 pub(super) struct GroupPending {
-    pub(super) signing_pk: Vec<u8>,
-    pub(super) encryption_pk: Vec<u8>,
+    pub(super) signing_pk: super::super::SigningPublicKey,
+    pub(super) encryption_pk: super::super::EncryptionPublicKey,
     pub(super) from_conversation_id: super::super::ConversationId,
     pub(super) name: super::super::DisplayName,
     pub(super) photo: Option<super::super::ProfilePic>,
@@ -699,9 +708,16 @@ pub(super) struct GroupPending {
 /// Conversation stored on this device.
 #[derive(Clone, Debug)]
 pub(super) enum DeviceConversation {
-    SyncHandshake(SyncParty),
+    SyncHandshake {
+        party: SyncParty,
+        log: TxLog<SyncHandshakeTx>,
+        chains: super::chains::PacketChains,
+    },
     Synchronization {
         secret: Secret,
         parent: super::super::ConversationId,
+        peer: super::super::DeviceId,
+        log: TxLog<SyncTx>,
+        chains: super::chains::EstablishedChains,
     },
 }

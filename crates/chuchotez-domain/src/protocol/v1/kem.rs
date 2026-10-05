@@ -108,6 +108,50 @@ impl core::fmt::Debug for KemSeed {
     }
 }
 
+/// Encapsulation public key for one [`Policy`].
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct EncryptionPublicKey(Vec<u8>);
+
+impl EncryptionPublicKey {
+    /// Bytes whose length already matches `policy`.
+    #[must_use]
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// Accept `bytes` when the length is `kem_pk_len(policy)`.
+    pub fn parse(policy: Policy, bytes: impl Into<Vec<u8>>) -> Option<Self> {
+        let bytes = bytes.into();
+        (bytes.len() == kem_pk_len(policy)).then_some(Self(bytes))
+    }
+
+    /// Raw encapsulation key.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for EncryptionPublicKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::ops::Deref for EncryptionPublicKey {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for EncryptionPublicKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("EncryptionPublicKey(..)")
+    }
+}
+
 /// A `wrap` key pair.
 #[derive(Clone)]
 pub struct KeyPair {
@@ -146,6 +190,12 @@ impl Eq for KeyPair {}
 impl core::fmt::Debug for KeyPair {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("KeyPair(..)")
+    }
+}
+
+impl Drop for KeyPair {
+    fn drop(&mut self) {
+        self.secret.fill(0);
     }
 }
 
@@ -194,7 +244,8 @@ pub trait Kem {
 #[cfg(test)]
 mod tests {
     use super::{
-        KEM_SEED_LEN, KemError, KemSeed, KemSeedBytes, KeyPair, kem_ct_len, kem_pk_len, kem_sk_len,
+        EncryptionPublicKey, KEM_SEED_LEN, KemError, KemSeed, KemSeedBytes, KeyPair, kem_ct_len,
+        kem_pk_len, kem_sk_len,
     };
     use crate::protocol::{Policy, RANDOM32_LEN, Random32};
 
@@ -215,6 +266,13 @@ mod tests {
         assert!(!format!("{seed:?}").contains("ab"));
         let keys = KeyPair::from_parts(vec![1, 2], vec![3, 4]);
         assert_eq!(keys.public_bytes(), &[1, 2]);
+        let parsed = EncryptionPublicKey::parse(Policy::Classic, vec![0; 32]).expect("pk");
+        assert_eq!(parsed.as_ref(), &[0; 32]);
+        assert!(EncryptionPublicKey::parse(Policy::Classic, vec![0; 3]).is_none());
+        assert_eq!(
+            format!("{:?}", EncryptionPublicKey::from_bytes(vec![1])),
+            "EncryptionPublicKey(..)"
+        );
         assert_eq!(keys.secret_bytes(), &[3, 4]);
         assert_eq!(format!("{keys:?}"), "KeyPair(..)");
         assert_eq!(keys, keys.clone());

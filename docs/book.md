@@ -126,7 +126,8 @@ Typing clears 6 ticked seconds after the signal. Reload has empty typing
 and presence. A durable DM send pings the peer `Wake` when that
 subscription is set.
 
-`sendMedia` takes 1..=4 attachments on an established DM. `media_key` is
+`sendMedia` takes 1..=4 attachments on an established DM. Each attachment
+carries the blob kind and address from the caller. `media_key` is
 `expand(conversation_secret, "chuchotez/1/media" || hash)`. `poll.blob_put`
 carries `nonce || seal(media_key, media_bytes)` until `write_blob_ack`.
 `poll.blob_get` lists `TxMedia` locators that are not still being put.
@@ -141,15 +142,19 @@ carries `nonce || seal(media_key, media_bytes)` until `write_blob_ack`.
 stores `Kicked`. `reject_group` stores `OfferRejected`. Leave and delete post
 `TxGroupLeave` and store `Left`. Name, photo, and `disappear_after` are
 owner-only. A durable group transaction pings every member whose latest
-`TxPrefs.wake` is set. The folded snapshot of a live group keeps the secret,
-name, owner, and epoch.
+`TxPrefs.wake` is set. A folded snapshot restores a group's members,
+channels, and photo, along with the secret, name, owner, and epoch.
 
 `create_sync_invite` keeps at most 4 peers besides this device. On confirm
 the inviter seals the DEK to the invitee device encryption key as KEM
 ciphertext, a 12-byte nonce, and an AEAD under
-`expand(shared, "chuchotez/1/sync-dek")`. `open_sync_dek` opens that wrap
-and holds the DEK. `kick_device` of this device is `WrongPhase`. Kicking
-another device drops it from membership and rekeys Sync sending chains.
+`expand(shared, "chuchotez/1/sync-dek")`. On confirm that sealed key is a
+body in `poll`. The other device opens it from the body it ingests and then
+holds that key. A sync intro carries that device's id, and the established
+row stores the peer's id. `kick_device` of this device is `WrongPhase`. An id
+that is not a peer is `UnknownIds`. Kicking
+another device drops that device's link and makes new sending keys for the
+Sync conversations that remain.
 `leave_sync` clears this device's Sync rows. Once a Synchronization exists,
 engine transactions also post on that live path.
 
@@ -163,16 +168,21 @@ A host cycle is `tick`, then `poll`, then mapper post, list, listen, and blob
 transfer, then `ingest_packet` / `ingest_list`, `write_ack`, and
 `write_blob_ack`.
 
+Group chat, the member list, and each wrap of the group secret are sealed
+512-byte bodies on the group's durable channels. They appear in `poll`. A
+member list whose signature does not check is not applied. Invites stay on
+the direct message.
+
 **Rng** is a host port. Engine methods that need entropy take `&dyn Rng`.
 Cryptographic adapters take seeds. This workspace never implements `Rng`.
 `Random32` is `RANDOM32_LEN` (32) branded CSPRNG bytes. `KemSeed` /
 `SignSeed` are 64 bytes from two `Random32` draws.
 
-Query `get_conversation` returns a `Conversation` enum: `Handshake`
-(`HandshakeInviter`, `HandshakeInvitee`, `FailedReason`), `DirectMessageQuery`,
-`GroupQuery`, or `SynchronizationQuery`. `list_conversations` rows carry that
-same `Conversation`. Ticket secret, DEK, and secret keys stay out of that
-query.
+Query `get_conversation` returns a `Conversation` enum: `HandshakeDm` or
+`HandshakeSync` (`HandshakeInviter`, `HandshakeInvitee`, `FailedReason`), an
+established direct message, `GroupQuery`, or an established synchronization.
+`list_conversations` rows carry that same `Conversation`. Ticket secret, DEK,
+and secret keys stay out of that query.
 
 ## Call the library
 

@@ -121,7 +121,7 @@ pub(crate) fn ticket_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tic
     })
 }
 
-fn parse_durable_list(value: &Json) -> Result<Vec<DurableChannel>, ()> {
+pub(crate) fn parse_durable_list(value: &Json) -> Result<Vec<DurableChannel>, ()> {
     let Json::Array(items) = value else {
         return Err(());
     };
@@ -136,7 +136,7 @@ fn parse_durable(value: &Json) -> Result<DurableChannel, ()> {
     Ok(DurableChannel::new(kind, address))
 }
 
-fn parse_ephemeral_list(value: &Json) -> Result<Vec<EphemeralChannel>, ()> {
+pub(crate) fn parse_ephemeral_list(value: &Json) -> Result<Vec<EphemeralChannel>, ()> {
     let Json::Array(items) = value else {
         return Err(());
     };
@@ -171,6 +171,8 @@ pub(crate) fn payload_type(payload: &TxPayload) -> &'static str {
     match payload {
         TxPayload::Notice(_) => "v1-handshake-notice",
         TxPayload::InviterIntro(_) => "v1-handshake-inviter-intro",
+        TxPayload::SyncInviterIntro(_) => "v1-sync-inviter-intro",
+        TxPayload::SyncInviteeIntro(_) => "v1-sync-invitee-intro",
         TxPayload::InviteeIntro(_) => "v1-handshake-invitee-intro",
         TxPayload::Confirm => "v1-handshake-confirm",
         TxPayload::Reject => "v1-handshake-reject",
@@ -205,6 +207,7 @@ pub(crate) fn payload_type(payload: &TxPayload) -> &'static str {
         TxPayload::EngineSetProfilePic { .. } => "v1-engine-set-profile-pic",
         TxPayload::EngineSetDeviceName { .. } => "v1-engine-set-device-name",
         TxPayload::EngineKickDevice { .. } => "v1-engine-kick-device",
+        TxPayload::SyncDek { .. } => "v1-sync-dek",
     }
 }
 
@@ -304,6 +307,9 @@ pub(crate) fn payload_to_json(b64u: &dyn Base64Url, payload: &TxPayload) -> Json
         TxPayload::EngineKickDevice { device_id } => {
             members.push(("device_id".into(), bstr(b64u, device_id.as_bytes())));
         }
+        TxPayload::SyncDek { ct } => {
+            members.push(("ct".into(), bstr(b64u, ct)));
+        }
         TxPayload::Text(t) => {
             members.push(("body".into(), Json::String(t.body.clone())));
             members.push((
@@ -361,6 +367,14 @@ pub(crate) fn payload_to_json(b64u: &dyn Base64Url, payload: &TxPayload) -> Json
         }
         TxPayload::InviterIntro(i) => members.extend(intro_fields(b64u, i, false)),
         TxPayload::InviteeIntro(i) => members.extend(invitee_fields(b64u, i)),
+        TxPayload::SyncInviterIntro(s) => {
+            members.extend(intro_fields(b64u, &s.intro, false));
+            members.push(("device_id".into(), bstr(b64u, s.device_id.as_bytes())));
+        }
+        TxPayload::SyncInviteeIntro(s) => {
+            members.extend(invitee_fields(b64u, &s.intro));
+            members.push(("device_id".into(), bstr(b64u, s.device_id.as_bytes())));
+        }
         TxPayload::Media(m) => members.extend(media_fields(b64u, m)),
         TxPayload::Prefs(p) => members.extend(prefs_fields(b64u, p)),
         TxPayload::GroupInvite(g) => members.extend(group_invite_fields(b64u, g)),
@@ -759,57 +773,87 @@ fn parse_opt_str(value: &Json) -> Result<Option<String>, ()> {
     }
 }
 
-fn parse_intro(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxInviterIntro, ()> {
-    extra_ok(
-        m,
-        &[
-            "type",
-            "name",
-            "profile_pic",
-            "send_tag_key",
-            "eph_send_tag_key",
-            "encryption_pk",
-            "signing_pk",
-            "seed_ct",
-            "prefs",
-        ],
-    )?;
+fn take_enc(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    key: &str,
+) -> Result<crate::protocol::v1::EncryptionPublicKey, ()> {
+    #[rustfmt::skip]
+    let pk = crate::protocol::v1::EncryptionPublicKey::from_bytes(get_bstr(b64u, m, key)?);
+    Ok(pk)
+}
+
+fn take_sign(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    key: &str,
+) -> Result<crate::protocol::v1::SigningPublicKey, ()> {
+    #[rustfmt::skip]
+    let pk = crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(b64u, m, key)?);
+    Ok(pk)
+}
+
+fn parse_intro(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    sync: bool,
+) -> Result<TxInviterIntro, ()> {
+    let mut keys = vec![
+        "type",
+        "name",
+        "profile_pic",
+        "send_tag_key",
+        "eph_send_tag_key",
+        "encryption_pk",
+        "signing_pk",
+        "seed_ct",
+        "prefs",
+    ];
+    if sync {
+        keys.push("device_id");
+    }
+    extra_ok(m, &keys)?;
     Ok(TxInviterIntro {
         name: parse_name(get_str(m, "name")?)?,
         profile_pic: parse_pic(b64u, get(m, "profile_pic")?)?,
         send_tag_key: id32(get_bstr(b64u, m, "send_tag_key")?, TagKey::from_bytes)?,
         eph_send_tag_key: id32(get_bstr(b64u, m, "eph_send_tag_key")?, TagKey::from_bytes)?,
-        encryption_pk: get_bstr(b64u, m, "encryption_pk")?,
-        signing_pk: get_bstr(b64u, m, "signing_pk")?,
+        encryption_pk: take_enc(b64u, m, "encryption_pk")?,
+        signing_pk: take_sign(b64u, m, "signing_pk")?,
         seed_ct: get_bstr(b64u, m, "seed_ct")?,
         prefs: parse_prefs(b64u, get(m, "prefs")?)?,
     })
 }
 
-fn parse_invitee(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxInviteeIntro, ()> {
-    extra_ok(
-        m,
-        &[
-            "type",
-            "name",
-            "profile_pic",
-            "send_tag_key",
-            "eph_send_tag_key",
-            "encryption_pk",
-            "signing_pk",
-            "intake_pk",
-            "seed_ct",
-            "prefs",
-        ],
-    )?;
+fn parse_invitee(
+    b64u: &dyn Base64Url,
+    m: &[(String, Json)],
+    sync: bool,
+) -> Result<TxInviteeIntro, ()> {
+    let mut keys = vec![
+        "type",
+        "name",
+        "profile_pic",
+        "send_tag_key",
+        "eph_send_tag_key",
+        "encryption_pk",
+        "signing_pk",
+        "intake_pk",
+        "seed_ct",
+        "prefs",
+    ];
+    if sync {
+        keys.push("device_id");
+    }
+    extra_ok(m, &keys)?;
     Ok(TxInviteeIntro {
         name: parse_name(get_str(m, "name")?)?,
         profile_pic: parse_pic(b64u, get(m, "profile_pic")?)?,
         send_tag_key: id32(get_bstr(b64u, m, "send_tag_key")?, TagKey::from_bytes)?,
         eph_send_tag_key: id32(get_bstr(b64u, m, "eph_send_tag_key")?, TagKey::from_bytes)?,
-        encryption_pk: get_bstr(b64u, m, "encryption_pk")?,
-        signing_pk: get_bstr(b64u, m, "signing_pk")?,
-        intake_pk: get_bstr(b64u, m, "intake_pk")?,
+        encryption_pk: take_enc(b64u, m, "encryption_pk")?,
+        signing_pk: take_sign(b64u, m, "signing_pk")?,
+        intake_pk: take_enc(b64u, m, "intake_pk")?,
         seed_ct: get_bstr(b64u, m, "seed_ct")?,
         prefs: parse_prefs(b64u, get(m, "prefs")?)?,
     })
@@ -861,12 +905,12 @@ fn parse_group_invite(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxGr
     )?;
     Ok(TxGroupInvite {
         group_id: id32(get_bstr(b64u, m, "group_id")?, ConversationId::from_bytes)?,
-        owner_signing_pk: get_bstr(b64u, m, "owner_signing_pk")?,
+        owner_signing_pk: take_sign(b64u, m, "owner_signing_pk")?,
         persistents: parse_durable_list(get(m, "persistents")?)?,
         ephemerals: parse_ephemeral_list(get(m, "ephemerals")?)?,
         name: parse_name(get_str(m, "name")?)?,
         photo: parse_pic(b64u, get(m, "photo")?)?,
-        invitee_signing_pk: get_bstr(b64u, m, "invitee_signing_pk")?,
+        invitee_signing_pk: take_sign(b64u, m, "invitee_signing_pk")?,
         group_secret_ct: get_bstr(b64u, m, "group_secret_ct")?,
     })
 }
@@ -889,8 +933,8 @@ fn parse_roster(b64u: &dyn Base64Url, m: &[(String, Json)]) -> Result<TxGroupRos
             ],
         )?;
         members.push(GroupMember {
-            signing_pk: get_bstr(b64u, im, "signing_pk")?,
-            encryption_pk: get_bstr(b64u, im, "encryption_pk")?,
+            signing_pk: take_sign(b64u, im, "signing_pk")?,
+            encryption_pk: take_enc(b64u, im, "encryption_pk")?,
             send_tag_key: id32(get_bstr(b64u, im, "send_tag_key")?, TagKey::from_bytes)?,
             eph_send_tag_key: id32(get_bstr(b64u, im, "eph_send_tag_key")?, TagKey::from_bytes)?,
         });
@@ -920,14 +964,26 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
             )?;
             Ok(TxPayload::Notice(TxNotice {
                 policy: parse_policy(get_str(m, "policy")?).ok_or(())?,
-                intake_pk: get_bstr(b64u, m, "intake_pk")?,
+                intake_pk: take_enc(b64u, m, "intake_pk")?,
                 persistents: parse_durable_list(get(m, "persistents")?)?,
                 ephemerals: parse_ephemeral_list(get(m, "ephemerals")?)?,
                 expires: UnixSeconds::from_u64(get_u64(m, "expires")?),
             }))
         }
-        "v1-handshake-inviter-intro" => Ok(TxPayload::InviterIntro(parse_intro(b64u, m)?)),
-        "v1-handshake-invitee-intro" => Ok(TxPayload::InviteeIntro(parse_invitee(b64u, m)?)),
+        "v1-handshake-inviter-intro" => Ok(TxPayload::InviterIntro(parse_intro(b64u, m, false)?)),
+        "v1-sync-inviter-intro" => Ok(TxPayload::SyncInviterIntro(
+            super::payload::SyncInviterIntro {
+                intro: parse_intro(b64u, m, true)?,
+                device_id: id32(get_bstr(b64u, m, "device_id")?, DeviceId::from_bytes)?,
+            },
+        )),
+        "v1-sync-invitee-intro" => Ok(TxPayload::SyncInviteeIntro(
+            super::payload::SyncInviteeIntro {
+                intro: parse_invitee(b64u, m, true)?,
+                device_id: id32(get_bstr(b64u, m, "device_id")?, DeviceId::from_bytes)?,
+            },
+        )),
+        "v1-handshake-invitee-intro" => Ok(TxPayload::InviteeIntro(parse_invitee(b64u, m, false)?)),
         "v1-handshake-confirm" => {
             extra_ok(m, &["type"])?;
             Ok(TxPayload::Confirm)
@@ -981,7 +1037,7 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
         "v1-advertise" => {
             extra_ok(m, &["type", "encaps_pk"])?;
             Ok(TxPayload::Advertise {
-                encaps_pk: get_bstr(b64u, m, "encaps_pk")?,
+                encaps_pk: take_enc(b64u, m, "encaps_pk")?,
             })
         }
         "v1-wrap" => {
@@ -1029,8 +1085,8 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
         "v1-group-wrap" => {
             extra_ok(m, &["type", "to", "from", "kem_ct"])?;
             Ok(TxPayload::GroupWrap(TxGroupWrap {
-                to: get_bstr(b64u, m, "to")?,
-                from: get_bstr(b64u, m, "from")?,
+                to: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(b64u, m, "to")?),
+                from: crate::protocol::v1::SigningPublicKey::from_bytes(get_bstr(b64u, m, "from")?),
                 kem_ct: get_bstr(b64u, m, "kem_ct")?,
             }))
         }
@@ -1041,7 +1097,7 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
         "v1-group-kick" => {
             extra_ok(m, &["type", "signing_pk"])?;
             Ok(TxPayload::GroupKick {
-                signing_pk: get_bstr(b64u, m, "signing_pk")?,
+                signing_pk: take_sign(b64u, m, "signing_pk")?,
             })
         }
         "v1-engine-init" => {
@@ -1126,6 +1182,12 @@ pub(crate) fn payload_from_json(b64u: &dyn Base64Url, value: &Json) -> Result<Tx
             extra_ok(m, &["type", "device_id"])?;
             Ok(TxPayload::EngineKickDevice {
                 device_id: id32(get_bstr(b64u, m, "device_id")?, DeviceId::from_bytes)?,
+            })
+        }
+        "v1-sync-dek" => {
+            extra_ok(m, &["type", "ct"])?;
+            Ok(TxPayload::SyncDek {
+                ct: get_bstr(b64u, m, "ct")?,
             })
         }
         _ => Err(()),
@@ -1725,7 +1787,7 @@ mod tests {
         roundtrip(TxPayload::GroupLeave);
         roundtrip(TxPayload::Notice(TxNotice {
             policy: Policy::Hybrid,
-            intake_pk: vec![1, 2, 3],
+            intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1, 2, 3]),
             persistents: vec![ch()],
             ephemerals: vec![eph()],
             expires: UnixSeconds::from_u64(9),
@@ -1735,8 +1797,8 @@ mod tests {
             profile_pic: Some(webp()),
             send_tag_key: tk,
             eph_send_tag_key: tk,
-            encryption_pk: vec![9],
-            signing_pk: vec![8],
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![9]),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![8]),
             seed_ct: vec![7],
             prefs: prefs(),
         }));
@@ -1745,9 +1807,9 @@ mod tests {
             profile_pic: None,
             send_tag_key: tk,
             eph_send_tag_key: tk,
-            encryption_pk: vec![9],
-            signing_pk: vec![8],
-            intake_pk: vec![6],
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![9]),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![8]),
+            intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![6]),
             seed_ct: vec![7],
             prefs: prefs(),
         }));
@@ -1784,7 +1846,9 @@ mod tests {
             reply_to: Some(tag),
             expire_at: Some(UnixSeconds::from_u64(9)),
         }));
-        roundtrip(TxPayload::Advertise { encaps_pk: vec![1] });
+        roundtrip(TxPayload::Advertise {
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
+        });
         roundtrip(TxPayload::Wrap { kem_ct: vec![2] });
         roundtrip(TxPayload::Ack { ratchet_ack: tag });
         roundtrip(TxPayload::Name { name: name() });
@@ -1795,12 +1859,12 @@ mod tests {
         roundtrip(TxPayload::Prefs(prefs()));
         roundtrip(TxPayload::GroupInvite(TxGroupInvite {
             group_id: ConversationId::from_bytes([5; 32]),
-            owner_signing_pk: vec![1],
+            owner_signing_pk: crate::protocol::v1::sign::SigningPublicKey::from_bytes(vec![1]),
             persistents: vec![ch()],
             ephemerals: Vec::new(),
             name: name(),
             photo: None,
-            invitee_signing_pk: vec![2],
+            invitee_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![2]),
             group_secret_ct: vec![3],
         }));
         roundtrip(TxPayload::GroupAccept {
@@ -1812,20 +1876,20 @@ mod tests {
         roundtrip(TxPayload::GroupRoster(TxGroupRoster {
             epoch: 1,
             members: vec![GroupMember {
-                signing_pk: vec![1],
-                encryption_pk: vec![2],
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1]),
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![2]),
                 send_tag_key: tk,
                 eph_send_tag_key: tk,
             }],
             sig: vec![9],
         }));
         roundtrip(TxPayload::GroupWrap(TxGroupWrap {
-            to: vec![1],
-            from: vec![2],
+            to: crate::protocol::v1::sign::SigningPublicKey::from_bytes(vec![1]),
+            from: crate::protocol::v1::sign::SigningPublicKey::from_bytes(vec![2]),
             kem_ct: vec![3],
         }));
         roundtrip(TxPayload::GroupKick {
-            signing_pk: vec![1],
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1]),
         });
         roundtrip(TxPayload::EngineCreateUser {
             user_id: UserId::from_bytes([1; 32]),
@@ -1874,6 +1938,7 @@ mod tests {
         roundtrip(TxPayload::EngineKickDevice {
             device_id: DeviceId::from_bytes([9; 32]),
         });
+        roundtrip(TxPayload::SyncDek { ct: vec![1, 2, 3] });
         let wake = Wake::try_new(
             "https://push.example/x",
             &[3u8; 65],
@@ -1985,7 +2050,7 @@ mod tests {
         for p in [
             TxPayload::Notice(TxNotice {
                 policy: Policy::Classic,
-                intake_pk: vec![1],
+                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
                 persistents: vec![ch()],
                 ephemerals: vec![eph()],
                 expires: UnixSeconds::from_u64(1),
@@ -1995,8 +2060,8 @@ mod tests {
                 profile_pic: None,
                 send_tag_key: tk,
                 eph_send_tag_key: tk,
-                encryption_pk: vec![1],
-                signing_pk: vec![2],
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![2]),
                 seed_ct: vec![3],
                 prefs: prefs(),
             }),
@@ -2005,9 +2070,9 @@ mod tests {
                 profile_pic: None,
                 send_tag_key: tk,
                 eph_send_tag_key: tk,
-                encryption_pk: vec![1],
-                signing_pk: vec![2],
-                intake_pk: vec![3],
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![1]),
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![2]),
+                intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![3]),
                 seed_ct: vec![4],
                 prefs: prefs(),
             }),
@@ -2024,12 +2089,12 @@ mod tests {
             }),
             TxPayload::GroupInvite(TxGroupInvite {
                 group_id: ConversationId::from_bytes([5; 32]),
-                owner_signing_pk: vec![1],
+                owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1]),
                 persistents: vec![ch()],
                 ephemerals: Vec::new(),
                 name: name(),
                 photo: None,
-                invitee_signing_pk: vec![2],
+                invitee_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![2]),
                 group_secret_ct: vec![3],
             }),
             TxPayload::EngineCreateIdentity {
@@ -2060,8 +2125,8 @@ mod tests {
             &TxPayload::GroupRoster(TxGroupRoster {
                 epoch: 1,
                 members: vec![GroupMember {
-                    signing_pk: vec![1],
-                    encryption_pk: vec![2],
+                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1]),
+                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![2]),
                     send_tag_key: tk,
                     eph_send_tag_key: tk,
                 }],
@@ -2075,8 +2140,8 @@ mod tests {
             &TxPayload::GroupRoster(TxGroupRoster {
                 epoch: 1,
                 members: vec![GroupMember {
-                    signing_pk: vec![1],
-                    encryption_pk: vec![2],
+                    signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![1]),
+                    encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![2]),
                     send_tag_key: tk,
                     eph_send_tag_key: tk,
                 }],

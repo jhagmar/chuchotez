@@ -919,7 +919,9 @@ the same txs also travel on the Sync live path.
 Sort-constrained inner value.
 
 ```
-TxPayload = TxNotice / TxInviterIntro / TxInviteeIntro / TxConfirm / TxReject
+TxPayload = TxNotice / TxInviterIntro / TxInviteeIntro
+          / TxSyncInviterIntro / TxSyncInviteeIntro
+          / TxConfirm / TxReject
           / TxText / TxEdit / TxRemove / TxReaction
           / TxRead / TxDelivered / TxMedia
           / TxAdvertise / TxWrap / TxAck
@@ -930,6 +932,7 @@ TxPayload = TxNotice / TxInviterIntro / TxInviteeIntro / TxConfirm / TxReject
           / TxEngineCreateIdentity / TxEngineDeleteUser / TxEngineDeleteIdentity
           / TxEngineSetDisplayName / TxEngineUnsetDisplayName
           / TxEngineSetProfilePic / TxEngineSetDeviceName / TxEngineKickDevice
+          / TxSyncDek
 ```
 
 Handshake durable payloads: `TxNotice`, `TxInviterIntro`, `TxInviteeIntro`,
@@ -940,9 +943,10 @@ DM durable payloads: `TxText`, `TxEdit`, `TxRemove`, `TxReaction`, `TxRead`,
 durable payloads: `TxText`, `TxEdit`, `TxRemove`, `TxReaction`, `TxRead`,
 `TxDelivered`, `TxMedia`, `TxAdvertise`, `TxWrap`, `TxAck`, `TxName`,
 `TxPhoto`, `TxPrefs`, `TxGroupRoster`, `TxGroupWrap`, `TxGroupLeave`,
-`TxGroupKick`. Sync handshake
-uses the handshake payloads. Synchronization durable payloads are engine
-payloads and device `TxName`. Engine payloads are the `TxEngine*` sorts.
+`TxGroupKick`. Sync handshake payloads are `TxNotice`, `TxSyncInviterIntro`,
+`TxSyncInviteeIntro`, `TxConfirm`, `TxReject`, and `TxSyncDek`. Synchronization
+durable payloads are engine payloads and device `TxName`. Engine payloads are
+the `TxEngine*` sorts.
 
 #### TxNotice
 
@@ -995,6 +999,30 @@ TxInviteeIntro = {
 }
 ```
 
+#### TxSyncInviterIntro
+
+Sync inviter intro. `device_id` is that device.
+
+```
+TxSyncInviterIntro = {
+  intro: TxInviterIntro,
+  device_id: DeviceId,
+}
+```
+
+#### TxSyncInviteeIntro
+
+Sync invitee intro. `device_id` is that device.
+
+```
+TxSyncInviteeIntro = {
+  intro: TxInviteeIntro,
+  device_id: DeviceId,
+}
+```
+
+`J` writes the intro members and `device_id` on one object.
+
 `seed_ct` is `wrap` to the peer intake `pk` of a `random32()` seed. `shared`
 is `unwrap` of that `kem_ct`. Spawn secret:
 
@@ -1015,7 +1043,8 @@ fingerprint = mac(expand(ticket.secret, established_label),
 ```
 
 `intro_lo` / `intro_hi` are the inviter and invitee intro values ordered by
-`signing_pk` bytes. `established_label` is `"chuchotez/1/handshake-dm-established"` or
+`signing_pk` bytes. On a sync handshake those values are `TxSyncInviterIntro`
+and `TxSyncInviteeIntro`. `established_label` is `"chuchotez/1/handshake-dm-established"` or
 `"chuchotez/1/handshake-sync-established"`. `confirmationDigest` is
 `text(fingerprint)`.
 
@@ -1090,7 +1119,8 @@ the snapshot. Sync gossips unexpired txs. Relays follow the 72-bin TTL.
 
 `TxMedia` locates sealed bytes at a blob mapper. `hash` is `hash` of the
 plaintext. `kind`, `address`, and `tag` are the GET/PUT locator (example Kind
-`blossom`). Mime allowlist is host UI. `sendMedia` mints one `TxMedia` per
+`blossom`). `sendMedia` copies `kind` and `address` from the caller onto each
+`TxMedia`. Mime allowlist is host UI. `sendMedia` mints one `TxMedia` per
 attachment (length 1..=4). EngineState holds the pointer. Host cache holds
 plaintext after `open`.
 
@@ -1141,7 +1171,7 @@ TxGroupInvite = {
   name: DisplayName,
   photo: ProfilePic / nil,
   invitee_signing_pk: SigningPublicKey,
-  group_secret_ct: KemCiphertext,
+  group_secret_ct: bstr,
 }
 
 TxGroupAccept = {
@@ -1175,8 +1205,9 @@ GroupMember = {
 }
 ```
 
-`group_secret_ct` is `wrap` of `group_secret` to the invitee
-`encryption_pk`. `TxGroupRoster.sig` is `sign(owner_sk, canonical(roster_body))`
+`group_secret_ct` is the KEM ciphertext, a 12-byte nonce, and an AEAD of
+`group_secret` under `expand(shared, "chuchotez/1/group-secret")`.
+`TxGroupRoster.sig` is `sign(owner_sk, canonical(roster_body))`
 where `roster_body` is `TxGroupRoster` with `sig` empty bytes of the Policy
 `sig` length. Creator mints `group_secret` and `group_id` with `random32()`, genesis
 Persistent/Ephemeral lists (omitted copies `Defaults`), and the creator
@@ -1248,7 +1279,16 @@ TxEngineSetDeviceName = {
 TxEngineKickDevice = {
   device_id: DeviceId,
 }
+
+TxSyncDek = {
+  ct: bstr,
+}
 ```
+
+`ct` is the KEM ciphertext, a 12-byte nonce, and an AEAD of the DEK under
+`expand(shared, "chuchotez/1/sync-dek")`. On confirm the inviter posts that
+body in `poll`. The other device opens it from the ingested body and holds
+the DEK.
 
 An empty `EngineState` (no engine txs) accepts `createUser`, `setDefaults`,
 and `receiveSyncTicket`. `createUser` and `setDefaults` mint `TxEngineInit`
@@ -1259,20 +1299,21 @@ if absent, then their payload. `TxEngineInit` is minted once.
 One durable row in query `messages`.
 
 ```
+ChatItem = Text(TxText) / Edit(TxEdit) / Remove({ target: Tag }) /
+  Reaction(TxReaction) / Read({ up_to: Tag }) / Delivered({ up_to: Tag }) /
+  Media(TxMedia)
+
 HistoryItem = {
   tx_id: Tag,
   sender: bstr,
   hlc: Hlc,
-  payload: TxPayload,
+  item: ChatItem,
   expire_at: UnixSeconds / nil,
 }
 ```
 
 `sender` is `SigningPublicKey` or `DeviceId`. `messages` is the most recent
-1000 durable items after `(hlc, tx_id)` sort. Handshake payloads,
-`TxAdvertise`, `TxWrap`, `TxAck`, `TxName`, `TxPhoto`, `TxPrefs`, `TxGroupInvite`,
-`TxGroupAccept`, `TxGroupReject`, `TxGroupRoster`, `TxGroupWrap`, and engine
-payloads are omitted from `messages`.
+1000 durable items after `(hlc, tx_id)` sort.
 
 #### Sending chain
 
@@ -1442,6 +1483,8 @@ refuses an unknown `"type"`.
 | TxNotice | `"v1-handshake-notice"` |
 | TxInviterIntro | `"v1-handshake-inviter-intro"` |
 | TxInviteeIntro | `"v1-handshake-invitee-intro"` |
+| TxSyncInviterIntro | `"v1-sync-inviter-intro"` |
+| TxSyncInviteeIntro | `"v1-sync-invitee-intro"` |
 | TxConfirm | `"v1-handshake-confirm"` |
 | TxReject | `"v1-handshake-reject"` |
 | TxText | `"v1-text"` |
@@ -1475,6 +1518,7 @@ refuses an unknown `"type"`.
 | TxEngineSetProfilePic | `"v1-engine-set-profile-pic"` |
 | TxEngineSetDeviceName | `"v1-engine-set-device-name"` |
 | TxEngineKickDevice | `"v1-engine-kick-device"` |
+| TxSyncDek | `"v1-sync-dek"` |
 | VaultHeader | `"v1-vault-header"` |
 
 **Packet.** Mapper body:
@@ -1668,13 +1712,24 @@ type MediaDraft = {
   mediaBytes: Uint8Array
   mime: string
   filename: string
+  kind: Kind
+  address: Address
 }
+
+type ChatItem =
+  | { kind: "Text"; value: TxText }
+  | { kind: "Edit"; value: TxEdit }
+  | { kind: "Remove"; target: Uint8Array }
+  | { kind: "Reaction"; value: TxReaction }
+  | { kind: "Read"; upTo: Uint8Array }
+  | { kind: "Delivered"; upTo: Uint8Array }
+  | { kind: "Media"; value: TxMedia }
 
 type HistoryItem = {
   txId: Uint8Array
   sender: Uint8Array
   hlc: { wallMs: number; counter: number }
-  payload: unknown
+  item: ChatItem
   expireAt: UnixSeconds | null
 }
 
@@ -1784,35 +1839,25 @@ type FailedReason =
   | { reason: "DuplicateIntro" }
   | { reason: "ConfirmationRejected" }
   | { reason: "Equivocation" }
-  | { reason: "OfferRejected" }
-  | { reason: "Kicked" }
-  | { reason: "Left" }
+
+type GroupEnd = { reason: "OfferRejected" } | { reason: "Kicked" } | { reason: "Left" }
 
 type Handshake =
   | ({ role: "Inviter" } & HandshakeInviter)
   | ({ role: "Invitee" } & HandshakeInvitee)
   | ({ role: "Failed" } & FailedReason)
 
-type DirectMessageQuery =
-  | { phase: "Established"; value: DmEstablished }
-  | { phase: "Failed"; value: FailedReason }
-
 type GroupQuery =
   | { phase: "GroupOffer"; value: GroupOffer }
   | { phase: "GroupEstablished"; value: GroupEstablished }
-  | { phase: "GroupFailed"; value: FailedReason }
-
-type SynchronizationQuery =
-  | { phase: "Handshake"; value: Handshake }
-  | { phase: "SyncEstablished"; value: SyncEstablished }
-  | { phase: "Failed"; value: FailedReason }
+  | { phase: "GroupFailed"; value: GroupEnd }
 
 type Conversation =
   | { sort: "HandshakeDm"; value: Handshake }
   | { sort: "HandshakeSync"; value: Handshake }
-  | { sort: "DirectMessage"; value: DirectMessageQuery }
+  | { sort: "DirectMessage"; value: DmEstablished }
   | { sort: "Group"; value: GroupQuery }
-  | { sort: "Synchronization"; value: SynchronizationQuery }
+  | { sort: "Synchronization"; value: SyncEstablished }
 
 declare class Engine {
   constructor(defaults: Defaults)
@@ -2064,7 +2109,9 @@ Owner is in the roster immediately (`GroupEstablished`). Parallel
 `TxGroupInvite` on each named DM. Member cap 32 including owner. Device cap 5
 including the inviter. `addGroupMember` of a pending invitee is `WrongPhase`.
 `kickGroupMember` on a `GroupOffer` contact drops the offer. `kickDevice` of
-this device is `WrongPhase`; `leaveSync` unlinks this device. Last remaining
+this device is `WrongPhase`. Removing another device drops that device's link
+and makes new sending keys for the conversations that remain. `leaveSync`
+unlinks this device. Last remaining
 device after leave/kick is legal. `receiveSyncTicket` is `EmptyEngineRequired`
 unless EngineState has no users. Until an engine `TxEngineCreateUser` tx is merged,
 `getConversation` and `listConversations` for that Sync handshake use `userId`

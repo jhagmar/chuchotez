@@ -8,7 +8,7 @@ use super::super::payload::{
     PACKET_MAX_UNCOMPRESSED, PacketPlain, TxInviteeIntro, TxInviterIntro, TxPayload, time_bin,
 };
 use super::super::{
-    ActorId, Address, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex,
+    Actor, Address, ConversationId, DurableChannel, EngineError, EphemeralChannel, FragIndex,
     IdentityId, KemSeed, Kind, OnWirePrefs, Policy, Secret, SignSeed, Tag, TagKey, TimeBin,
     UnixSeconds, UserId,
 };
@@ -23,6 +23,39 @@ use super::{
 };
 use crate::protocol::Rng;
 use std::collections::{BTreeMap, BTreeSet};
+
+fn fingerprint_payloads(
+    state: &EngineState,
+    conversation_id: ConversationId,
+    inviter: &TxInviterIntro,
+    invitee: &TxInviteeIntro,
+) -> Option<(TxPayload, TxPayload)> {
+    let (inviter_payload, invitee_payload) = if state.is_sync(conversation_id) {
+        let mut inviter_payload = None;
+        let mut invitee_payload = None;
+        for tx in state.bodies().iter() {
+            if tx.conversation_id != conversation_id {
+                continue;
+            }
+            match &tx.payload {
+                TxPayload::SyncInviterIntro(_) => inviter_payload = Some(tx.payload.clone()),
+                TxPayload::SyncInviteeIntro(_) => invitee_payload = Some(tx.payload.clone()),
+                _ => continue,
+            }
+        }
+        (inviter_payload?, invitee_payload?)
+    } else {
+        (
+            TxPayload::InviterIntro(inviter.clone()),
+            TxPayload::InviteeIntro(invitee.clone()),
+        )
+    };
+    if inviter.signing_pk <= invitee.signing_pk {
+        Some((inviter_payload, invitee_payload))
+    } else {
+        Some((invitee_payload, inviter_payload))
+    }
+}
 
 pub(super) enum HitChannel<'a> {
     Durable(&'a DurableChannel),
@@ -61,11 +94,11 @@ impl Engine {
         if state.established_secret(conversation_id).is_some() {
             if state.is_sync(conversation_id) {
                 return Some(Conversation::Synchronization(
-                    SynchronizationQuery::SyncEstablished(self.sync_view(state, conversation_id)),
+                    self.sync_view(state, conversation_id),
                 ));
             }
             return Some(Conversation::DirectMessage(
-                DirectMessageQuery::Established(self.dm_view(state, conversation_id)),
+                self.dm_view(state, conversation_id),
             ));
         }
         let party = state.party(conversation_id)?;
@@ -93,11 +126,13 @@ impl Engine {
         let mut members = Vec::new();
         if let Some(keys) = &state.device.keys {
             members.push(super::SyncMemberView {
-                device_id: keys
-                    .id
-                    .unwrap_or(super::super::DeviceId::from_bytes([0; 32])),
-                signing_pk: keys.sign.public_bytes().to_vec(),
-                encryption_pk: keys.enc.public_bytes().to_vec(),
+                device_id: keys.id,
+                signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(
+                    keys.sign.public_bytes().to_vec(),
+                ),
+                encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(
+                    keys.enc.public_bytes().to_vec(),
+                ),
                 name: device_name.clone(),
                 last_active: None,
             });
@@ -107,26 +142,34 @@ impl Engine {
             .keys
             .as_ref()
             .map(|keys| keys.sign.public_bytes().to_vec());
-        if let Some(parent) = parent {
+        let peer_device = state
+            .device
+            .conversations
+            .get(&cid)
+            .and_then(|node| match &node.kind {
+                super::party::DeviceConversation::Synchronization { peer, .. } => Some(*peer),
+                super::party::DeviceConversation::SyncHandshake { .. } => None,
+            });
+        if let (Some(parent), Some(peer_device)) = (parent, peer_device) {
             if let Some(intro) = inviter_intro_for(state, parent)
                 && local_sign
                     .as_ref()
-                    .is_none_or(|signing| signing != &intro.signing_pk)
+                    .is_none_or(|signing| signing.as_slice() != intro.signing_pk.as_bytes())
             {
                 members.push(super::SyncMemberView {
-                    device_id: super::super::DeviceId::from_bytes([0; 32]),
+                    device_id: peer_device,
                     signing_pk: intro.signing_pk.clone(),
                     encryption_pk: intro.encryption_pk.clone(),
                     name: intro.name.clone(),
-                    last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                    last_active: state.established(cid).and_then(|chains| chains.presence_at),
                 });
             } else if let Some(intro) = invitee_intro_for(state, parent) {
                 members.push(super::SyncMemberView {
-                    device_id: super::super::DeviceId::from_bytes([0; 32]),
+                    device_id: peer_device,
                     signing_pk: intro.signing_pk.clone(),
                     encryption_pk: intro.encryption_pk.clone(),
                     name: intro.name.clone(),
-                    last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                    last_active: state.established(cid).and_then(|chains| chains.presence_at),
                 });
             }
         }
@@ -137,7 +180,7 @@ impl Engine {
                 .map(|row| row.persistents.clone())
                 .unwrap_or_default(),
             ephemerals: notice.map(|row| row.ephemerals.clone()).unwrap_or_default(),
-            last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+            last_active: state.established(cid).and_then(|chains| chains.presence_at),
         }
     }
 
@@ -225,17 +268,7 @@ impl Engine {
             HANDSHAKE_DM_ESTABLISHED_INFO
         };
         let fp_key = expand(hmac, &key, label);
-        let (lo, hi) = if inviter.signing_pk <= invitee.signing_pk {
-            (
-                TxPayload::InviterIntro(inviter.clone()),
-                TxPayload::InviteeIntro(invitee.clone()),
-            )
-        } else {
-            (
-                TxPayload::InviteeIntro(invitee.clone()),
-                TxPayload::InviterIntro(inviter.clone()),
-            )
-        };
+        let (lo, hi) = fingerprint_payloads(state, conversation_id, inviter, invitee)?;
         let mut data = self
             .suite
             .canonical_json()
@@ -280,7 +313,14 @@ impl Engine {
                 )
                 .into_bytes(),
         );
-        state.spawn_established(cid, child, spawn_secret);
+        let peer = if state.is_sync(handshake) {
+            #[rustfmt::skip]
+            let id = super::helpers::sync_peer_device(state, handshake).ok_or(EngineError::WrongPhase)?;
+            super::state::SpawnPeer::Sync(id)
+        } else {
+            super::state::SpawnPeer::Direct
+        };
+        state.spawn_established(cid, child, spawn_secret, peer);
         Ok(())
     }
 
@@ -363,7 +403,7 @@ impl Engine {
             | Some(Conversation::HandshakeSync(Handshake::Invitee(
                 HandshakeInvitee::Confirming { .. },
             ))) => {
-                let decided = state.txs.values().any(|t| {
+                let decided = state.bodies().iter().any(|t| {
                     matches!(t.payload, TxPayload::Confirm | TxPayload::Reject)
                         && t.conversation_id == ids.conversation_id
                 });
@@ -393,7 +433,7 @@ impl Engine {
         user_id: &UserId,
         identity_id: &IdentityId,
     ) -> Option<(Policy, Vec<u8>, Vec<u8>)> {
-        state.txs.values().find_map(|tx| match &tx.payload {
+        state.bodies().iter().find_map(|tx| match &tx.payload {
             TxPayload::EngineCreateIdentity {
                 user_id: u,
                 identity_id: i,
@@ -417,7 +457,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         if state.device.keys.is_none() {
             state.device.keys = Some(super::state::DeviceKeys {
-                id: None,
+                id: super::super::DeviceId::from(rng.random32()),
                 enc: self
                     .suite
                     .kem()
@@ -513,17 +553,33 @@ impl Engine {
         #[rustfmt::skip]
         let (shared, seed_ct) = self.suite.kem().wrap(notice.policy, &notice.intake_pk, &seed).map_err(|_| EngineError::MalformedPayload)?;
         let shared_inviter = take_shared32(shared);
-        let payload = TxPayload::InviteeIntro(TxInviteeIntro {
+        let intro = TxInviteeIntro {
             name,
             profile_pic: pic,
             send_tag_key: TagKey::from(rng.random32()),
             eph_send_tag_key: TagKey::from(rng.random32()),
-            encryption_pk: enc,
-            signing_pk: sign,
-            intake_pk: intake.public_bytes().to_vec(),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(enc),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign),
+            intake_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(
+                intake.public_bytes().to_vec(),
+            ),
             seed_ct,
             prefs: self.on_wire_prefs(),
-        });
+        };
+        let payload = if state.is_sync(conversation_id) {
+            let device_id = state
+                .device
+                .keys
+                .as_ref()
+                .map(|keys| keys.id)
+                .ok_or(EngineError::WrongPhase)?;
+            TxPayload::SyncInviteeIntro(super::super::payload::SyncInviteeIntro {
+                intro,
+                device_id,
+            })
+        } else {
+            TxPayload::InviteeIntro(intro)
+        };
         if let Some(mut party) = state.party_mut(cid)
             && let Some(invitee) = party.invitee_mut()
         {
@@ -578,16 +634,30 @@ impl Engine {
         {
             let _ = inviter.mint_intro(shared_inviter, shared_invitee);
         }
-        let payload = TxPayload::InviterIntro(TxInviterIntro {
+        let intro = TxInviterIntro {
             name,
             profile_pic: pic,
             send_tag_key: TagKey::from(rng.random32()),
             eph_send_tag_key: TagKey::from(rng.random32()),
-            encryption_pk: enc,
-            signing_pk: sign,
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(enc),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign),
             seed_ct,
             prefs: self.on_wire_prefs(),
-        });
+        };
+        let payload = if state.is_sync(conversation_id) {
+            let device_id = state
+                .device
+                .keys
+                .as_ref()
+                .map(|keys| keys.id)
+                .ok_or(EngineError::WrongPhase)?;
+            TxPayload::SyncInviterIntro(super::super::payload::SyncInviterIntro {
+                intro,
+                device_id,
+            })
+        } else {
+            TxPayload::InviterIntro(intro)
+        };
         let secret = self.conv_secret(state, &conversation_id)?;
         let (tx_id, _, rec) = self.merge_tx(state, &secret, conversation_id, payload)?;
         self.post_handshake_packets(state, rng, conversation_id, &secret, tx_id)?;
@@ -599,7 +669,7 @@ impl Engine {
     /// advances IntroductionMinted / Confirming. Unlock and policy failures
     /// store `FailedReason`.
     pub fn ingest_list(
-        &self,
+        &mut self,
         state: EngineState,
         rng: &dyn Rng,
         channel: DurableChannel,
@@ -630,7 +700,7 @@ impl Engine {
     /// reassembles fragments. Durable `PacketTxFragLast` / `PacketXorAck`
     /// matching `set_xor` after merge stores that actor's last Persistent ack.
     pub fn ingest_packet(
-        &self,
+        &mut self,
         mut state: EngineState,
         rng: &dyn Rng,
         channel: DurableChannel,
@@ -638,7 +708,6 @@ impl Engine {
         body: &[u8],
     ) -> Result<MutateOk, EngineError> {
         let now = Self::require_tick(&state)?;
-        let _ = self.require_dek()?;
         let hits = self.handshake_hits(&state, HitChannel::Durable(&channel), &tag, now);
         if hits.is_empty() {
             return self.finish_established(state, rng, LiveChannel::Durable(&channel), &tag, body);
@@ -655,7 +724,7 @@ impl Engine {
     /// Ingest one 512-byte ephemeral body. Matching `PacketXorAck` is a live
     /// ack only.
     pub fn ingest_ephemeral_packet(
-        &self,
+        &mut self,
         mut state: EngineState,
         rng: &dyn Rng,
         channel: EphemeralChannel,
@@ -754,7 +823,7 @@ impl Engine {
     }
 
     pub(super) fn ingest_known_body(
-        &self,
+        &mut self,
         state: &mut EngineState,
         rng: &dyn Rng,
         hits: &[HandshakeHit],
@@ -773,7 +842,7 @@ impl Engine {
     }
 
     pub(super) fn open_and_merge(
-        &self,
+        &mut self,
         state: &mut EngineState,
         rng: &dyn Rng,
         hit: &HandshakeHit,
@@ -790,7 +859,7 @@ impl Engine {
         if state.failed(hit.cid).is_some() {
             return Err(EngineError::UnknownTag);
         }
-        let actor = ActorId::handshake();
+        let actor = Actor::handshake();
         self.absorb_peer_wraps(state, hit.cid);
         let joined = join(self.suite.hmac(), hit.secret.as_bytes(), hit.sort, &[])?;
         let start = state
@@ -936,17 +1005,11 @@ impl Engine {
         if durable.conversation_id != hit.cid {
             rekey_conversation(state, hit.cid, durable.conversation_id);
         }
-        if let Some(existing) = state.txs.get(&part.tx_id) {
+        if let Some(existing) = state.body(&part.tx_id) {
             if existing.payload == durable.payload {
-                if persistent && let PacketPlain::TxFragLast(last) = &opened.packet {
-                    store_durable_last_ack(
-                        state,
-                        durable.conversation_id,
-                        &last.actor_id,
-                        last.set_xor,
-                    );
-                    self.note_set_xor(state, rng, durable.conversation_id, last.set_xor)?;
-                }
+                #[allow(clippy::let_unit_value)]
+                #[rustfmt::skip]
+                let () = self.ack_completed_last(state, rng, persistent, &opened.packet, durable.conversation_id)?;
                 prune_cached_mks(state);
                 return Ok(Vec::new());
             }
@@ -956,15 +1019,15 @@ impl Engine {
         if let Some(extra) = self.handshake_ingest_gate(state, cid, &durable.payload)? {
             return Ok(extra);
         }
+        if let TxPayload::SyncDek { ct } = &durable.payload {
+            self.hold_sync_dek(state, ct)?;
+        }
         let seq = state.next_seq;
         let persist = self.persist_record(seq, &durable)?;
         state.persist_log.insert(seq, part.tx_id);
         state.next_seq = state.next_seq.saturating_add(1);
-        state.txs.insert(part.tx_id, durable);
-        if persistent && let PacketPlain::TxFragLast(last) = &opened.packet {
-            store_durable_last_ack(state, cid, &last.actor_id, last.set_xor);
-            self.note_set_xor(state, rng, cid, last.set_xor)?;
-        }
+        state.insert_body(part.tx_id, durable)?;
+        self.ack_completed_last(state, rng, persistent, &opened.packet, cid)?;
         prune_cached_mks(state);
         let conversation_id = cid;
         let mut out = vec![persist];
@@ -1003,87 +1066,115 @@ impl Engine {
                 }
                 Ok(None)
             }
-            TxPayload::InviteeIntro(i) => {
-                if invitee_intro_for(state, conversation_id).is_some() {
-                    state.fail(cid, HandshakeFailure::DuplicateIntro);
-                    return Ok(Some(Vec::new()));
-                }
-                let Some(notice) = notice_for(state, conversation_id) else {
-                    state.fail(cid, HandshakeFailure::IntroVerifyFailed);
-                    return Ok(Some(Vec::new()));
-                };
-                if !intro_keys_ok(
-                    notice.policy,
-                    &i.encryption_pk,
-                    &i.signing_pk,
-                    Some(&i.intake_pk),
-                    &i.seed_ct,
-                ) {
-                    state.fail(cid, HandshakeFailure::IntroVerifyFailed);
-                    return Ok(Some(Vec::new()));
-                }
-                let policy = notice.policy;
-                if state.is_inviter(cid) {
-                    let sk = state.intake_secret(cid);
-                    if let Some(sk) = sk {
-                        match self.unwrap_shared(policy, &sk, &i.seed_ct) {
-                            Ok(_) => {}
-                            Err(()) => {
-                                state.fail(cid, HandshakeFailure::IntroVerifyFailed);
-                                return Ok(Some(Vec::new()));
-                            }
-                        }
-                    }
-                }
-                Ok(None)
+            TxPayload::InviteeIntro(i) => self.gate_invitee_intro(state, cid, i),
+            TxPayload::SyncInviteeIntro(s) => self.gate_invitee_intro(state, cid, &s.intro),
+            TxPayload::InviterIntro(i) => self.gate_inviter_intro(state, cid, i),
+            TxPayload::SyncInviterIntro(s) => self.gate_inviter_intro(state, cid, &s.intro),
+            _ => Ok(None),
+        }
+    }
+
+    fn gate_invitee_intro(
+        &self,
+        state: &mut EngineState,
+        cid: ConversationId,
+        i: &TxInviteeIntro,
+    ) -> Result<Option<Vec<Vec<u8>>>, EngineError> {
+        let conversation_id = cid;
+        {
+            if invitee_intro_for(state, conversation_id).is_some() {
+                state.fail(cid, HandshakeFailure::DuplicateIntro);
+                return Ok(Some(Vec::new()));
             }
-            TxPayload::InviterIntro(i) => {
-                if inviter_intro_for(state, conversation_id).is_some() {
-                    state.fail(cid, HandshakeFailure::DuplicateIntro);
-                    return Ok(Some(Vec::new()));
-                }
-                #[rustfmt::skip]
-                let Some(notice) = notice_for(state, conversation_id) else { state.fail(cid, HandshakeFailure::IntroVerifyFailed); return Ok(Some(Vec::new())); };
-                if !intro_keys_ok(
-                    notice.policy,
-                    &i.encryption_pk,
-                    &i.signing_pk,
-                    None,
-                    &i.seed_ct,
-                ) {
-                    state.fail(cid, HandshakeFailure::IntroVerifyFailed);
-                    return Ok(Some(Vec::new()));
-                }
-                let policy = notice.policy;
-                if !state.is_inviter(cid) {
-                    let sk = state.intake_secret(cid);
-                    let Some(sk) = sk else {
-                        state.fail(cid, HandshakeFailure::IntroVerifyFailed);
-                        return Ok(Some(Vec::new()));
-                    };
+            let Some(notice) = notice_for(state, conversation_id) else {
+                state.fail(cid, HandshakeFailure::IntroVerifyFailed);
+                return Ok(Some(Vec::new()));
+            };
+            if !intro_keys_ok(
+                notice.policy,
+                &i.encryption_pk,
+                &i.signing_pk,
+                Some(&i.intake_pk),
+                &i.seed_ct,
+            ) {
+                state.fail(cid, HandshakeFailure::IntroVerifyFailed);
+                return Ok(Some(Vec::new()));
+            }
+            let policy = notice.policy;
+            if state.is_inviter(cid) {
+                let sk = state.intake_secret(cid);
+                if let Some(sk) = sk {
                     match self.unwrap_shared(policy, &sk, &i.seed_ct) {
-                        Ok(s) => {
-                            let accepted = state
-                                .party_mut(cid)
-                                .and_then(|mut party| {
-                                    party.invitee_mut().map(|inv| inv.confirm_peer(s))
-                                })
-                                .unwrap_or(false);
-                            if !accepted {
-                                state.fail(cid, HandshakeFailure::IntroVerifyFailed);
-                                return Ok(Some(Vec::new()));
-                            }
-                        }
+                        Ok(_) => {}
                         Err(()) => {
                             state.fail(cid, HandshakeFailure::IntroVerifyFailed);
                             return Ok(Some(Vec::new()));
                         }
                     }
                 }
-                Ok(None)
             }
-            _ => Ok(None),
+            Ok(None)
         }
+    }
+
+    fn gate_inviter_intro(
+        &self,
+        state: &mut EngineState,
+        cid: ConversationId,
+        i: &TxInviterIntro,
+    ) -> Result<Option<Vec<Vec<u8>>>, EngineError> {
+        let conversation_id = cid;
+        {
+            if inviter_intro_for(state, conversation_id).is_some() {
+                state.fail(cid, HandshakeFailure::DuplicateIntro);
+                return Ok(Some(Vec::new()));
+            }
+            #[rustfmt::skip]
+                let Some(notice) = notice_for(state, conversation_id) else { state.fail(cid, HandshakeFailure::IntroVerifyFailed); return Ok(Some(Vec::new())); };
+            if !intro_keys_ok(
+                notice.policy,
+                &i.encryption_pk,
+                &i.signing_pk,
+                None,
+                &i.seed_ct,
+            ) {
+                state.fail(cid, HandshakeFailure::IntroVerifyFailed);
+                return Ok(Some(Vec::new()));
+            }
+            let policy = notice.policy;
+            if !state.is_inviter(cid) {
+                let sk = state.intake_secret(cid);
+                let Some(sk) = sk else {
+                    state.fail(cid, HandshakeFailure::IntroVerifyFailed);
+                    return Ok(Some(Vec::new()));
+                };
+                match self.unwrap_shared(policy, &sk, &i.seed_ct) {
+                    Ok(s) => {
+                        let accepted = state
+                            .party_mut(cid)
+                            .and_then(|mut party| {
+                                party.invitee_mut().map(|inv| inv.confirm_peer(s))
+                            })
+                            .unwrap_or(false);
+                        if !accepted {
+                            state.fail(cid, HandshakeFailure::IntroVerifyFailed);
+                            return Ok(Some(Vec::new()));
+                        }
+                    }
+                    Err(()) => {
+                        state.fail(cid, HandshakeFailure::IntroVerifyFailed);
+                        return Ok(Some(Vec::new()));
+                    }
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    #[rustfmt::skip]
+    fn ack_completed_last(&self, state: &mut EngineState, rng: &dyn Rng, persistent: bool, packet: &PacketPlain, cid: ConversationId) -> Result<(), EngineError> {
+        if persistent && let PacketPlain::TxFragLast(last) = packet { store_durable_last_ack(state, cid, &last.actor_id, last.set_xor); self.note_set_xor(state, rng, cid, last.set_xor)?; }
+        Ok(())
     }
 
     pub(super) fn complete_list_bin(

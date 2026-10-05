@@ -8,7 +8,7 @@ use super::super::payload::{
     VAULT_P, VAULT_T, VaultHeader, time_bin,
 };
 use super::super::{
-    AEAD_NONCE_LEN, ActorId, AeadKey, AeadNonce, ConversationId, EngineError, Json, PersistSeq,
+    AEAD_NONCE_LEN, Actor, AeadKey, AeadNonce, ConversationId, EngineError, Json, PersistSeq,
     Secret, Tag, UnixSeconds,
 };
 use super::query::*;
@@ -292,21 +292,8 @@ impl Engine {
             )
             .into_bytes(),
         );
-        let actor = ActorId::handshake();
+        let actor = Actor::handshake();
         self.absorb_peer_wraps(state, cid);
-        if let Some(owed) = self.mint_if_owed(state, rng, cid, conv_secret)? {
-            self.write_chain_packets(
-                state,
-                rng,
-                cid,
-                sort,
-                &persistents,
-                tag,
-                owed,
-                actor.clone(),
-                false,
-            )?;
-        }
         self.write_chain_packets(state, rng, cid, sort, &persistents, tag, tx_id, actor, true)?;
         Ok(())
     }
@@ -321,7 +308,7 @@ impl Engine {
         persistents: &[super::super::DurableChannel],
         tag: Tag,
         tx_id: Tag,
-        actor: ActorId,
+        actor: Actor,
         count_since: bool,
     ) -> Result<(), EngineError> {
         let secret = state
@@ -345,13 +332,9 @@ impl Engine {
                 chains.heal.needs_reseal = true;
             }
         }
-        let body = state
-            .txs
-            .get(&tx_id)
-            .ok_or(EngineError::UnknownIds)?
-            .clone();
+        let body = state.body(&tx_id).ok_or(EngineError::UnknownIds)?.clone();
         let mut packed = packed_tx(&self.suite, &body);
-        let set_xor = set_xor_for(&state.txs, conversation_id);
+        let set_xor = set_xor_for(state.body_pairs(), conversation_id);
         let mut chain = match state
             .chains(conversation_id)
             .and_then(|c| c.send.get(&actor))
@@ -361,9 +344,6 @@ impl Engine {
         };
         let mut frag_i = 0u64;
         loop {
-            if let Some(mixed) = self.mixed_chain(state, conversation_id, sort, &chain, true) {
-                chain = mixed;
-            }
             let (packet, n) = next_fragment(
                 &self.suite,
                 &packed,
@@ -416,9 +396,9 @@ impl Engine {
             },
             payload,
         };
-        if let Some(existing) = state.txs.get(&tx_id) {
+        if let Some(existing) = state.body(&tx_id) {
             if existing.payload == body.payload {
-                let persist = self.persist_record(state.next_seq, existing)?;
+                let persist = self.persist_record(state.next_seq, &existing)?;
                 return Ok((tx_id, existing.clone(), persist));
             }
             return Err(EngineError::Equivocation);
@@ -427,7 +407,7 @@ impl Engine {
         let seq = state.next_seq;
         state.persist_log.insert(seq, tx_id);
         state.next_seq = state.next_seq.saturating_add(1);
-        state.txs.insert(tx_id, body.clone());
+        state.insert_body(tx_id, body.clone())?;
         Ok((tx_id, body, persist))
     }
 

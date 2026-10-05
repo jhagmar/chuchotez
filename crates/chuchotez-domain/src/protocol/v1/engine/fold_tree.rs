@@ -6,7 +6,7 @@ use super::super::kem::KeyPair;
 use super::super::payload::{Ticket, parse_policy, policy_str};
 use super::super::sign::SigningKeyPair;
 use super::super::{
-    ActorId, Base64Url, ConversationId, DisplayName, EngineError, IdentityId, Json, ProfilePic,
+    Actor, Base64Url, ConversationId, DisplayName, EngineError, IdentityId, Json, ProfilePic,
     Secret, Tag, TimeBin, UserId,
 };
 use super::helpers::{decode_fold_bstr, decode_fold32, keypair_json, parse_fold_keypair};
@@ -14,8 +14,11 @@ use super::party::{
     DeviceConversation, DmParty, HandshakeFailure, IdentityConversation, InviteePhase,
     InviterPhase, SyncParty,
 };
-use super::state::{ConversationChains, Device, DeviceKeys, DeviceNode, EngineState, IdentityNode};
-use std::collections::BTreeSet;
+use super::state::{
+    Device, DeviceKeys, DeviceNode, EngineState, EstablishedChains, IdentityNode, PacketChains,
+    Ratchet,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn users_json(b64u: &dyn Base64Url, state: &EngineState) -> Json {
     let mut users = Vec::new();
@@ -171,12 +174,7 @@ pub(super) fn install_device(
 
 fn keys_json(b64u: &dyn Base64Url, keys: &DeviceKeys) -> Json {
     Json::Object(vec![
-        (
-            "id".into(),
-            keys.id
-                .map(|id| bstr(b64u, id.as_bytes()))
-                .unwrap_or(Json::Null),
-        ),
+        ("id".into(), bstr(b64u, keys.id.as_bytes())),
         (
             "enc".into(),
             keypair_json(b64u, keys.enc.public_bytes(), keys.enc.secret_bytes()),
@@ -192,12 +190,7 @@ fn parse_keys(b64u: &dyn Base64Url, value: &Json) -> Result<DeviceKeys, EngineEr
     let Json::Object(m) = value else {
         return Err(EngineError::MalformedPersist);
     };
-    let id = match field(m, "id")? {
-        Json::Null => None,
-        other => Some(super::super::DeviceId::from_bytes(decode_fold32(
-            b64u, other,
-        )?)),
-    };
+    let id = super::super::DeviceId::from_bytes(decode_fold32(b64u, field(m, "id")?)?);
     let (epk, esk) = parse_fold_keypair(b64u, field(m, "enc")?)?;
     let (spk, ssk) = parse_fold_keypair(b64u, field(m, "sign")?)?;
     Ok(DeviceKeys {
@@ -211,10 +204,10 @@ fn identity_conv_json(b64u: &dyn Base64Url, cid: ConversationId, node: &Identity
     let mut members = vec![
         ("conversation_id".into(), bstr(b64u, cid.as_bytes())),
         match &node.kind {
-            IdentityConversation::DmHandshake(party) => {
+            IdentityConversation::DmHandshake { party, .. } => {
                 ("handshake".into(), party_json(b64u, party_of_dm(party)))
             }
-            IdentityConversation::DirectMessage { secret, parent } => (
+            IdentityConversation::DirectMessage { secret, parent, .. } => (
                 "direct_message".into(),
                 Json::Object(vec![
                     ("secret".into(), bstr(b64u, secret.as_bytes())),
@@ -226,7 +219,7 @@ fn identity_conv_json(b64u: &dyn Base64Url, cid: ConversationId, node: &Identity
             }
         },
     ];
-    members.extend(chains_json(b64u, cid, &node.chains));
+    members.extend(identity_chain_json(b64u, cid, &node.kind));
     Json::Object(members)
 }
 
@@ -234,20 +227,56 @@ fn device_conv_json(b64u: &dyn Base64Url, cid: ConversationId, node: &DeviceNode
     let mut members = vec![
         ("conversation_id".into(), bstr(b64u, cid.as_bytes())),
         match &node.kind {
-            DeviceConversation::SyncHandshake(party) => {
+            DeviceConversation::SyncHandshake { party, .. } => {
                 ("handshake".into(), party_json(b64u, party_of_sync(party)))
             }
-            DeviceConversation::Synchronization { secret, parent } => (
+            DeviceConversation::Synchronization {
+                secret,
+                parent,
+                peer,
+                ..
+            } => (
                 "synchronization".into(),
                 Json::Object(vec![
                     ("secret".into(), bstr(b64u, secret.as_bytes())),
                     ("parent".into(), bstr(b64u, parent.as_bytes())),
+                    ("peer".into(), bstr(b64u, peer.as_bytes())),
                 ]),
             ),
         },
     ];
-    members.extend(chains_json(b64u, cid, &node.chains));
+    members.extend(device_chain_json(b64u, cid, &node.kind));
     Json::Object(members)
+}
+
+fn identity_chain_json(
+    b64u: &dyn Base64Url,
+    cid: ConversationId,
+    kind: &IdentityConversation,
+) -> Vec<(String, Json)> {
+    match kind {
+        IdentityConversation::DmHandshake { chains, .. } => chains_json(b64u, cid, chains, None),
+        IdentityConversation::DirectMessage { chains, .. } => {
+            chains_json(b64u, cid, chains, Some(&chains.ratchet))
+        }
+        IdentityConversation::Group(super::party::GroupPhase::Live(live)) => {
+            chains_json(b64u, cid, &live.chains, Some(&live.chains.ratchet))
+        }
+        IdentityConversation::Group(_) => Vec::new(),
+    }
+}
+
+fn device_chain_json(
+    b64u: &dyn Base64Url,
+    cid: ConversationId,
+    kind: &DeviceConversation,
+) -> Vec<(String, Json)> {
+    match kind {
+        DeviceConversation::SyncHandshake { chains, .. } => chains_json(b64u, cid, chains, None),
+        DeviceConversation::Synchronization { chains, .. } => {
+            chains_json(b64u, cid, chains, Some(&chains.ratchet))
+        }
+    }
 }
 
 enum PartyView<'a> {
@@ -535,7 +564,8 @@ fn failure_json(reason: HandshakeFailure) -> Json {
 fn chains_json(
     b64u: &dyn Base64Url,
     cid: ConversationId,
-    chains: &ConversationChains,
+    chains: &PacketChains,
+    ratchet: Option<&super::state::Ratchet>,
 ) -> Vec<(String, Json)> {
     let send: Vec<_> = chains
         .send
@@ -566,6 +596,7 @@ fn chains_json(
             .collect();
         skipped.push(Json::Object(vec![
             ("actor_id".into(), bstr(b64u, actor.as_bytes())),
+            ("actor_role".into(), Json::String(actor.role().into())),
             ("mks".into(), Json::Array(mks)),
         ]));
     }
@@ -573,19 +604,23 @@ fn chains_json(
     for (actor, ids) in &chains.last_acks {
         last_acks.push(Json::Object(vec![
             ("actor_id".into(), bstr(b64u, actor.as_bytes())),
+            ("actor_role".into(), Json::String(actor.role().into())),
             (
                 "tx_ids".into(),
                 Json::Array(ids.iter().map(|id| bstr(b64u, id.as_bytes())).collect()),
             ),
         ]));
     }
-    vec![
+    let mut fields = vec![
         ("chains".into(), Json::Array(send)),
         ("recv_chains".into(), Json::Array(recv)),
         ("skipped_mks".into(), Json::Array(skipped)),
         ("last_acks".into(), Json::Array(last_acks)),
-        ("ratchet".into(), ratchet_json(b64u, &chains.ratchet)),
-    ]
+    ];
+    if let Some(ratchet) = ratchet {
+        fields.push(("ratchet".into(), ratchet_json(b64u, ratchet)));
+    }
+    fields
 }
 
 fn ratchet_json(b64u: &dyn Base64Url, ratchet: &super::state::Ratchet) -> Json {
@@ -634,9 +669,13 @@ fn parse_identity_conv(
         return Err(EngineError::MalformedPersist);
     };
     let cid = ConversationId::from_bytes(decode_fold32(b64u, field(m, "conversation_id")?)?);
-    let chains = parse_chains(b64u, m)?;
+    let (packet, ratchet) = parse_chains(b64u, m)?;
     let kind = if let Some(hs) = optional(m, "handshake") {
-        IdentityConversation::DmHandshake(parse_dm_party(b64u, hs)?)
+        IdentityConversation::DmHandshake {
+            party: parse_dm_party(b64u, hs)?,
+            log: BTreeMap::new(),
+            chains: packet,
+        }
     } else if let Some(dm) = optional(m, "direct_message") {
         let Json::Object(d) = dm else {
             return Err(EngineError::MalformedPersist);
@@ -644,13 +683,27 @@ fn parse_identity_conv(
         IdentityConversation::DirectMessage {
             secret: Secret::from_bytes(decode_fold32(b64u, field(d, "secret")?)?),
             parent: ConversationId::from_bytes(decode_fold32(b64u, field(d, "parent")?)?),
+            log: BTreeMap::new(),
+            chains: established_from(packet, ratchet),
         }
     } else if let Some(group) = optional(m, "group") {
-        IdentityConversation::Group(super::group::parse_group(b64u, group)?)
+        let mut phase = super::group::parse_group(b64u, group)?;
+        if let super::party::GroupPhase::Live(live) = &mut phase {
+            live.chains = established_from(packet, ratchet);
+        }
+        IdentityConversation::Group(phase)
     } else {
         return Err(EngineError::MalformedPersist);
     };
-    Ok((cid, IdentityNode { kind, chains }))
+    Ok((cid, IdentityNode { kind }))
+}
+
+fn established_from(packet: PacketChains, ratchet: Ratchet) -> EstablishedChains {
+    EstablishedChains {
+        packet,
+        ratchet,
+        ..EstablishedChains::default()
+    }
 }
 
 fn parse_device_conv(
@@ -661,9 +714,13 @@ fn parse_device_conv(
         return Err(EngineError::MalformedPersist);
     };
     let cid = ConversationId::from_bytes(decode_fold32(b64u, field(m, "conversation_id")?)?);
-    let chains = parse_chains(b64u, m)?;
+    let (packet, ratchet) = parse_chains(b64u, m)?;
     let kind = if let Some(hs) = optional(m, "handshake") {
-        DeviceConversation::SyncHandshake(parse_sync_party(b64u, hs)?)
+        DeviceConversation::SyncHandshake {
+            party: parse_sync_party(b64u, hs)?,
+            log: BTreeMap::new(),
+            chains: packet,
+        }
     } else if let Some(sync) = optional(m, "synchronization") {
         let Json::Object(d) = sync else {
             return Err(EngineError::MalformedPersist);
@@ -671,11 +728,15 @@ fn parse_device_conv(
         DeviceConversation::Synchronization {
             secret: Secret::from_bytes(decode_fold32(b64u, field(d, "secret")?)?),
             parent: ConversationId::from_bytes(decode_fold32(b64u, field(d, "parent")?)?),
+            #[rustfmt::skip]
+            peer: super::super::DeviceId::from_bytes(decode_fold32(b64u, field(d, "peer")?)?),
+            log: BTreeMap::new(),
+            chains: established_from(packet, ratchet),
         }
     } else {
         return Err(EngineError::MalformedPersist);
     };
-    Ok((cid, DeviceNode { kind, chains }))
+    Ok((cid, DeviceNode { kind }))
 }
 
 fn parse_dm_party(b64u: &dyn Base64Url, value: &Json) -> Result<DmParty, EngineError> {
@@ -846,8 +907,8 @@ fn parse_failure(value: &Json) -> Result<HandshakeFailure, EngineError> {
 fn parse_chains(
     b64u: &dyn Base64Url,
     m: &[(String, Json)],
-) -> Result<ConversationChains, EngineError> {
-    let mut chains = ConversationChains::default();
+) -> Result<(PacketChains, Ratchet), EngineError> {
+    let mut chains = PacketChains::default();
     if let Some(Json::Array(items)) = optional(m, "chains") {
         for item in items {
             let (_, actor, chain) = chain_from_json(b64u, item)?;
@@ -869,7 +930,14 @@ fn parse_chains(
             let Json::Object(sm) = item else {
                 return Err(EngineError::MalformedPersist);
             };
-            let actor = ActorId::from_bytes(decode_fold_bstr(b64u, field(sm, "actor_id")?)?);
+            let actor_bytes = decode_fold_bstr(b64u, field(sm, "actor_id")?)?;
+            let role = match optional(sm, "actor_role") {
+                Some(Json::String(role)) => Some(role.as_str()),
+                Some(_) => return Err(EngineError::MalformedPersist),
+                None => None,
+            };
+            let actor =
+                Actor::from_stored(role, actor_bytes).ok_or(EngineError::MalformedPersist)?;
             let Json::Array(mks) = field(sm, "mks")? else {
                 return Err(EngineError::MalformedPersist);
             };
@@ -902,7 +970,14 @@ fn parse_chains(
             let Json::Object(am) = item else {
                 return Err(EngineError::MalformedPersist);
             };
-            let actor = ActorId::from_bytes(decode_fold_bstr(b64u, field(am, "actor_id")?)?);
+            let actor_bytes = decode_fold_bstr(b64u, field(am, "actor_id")?)?;
+            let role = match optional(am, "actor_role") {
+                Some(Json::String(role)) => Some(role.as_str()),
+                Some(_) => return Err(EngineError::MalformedPersist),
+                None => None,
+            };
+            let actor =
+                Actor::from_stored(role, actor_bytes).ok_or(EngineError::MalformedPersist)?;
             let Json::Array(ids_v) = field(am, "tx_ids")? else {
                 return Err(EngineError::MalformedPersist);
             };
@@ -915,10 +990,12 @@ fn parse_chains(
     } else if optional(m, "last_acks").is_some() {
         return Err(EngineError::MalformedPersist);
     }
-    if let Some(value) = optional(m, "ratchet") {
-        chains.ratchet = parse_ratchet(b64u, value)?;
-    }
-    Ok(chains)
+    let ratchet = if let Some(value) = optional(m, "ratchet") {
+        parse_ratchet(b64u, value)?
+    } else {
+        Ratchet::default()
+    };
+    Ok((chains, ratchet))
 }
 
 fn parse_ratchet(b64u: &dyn Base64Url, value: &Json) -> Result<super::state::Ratchet, EngineError> {
@@ -945,7 +1022,8 @@ fn parse_ratchet(b64u: &dyn Base64Url, value: &Json) -> Result<super::state::Rat
         };
         unused.push(super::state::UnusedSk {
             tx_id: Tag::from_bytes(decode_fold32(b64u, field(row, "tx_id")?)?),
-            pk: decode_fold_bstr(b64u, field(row, "pk")?)?,
+            #[rustfmt::skip]
+            pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(decode_fold_bstr(b64u, field(row, "pk")?)?),
             sk: decode_fold_bstr(b64u, field(row, "sk")?)?,
         });
     }
@@ -965,7 +1043,8 @@ fn parse_ratchet(b64u: &dyn Base64Url, value: &Json) -> Result<super::state::Rat
             shared: Secret::from_bytes(decode_fold32(b64u, field(row, "shared")?)?),
             ct_hash: Tag::from_bytes(decode_fold32(b64u, field(row, "ct_hash")?)?),
             from_us: *from_us,
-            encaps_pk: decode_fold_bstr(b64u, field(row, "encaps_pk")?)?,
+            #[rustfmt::skip]
+            encaps_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(decode_fold_bstr(b64u, field(row, "encaps_pk")?)?),
         });
     }
     Ok(super::state::Ratchet {
@@ -1000,4 +1079,25 @@ fn optional<'a>(m: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
 
 fn bstr(b64u: &dyn Base64Url, bytes: &[u8]) -> Json {
     super::super::codec::bstr(b64u, bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Json, parse_chains};
+
+    #[test]
+    fn bad_actor_role_is_rejected() {
+        let engine = crate::protocol::v1::fixtures::test_engine();
+        let b64 = engine.suite.b64u();
+        let actor = ("actor_id".into(), Json::String(b64.encode(&[1])));
+        let role = ("actor_role".into(), Json::Number(1));
+        let skipped = Json::Object(vec![
+            actor.clone(),
+            role.clone(),
+            ("mks".into(), Json::Array(vec![])),
+        ]);
+        assert!(parse_chains(b64, &[("skipped_mks".into(), Json::Array(vec![skipped]))]).is_err());
+        let acks = Json::Object(vec![actor, role, ("tx_ids".into(), Json::Array(vec![]))]);
+        assert!(parse_chains(b64, &[("last_acks".into(), Json::Array(vec![acks]))]).is_err());
+    }
 }

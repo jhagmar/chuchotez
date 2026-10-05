@@ -68,8 +68,8 @@ impl Engine {
         let group_id = ConversationId::from(rng.random32());
         let secret = Secret::from(rng.random32());
         let owner = GroupMember {
-            signing_pk: sign_pk.clone(),
-            encryption_pk: enc_pk,
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign_pk.clone()),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(enc_pk),
             send_tag_key: TagKey::from(rng.random32()),
             eph_send_tag_key: TagKey::from(rng.random32()),
         };
@@ -77,7 +77,7 @@ impl Engine {
         let mut payloads_by_dm: Vec<(ConversationId, TxPayload)> = Vec::new();
         for (signing_pk, encryption_pk, dm) in &peers {
             #[rustfmt::skip]
-            let group_secret_ct = seal_group_secret(self, rng, policy, encryption_pk, secret.as_bytes())?;
+            let group_secret_ct = seal_group_secret(self, rng, policy, encryption_pk.as_bytes(), secret.as_bytes())?;
             pending.push(GroupPending {
                 signing_pk: signing_pk.clone(),
                 encryption_pk: encryption_pk.clone(),
@@ -89,7 +89,7 @@ impl Engine {
                 *dm,
                 TxPayload::GroupInvite(TxGroupInvite {
                     group_id,
-                    owner_signing_pk: sign_pk.clone(),
+                    owner_signing_pk: super::super::SigningPublicKey::from_bytes(sign_pk.clone()),
                     persistents: self.defaults.persistents().to_vec(),
                     ephemerals: self.defaults.ephemerals().to_vec(),
                     name: name.clone(),
@@ -104,18 +104,19 @@ impl Engine {
             identity_id,
             group_id,
             IdentityNode {
-                kind: IdentityConversation::Group(GroupPhase::Live(GroupLive {
+                kind: IdentityConversation::Group(GroupPhase::Live(Box::new(GroupLive {
                     secret,
                     name,
                     photo,
-                    owner_signing_pk: sign_pk,
+                    owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign_pk),
                     persistents: self.defaults.persistents().to_vec(),
                     ephemerals: self.defaults.ephemerals().to_vec(),
                     members: vec![owner],
                     pending,
                     epoch: 0,
-                })),
-                chains: Default::default(),
+                    log: std::collections::BTreeMap::new(),
+                    chains: super::chains::EstablishedChains::default(),
+                }))),
             },
         );
         let mut ok = MutateOk {
@@ -148,7 +149,11 @@ impl Engine {
         let peer =
             dm_peer(&state, contact_conversation_id, &sign_pk).ok_or(EngineError::WrongPhase)?;
         let live = match group_phase(&state, ids.conversation_id) {
-            Some(GroupPhase::Live(live)) if live.owner_signing_pk == sign_pk => live.clone(),
+            Some(GroupPhase::Live(live))
+                if live.owner_signing_pk.as_bytes() == sign_pk.as_slice() =>
+            {
+                live.clone()
+            }
             Some(GroupPhase::Live(_)) => return Err(EngineError::NotOwner),
             _ => return Err(EngineError::WrongPhase),
         };
@@ -164,7 +169,7 @@ impl Engine {
         let group_secret_ct = seal_group_secret(self, rng, policy, &peer.1, live.secret.as_bytes())?;
         let payload = TxPayload::GroupInvite(TxGroupInvite {
             group_id: ids.conversation_id,
-            owner_signing_pk: sign_pk,
+            owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign_pk),
             persistents: live.persistents.clone(),
             ephemerals: live.ephemerals.clone(),
             name: live.name.clone(),
@@ -176,8 +181,8 @@ impl Engine {
         let mut ok = self.mint_on(state, rng, &ConversationRef { conversation_id: contact_conversation_id, ..ids }, payload)?;
         if let Some(GroupPhase::Live(row)) = group_phase_mut(&mut ok.state, ids.conversation_id) {
             row.pending.push(GroupPending {
-                signing_pk: peer.0,
-                encryption_pk: peer.1,
+                signing_pk: peer.0.clone(),
+                encryption_pk: peer.1.clone(),
                 from_conversation_id: contact_conversation_id,
                 name: row.name.clone(),
                 photo: row.photo.clone(),
@@ -205,13 +210,13 @@ impl Engine {
         #[rustfmt::skip]
         let mut ok = self.mint_on(state, rng, &ConversationRef { conversation_id: offer.from_conversation_id, ..ids }, payload)?;
         let member = GroupMember {
-            signing_pk: sign_pk.clone(),
-            encryption_pk: enc_pk,
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(sign_pk.clone()),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(enc_pk),
             send_tag_key: TagKey::from(rng.random32()),
             eph_send_tag_key: TagKey::from(rng.random32()),
         };
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Live(GroupLive {
+            *phase = GroupPhase::Live(Box::new(GroupLive {
                 secret: offer.secret,
                 name: offer.name,
                 photo: offer.photo,
@@ -221,7 +226,9 @@ impl Engine {
                 members: vec![member],
                 pending: Vec::new(),
                 epoch: 0,
-            });
+                log: std::collections::BTreeMap::new(),
+                chains: super::chains::EstablishedChains::default(),
+            }));
         }
         let _ = sign_pk;
         Ok(ok)
@@ -244,7 +251,7 @@ impl Engine {
         #[rustfmt::skip]
         let mut ok = self.mint_on(state, rng, &ConversationRef { conversation_id: offer.from_conversation_id, ..ids }, payload)?;
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Failed(super::query::FailedReason::OfferRejected);
+            *phase = GroupPhase::Failed(super::query::GroupEnd::OfferRejected);
         }
         Ok(ok)
     }
@@ -270,22 +277,27 @@ impl Engine {
             _ => return Err(EngineError::WrongPhase),
         }
         let (_, _, sign_pk, _, _) = self.identity_secret(&state, &ids.user_id, &ids.identity_id)?;
-        let owner = group_live(&state, ids.conversation_id)
-            .is_some_and(|live| live.owner_signing_pk == sign_pk);
+        let owner = group_live(&state, ids.conversation_id).is_some_and(|live| {
+            live.owner_signing_pk == crate::protocol::v1::SigningPublicKey::from_bytes(sign_pk)
+        });
         if !owner {
             return Err(EngineError::NotOwner);
         }
-        if group_live(&state, ids.conversation_id)
-            .is_some_and(|live| live.pending.iter().any(|p| p.signing_pk == signing_pk))
-        {
+        if group_live(&state, ids.conversation_id).is_some_and(|live| {
+            live.pending.iter().any(|p| {
+                p.signing_pk == crate::protocol::v1::SigningPublicKey::from_bytes(signing_pk)
+            })
+        }) {
             return Err(EngineError::WrongPhase);
         }
         let payload = TxPayload::GroupKick {
-            signing_pk: signing_pk.to_vec(),
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(signing_pk.to_vec()),
         };
         let mut ok = self.mint_on(state, rng, &ids, payload)?;
         let live = live_mut(&mut ok.state, ids.conversation_id).expect("live");
-        live.members.retain(|m| m.signing_pk != signing_pk);
+        live.members.retain(|m| {
+            m.signing_pk != crate::protocol::v1::SigningPublicKey::from_bytes(signing_pk)
+        });
         live.epoch = live.epoch.saturating_add(1);
         self.post_roster(&mut ok.state, rng, ids)?;
         Ok(ok)
@@ -306,7 +318,7 @@ impl Engine {
         }
         let mut ok = self.mint_on(state, rng, &ids, TxPayload::GroupLeave)?;
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Failed(super::query::FailedReason::Left);
+            *phase = GroupPhase::Failed(super::query::GroupEnd::Left);
         }
         Ok(ok)
     }
@@ -366,7 +378,7 @@ impl Engine {
             )
             .ok()?;
         if let Some(phase) = group_phase_mut(&mut ok.state, ids.conversation_id) {
-            *phase = GroupPhase::Failed(super::query::FailedReason::Left);
+            *phase = GroupPhase::Failed(super::query::GroupEnd::Left);
         }
         Some(ok)
     }
@@ -427,7 +439,7 @@ impl Engine {
                     .collect(),
                 persistents: live.persistents.clone(),
                 ephemerals: live.ephemerals.clone(),
-                last_active: state.chains(cid).and_then(|chains| chains.presence_at),
+                last_active: state.established(cid).and_then(|chains| chains.presence_at),
                 local_prefs: super::chat::local_prefs(self, state, cid),
                 messages: self.dm_view(state, cid).messages,
             }),
@@ -448,7 +460,7 @@ impl Engine {
             return Ok(());
         };
         let (_, _, sign_pk, _, _) = self.identity_secret(state, &ids.user_id, &ids.identity_id)?;
-        if live.owner_signing_pk == sign_pk {
+        if live.owner_signing_pk == crate::protocol::v1::SigningPublicKey::from_bytes(sign_pk) {
             Ok(())
         } else {
             Err(EngineError::NotOwner)
@@ -460,7 +472,7 @@ impl Engine {
             return Err(EngineError::WrongPhase);
         };
         let (_, _, sign_pk, _, _) = self.identity_secret(state, &ids.user_id, &ids.identity_id)?;
-        if live.owner_signing_pk == sign_pk {
+        if live.owner_signing_pk == crate::protocol::v1::SigningPublicKey::from_bytes(sign_pk) {
             Ok(())
         } else {
             Err(EngineError::NotOwner)
@@ -496,7 +508,6 @@ impl Engine {
                         .dm_with_peer(state, user, identity, &invite.owner_signing_pk)
                         .unwrap_or(invite.group_id),
                 })),
-                chains: Default::default(),
             },
         );
         Ok(())
@@ -546,30 +557,37 @@ impl Engine {
         let Some((user, identity)) = self.owner_ids(state, cid) else {
             return Ok(());
         };
-        let (_, _, sign_pk, _, _) = self.identity_secret(state, &user, &identity)?;
-        if !roster.members.iter().any(|m| m.signing_pk == sign_pk) {
-            if let Some(phase) = group_phase_mut(state, cid) {
-                *phase = GroupPhase::Failed(super::query::FailedReason::Kicked);
-            }
-            return Ok(());
-        }
-        let (secret, name, photo, owner_signing_pk) = match group_phase(state, cid) {
+        let (owner_signing_pk, secret, name, photo, log) = match group_phase(state, cid) {
             Some(GroupPhase::Live(live)) => (
+                live.owner_signing_pk.clone(),
                 live.secret,
                 live.name.clone(),
                 live.photo.clone(),
-                live.owner_signing_pk.clone(),
+                live.log.clone(),
             ),
             Some(GroupPhase::Offer(offer)) => (
+                offer.owner_signing_pk.clone(),
                 offer.secret,
                 offer.name.clone(),
                 offer.photo.clone(),
-                offer.owner_signing_pk.clone(),
+                std::collections::BTreeMap::new(),
             ),
             _ => return Ok(()),
         };
+        self.verify_roster(&owner_signing_pk, roster)?;
+        let (_, _, sign_pk, _, _) = self.identity_secret(state, &user, &identity)?;
+        if !roster
+            .members
+            .iter()
+            .any(|m| m.signing_pk.as_bytes() == sign_pk.as_slice())
+        {
+            if let Some(phase) = group_phase_mut(state, cid) {
+                *phase = GroupPhase::Failed(super::query::GroupEnd::Kicked);
+            }
+            return Ok(());
+        }
         if let Some(phase) = group_phase_mut(state, cid) {
-            *phase = GroupPhase::Live(GroupLive {
+            *phase = GroupPhase::Live(Box::new(GroupLive {
                 secret,
                 name,
                 photo,
@@ -579,7 +597,9 @@ impl Engine {
                 members: roster.members.clone(),
                 pending: Vec::new(),
                 epoch: roster.epoch,
-            });
+                log,
+                chains: super::chains::EstablishedChains::default(),
+            }));
         }
         Ok(())
     }
@@ -611,12 +631,16 @@ impl Engine {
             .sign(policy, &sign_sk, &bytes, &rng.random32())
             .map_err(|_| EngineError::MalformedPayload)?;
         #[rustfmt::skip]
-        self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupRoster(roster))?;
+        let (tx_id, body, _) = self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupRoster(roster))?;
+        #[rustfmt::skip]
+        self.post_live(state, rng, ids.conversation_id, &secret, tx_id, &body.payload)?;
         for member in members.into_iter().filter(|m| m.signing_pk != owner_pk) {
             #[rustfmt::skip]
             let kem_ct = seal_group_secret(self, rng, policy, &member.encryption_pk, secret.as_bytes())?;
             #[rustfmt::skip]
-            self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupWrap(TxGroupWrap { to: member.signing_pk, from: owner_pk.clone(), kem_ct }))?;
+            let (tx_id, body, _) = self.merge_tx(state, &secret, ids.conversation_id, TxPayload::GroupWrap(TxGroupWrap { to: member.signing_pk, from: owner_pk.clone(), kem_ct }))?;
+            #[rustfmt::skip]
+            self.post_live(state, rng, ids.conversation_id, &secret, tx_id, &body.payload)?;
         }
         Ok(())
     }
@@ -626,6 +650,23 @@ impl Engine {
         Ok(self.suite.canonical_json().encode(&json))
     }
 
+    fn verify_roster(&self, owner_pk: &[u8], roster: &TxGroupRoster) -> Result<(), EngineError> {
+        for policy in [Policy::Classic, Policy::PostQuantum, Policy::Hybrid] {
+            let mut body = roster.clone();
+            body.sig = vec![0; sign_sig_len(policy)];
+            let bytes = self.roster_bytes(&body)?;
+            if self
+                .suite
+                .sign()
+                .verify(policy, owner_pk, &bytes, &roster.sig)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        Err(EngineError::MalformedPayload)
+    }
+
     fn identity_secret(
         &self,
         state: &EngineState,
@@ -633,8 +674,8 @@ impl Engine {
         identity_id: &IdentityId,
     ) -> Result<IdentityKeys, EngineError> {
         state
-            .txs
-            .values()
+            .bodies()
+            .iter()
             .find_map(|tx| match &tx.payload {
                 TxPayload::EngineCreateIdentity {
                     user_id: u,
@@ -659,7 +700,7 @@ impl Engine {
         state: &EngineState,
         signing_pk: &[u8],
     ) -> Option<(UserId, IdentityId)> {
-        state.txs.values().find_map(|tx| match &tx.payload {
+        state.bodies().iter().find_map(|tx| match &tx.payload {
             TxPayload::EngineCreateIdentity {
                 user_id,
                 identity_id,
@@ -684,7 +725,8 @@ impl Engine {
             .iter()
             .find_map(|(cid, node)| {
                 if matches!(node.kind, IdentityConversation::DirectMessage { .. })
-                    && dm_peer(state, *cid, &local).is_some_and(|(pk, _)| pk == peer_signing)
+                    && dm_peer(state, *cid, &local)
+                        .is_some_and(|(pk, _)| pk.as_bytes() == peer_signing)
                 {
                     Some(*cid)
                 } else {
@@ -753,13 +795,16 @@ pub(super) fn dm_peer(
     state: &EngineState,
     dm: ConversationId,
     local_sign: &[u8],
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> Option<(
+    super::super::SigningPublicKey,
+    super::super::EncryptionPublicKey,
+)> {
     let parent = state.established_parent(dm)?;
     let inviter = inviter_intro_for(state, parent)?;
     let invitee = invitee_intro_for(state, parent)?;
-    if inviter.signing_pk == local_sign {
+    if inviter.signing_pk.as_bytes() == local_sign {
         Some((invitee.signing_pk.clone(), invitee.encryption_pk.clone()))
-    } else if invitee.signing_pk == local_sign {
+    } else if invitee.signing_pk.as_bytes() == local_sign {
         Some((inviter.signing_pk.clone(), inviter.encryption_pk.clone()))
     } else {
         None
@@ -867,6 +912,49 @@ pub(super) fn group_json(
             ("name".into(), Json::String(live.name.as_str().into())),
             ("owner".into(), bstr(&live.owner_signing_pk)),
             ("epoch".into(), Json::Number(live.epoch)),
+            (
+                "photo".into(),
+                match &live.photo {
+                    Some(pic) => bstr(pic.as_bytes()),
+                    None => Json::Null,
+                },
+            ),
+            (
+                "persistents".into(),
+                Json::Array(
+                    live.persistents
+                        .iter()
+                        .map(super::super::codec::durable_json)
+                        .collect(),
+                ),
+            ),
+            (
+                "ephemerals".into(),
+                Json::Array(
+                    live.ephemerals
+                        .iter()
+                        .map(super::super::codec::ephemeral_json)
+                        .collect(),
+                ),
+            ),
+            (
+                "members".into(),
+                Json::Array(
+                    live.members
+                        .iter()
+                        .map(|member| member_json(b64u, member))
+                        .collect(),
+                ),
+            ),
+            (
+                "pending".into(),
+                Json::Array(
+                    live.pending
+                        .iter()
+                        .map(|row| pending_json(b64u, row))
+                        .collect(),
+                ),
+            ),
         ]),
     }
 }
@@ -886,7 +974,7 @@ pub(super) fn parse_group(
             .ok_or(EngineError::MalformedPersist)
     };
     if m.iter().any(|(k, _)| k == "failed") {
-        return Ok(GroupPhase::Failed(super::query::FailedReason::Left));
+        return Ok(GroupPhase::Failed(super::query::GroupEnd::Left));
     }
     let secret = Secret::from_bytes(decode32(b64u, field("secret")?)?);
     let name = match field("name")? {
@@ -902,7 +990,7 @@ pub(super) fn parse_group(
             secret,
             name,
             photo: None,
-            owner_signing_pk: owner,
+            owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(owner),
             from_conversation_id: from,
         }));
     }
@@ -910,17 +998,163 @@ pub(super) fn parse_group(
         Json::Number(n) => *n,
         _ => return Err(EngineError::MalformedPersist),
     };
-    Ok(GroupPhase::Live(GroupLive {
+    Ok(GroupPhase::Live(Box::new(GroupLive {
         secret,
         name,
-        photo: None,
-        owner_signing_pk: owner,
-        persistents: Vec::new(),
-        ephemerals: Vec::new(),
-        members: Vec::new(),
-        pending: Vec::new(),
+        photo: match optional_field(m, "photo") {
+            Some(Json::Null) | None => None,
+            Some(other) => Some(
+                ProfilePic::try_from(decode_vec(b64u, other)?.as_slice())
+                    .map_err(|_| EngineError::MalformedPersist)?,
+            ),
+        },
+        owner_signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(owner),
+        persistents: match optional_field(m, "persistents") {
+            Some(value) => super::super::codec::parse_durable_list(value)
+                .map_err(|_| EngineError::MalformedPersist)?,
+            None => Vec::new(),
+        },
+        ephemerals: match optional_field(m, "ephemerals") {
+            Some(value) => super::super::codec::parse_ephemeral_list(value)
+                .map_err(|_| EngineError::MalformedPersist)?,
+            None => Vec::new(),
+        },
+        members: match optional_field(m, "members") {
+            Some(value) => parse_members(b64u, value)?,
+            None => Vec::new(),
+        },
+        pending: match optional_field(m, "pending") {
+            Some(value) => parse_pending(b64u, value)?,
+            None => Vec::new(),
+        },
         epoch,
-    }))
+        log: std::collections::BTreeMap::new(),
+        chains: super::chains::EstablishedChains::default(),
+    })))
+}
+
+fn optional_field<'a>(
+    m: &'a [(String, super::super::Json)],
+    key: &str,
+) -> Option<&'a super::super::Json> {
+    m.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn member_json(
+    b64u: &dyn super::super::Base64Url,
+    member: &super::super::payload::GroupMember,
+) -> super::super::Json {
+    use super::super::Json;
+    let bstr = |bytes: &[u8]| Json::String(b64u.encode(bytes));
+    Json::Object(vec![
+        ("signing_pk".into(), bstr(&member.signing_pk)),
+        ("encryption_pk".into(), bstr(&member.encryption_pk)),
+        ("send_tag_key".into(), bstr(member.send_tag_key.as_bytes())),
+        (
+            "eph_send_tag_key".into(),
+            bstr(member.eph_send_tag_key.as_bytes()),
+        ),
+    ])
+}
+
+fn pending_json(b64u: &dyn super::super::Base64Url, row: &GroupPending) -> super::super::Json {
+    use super::super::Json;
+    let bstr = |bytes: &[u8]| Json::String(b64u.encode(bytes));
+    Json::Object(vec![
+        ("signing_pk".into(), bstr(&row.signing_pk)),
+        ("encryption_pk".into(), bstr(&row.encryption_pk)),
+        ("from".into(), bstr(row.from_conversation_id.as_bytes())),
+        ("name".into(), Json::String(row.name.as_str().into())),
+        (
+            "photo".into(),
+            match &row.photo {
+                Some(pic) => bstr(pic.as_bytes()),
+                None => Json::Null,
+            },
+        ),
+    ])
+}
+
+fn parse_members(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<Vec<super::super::payload::GroupMember>, EngineError> {
+    let super::super::Json::Array(items) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    items.iter().map(|item| parse_member(b64u, item)).collect()
+}
+
+fn parse_member(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<super::super::payload::GroupMember, EngineError> {
+    use super::super::payload::GroupMember;
+    let super::super::Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let field = |name: &str| {
+        m.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+            .ok_or(EngineError::MalformedPersist)
+    };
+    Ok(GroupMember {
+        #[rustfmt::skip]
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(decode_vec(b64u, field("signing_pk")?)?),
+        #[rustfmt::skip]
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(decode_vec(b64u, field("encryption_pk")?)?),
+        send_tag_key: super::super::TagKey::from_bytes(decode32(b64u, field("send_tag_key")?)?),
+        #[rustfmt::skip]
+        eph_send_tag_key: super::super::TagKey::from_bytes(decode32(b64u, field("eph_send_tag_key")?)?),
+    })
+}
+
+fn parse_pending(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<Vec<GroupPending>, EngineError> {
+    let super::super::Json::Array(items) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    items
+        .iter()
+        .map(|item| parse_one_pending(b64u, item))
+        .collect()
+}
+
+fn parse_one_pending(
+    b64u: &dyn super::super::Base64Url,
+    value: &super::super::Json,
+) -> Result<GroupPending, EngineError> {
+    let super::super::Json::Object(m) = value else {
+        return Err(EngineError::MalformedPersist);
+    };
+    let field = |name: &str| {
+        m.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+            .ok_or(EngineError::MalformedPersist)
+    };
+    let name = match field("name")? {
+        super::super::Json::String(s) => {
+            DisplayName::try_from(s.as_str()).map_err(|_| EngineError::MalformedPersist)?
+        }
+        _ => return Err(EngineError::MalformedPersist),
+    };
+    Ok(GroupPending {
+        #[rustfmt::skip]
+        signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(decode_vec(b64u, field("signing_pk")?)?),
+        #[rustfmt::skip]
+        encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(decode_vec(b64u, field("encryption_pk")?)?),
+        from_conversation_id: ConversationId::from_bytes(decode32(b64u, field("from")?)?),
+        name,
+        photo: match optional_field(m, "photo") {
+            Some(super::super::Json::Null) | None => None,
+            #[rustfmt::skip]
+            Some(other) => Some(ProfilePic::try_from(decode_vec(b64u, other)?.as_slice()).map_err(|_| EngineError::MalformedPersist)?),
+        },
+    })
 }
 
 fn decode32(
@@ -998,6 +1232,100 @@ mod tests {
             )
             .is_err()
         );
+        let bare = parse_group(
+            b64,
+            &Json::Object(vec![
+                ("secret".into(), Json::String(b64.encode(&[1; 32]))),
+                ("name".into(), Json::String("G".into())),
+                ("owner".into(), Json::String(b64.encode(&[2; 32]))),
+                ("epoch".into(), Json::Number(1)),
+            ]),
+        )
+        .expect("bare");
+        assert!(matches!(
+            bare,
+            super::GroupPhase::Live(ref live)
+                if live.members.is_empty()
+                    && live.photo.is_none()
+                    && live.persistents.is_empty()
+                    && live.ephemerals.is_empty()
+                    && live.pending.is_empty()
+        ));
+        let row = |extra: Vec<(String, Json)>| {
+            let mut members = vec![
+                ("secret".into(), Json::String(b64.encode(&[1; 32]))),
+                ("name".into(), Json::String("G".into())),
+                ("owner".into(), Json::String(b64.encode(&[2; 32]))),
+                ("epoch".into(), Json::Number(1)),
+            ];
+            members.extend(extra);
+            Json::Object(members)
+        };
+        assert!(parse_group(b64, &row(vec![("photo".into(), Json::Null)])).is_ok());
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("photo".into(), Json::String(b64.encode(&[1])))])
+            )
+            .is_err()
+        );
+        assert!(parse_group(b64, &row(vec![("persistents".into(), Json::Null)])).is_err());
+        assert!(parse_group(b64, &row(vec![("ephemerals".into(), Json::Null)])).is_err());
+        assert!(parse_group(b64, &row(vec![("members".into(), Json::Null)])).is_err());
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("members".into(), Json::Array(vec![Json::Null]))])
+            )
+            .is_err()
+        );
+        assert!(parse_group(b64, &row(vec![("pending".into(), Json::Null)])).is_err());
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("pending".into(), Json::Array(vec![Json::Null]))])
+            )
+            .is_err()
+        );
+        let mut webp = vec![0u8; 12];
+        webp[0..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        let pending = Json::Object(vec![
+            ("signing_pk".into(), Json::String(b64.encode(&[4]))),
+            ("encryption_pk".into(), Json::String(b64.encode(&[5]))),
+            ("from".into(), Json::String(b64.encode(&[6; 32]))),
+            ("name".into(), Json::String("Pat".into())),
+            ("photo".into(), Json::String(b64.encode(&webp))),
+        ]);
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("pending".into(), Json::Array(vec![pending]))])
+            )
+            .is_ok()
+        );
+        let bad_name = Json::Object(vec![
+            ("signing_pk".into(), Json::String(b64.encode(&[4]))),
+            ("encryption_pk".into(), Json::String(b64.encode(&[5]))),
+            ("from".into(), Json::String(b64.encode(&[6; 32]))),
+            ("name".into(), Json::Number(1)),
+        ]);
+        assert!(
+            parse_group(
+                b64,
+                &row(vec![("pending".into(), Json::Array(vec![bad_name]))])
+            )
+            .is_err()
+        );
+        let pic = crate::protocol::v1::ProfilePic::try_from(webp.as_slice()).expect("pic");
+        let with_photo = super::GroupPending {
+            signing_pk: crate::protocol::v1::SigningPublicKey::from_bytes(vec![4]),
+            encryption_pk: crate::protocol::v1::EncryptionPublicKey::from_bytes(vec![5]),
+            from_conversation_id: crate::protocol::v1::ConversationId::from_bytes([6; 32]),
+            name: crate::protocol::v1::DisplayName::try_from("Pat").expect("n"),
+            photo: Some(pic),
+        };
+        let _ = super::pending_json(b64, &with_photo);
         assert!(parse_group(b64, &Json::Object(vec![("secret".into(), Json::Null)])).is_err());
         assert!(
             parse_group(
