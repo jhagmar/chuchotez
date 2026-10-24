@@ -340,7 +340,7 @@ impl Engine {
             .and_then(|c| c.send.get(&actor))
         {
             Some(c) => c.clone(),
-            None => join(self.suite.hmac(), secret.as_bytes(), sort, &[])?,
+            None => join(self.suite.hmac(), &secret, sort, &[])?,
         };
         let mut frag_i = 0u64;
         loop {

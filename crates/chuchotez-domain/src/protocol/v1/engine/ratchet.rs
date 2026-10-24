@@ -154,7 +154,7 @@ impl Engine {
             return None;
         }
         let shared = next_shared(state, cid, from_us, chain.epoch.as_u64())?;
-        mix(self.suite.hmac(), chain, sort, shared.as_bytes()).ok()
+        mix(self.suite.hmac(), chain, sort, &shared).ok()
     }
 
     pub(super) fn note_sent_packet(&self, state: &mut EngineState, cid: ConversationId) {
@@ -163,6 +163,7 @@ impl Engine {
         }
     }
 
+    /// Which ratchet packet is still owed: an acknowledgement, a wrap, or a fresh advertise.
     fn choose_owed(
         &self,
         state: &EngineState,
@@ -188,6 +189,7 @@ impl Engine {
         self.advertise(rng, policy)
     }
 
+    /// Acknowledgement of a wrap we received and have not acknowledged yet.
     fn ack_of_wrap(&self, state: &EngineState, cid: ConversationId) -> Option<TxPayload> {
         let chains = state.established(cid)?;
         for known in &chains.ratchet.known {
@@ -207,6 +209,7 @@ impl Engine {
         None
     }
 
+    /// Acknowledgement of an advertise we received and have not acknowledged yet.
     fn ack_of_advertise(
         &self,
         state: &EngineState,
@@ -233,6 +236,7 @@ impl Engine {
         None
     }
 
+    /// Wrap a fresh shared secret to the peer's advertised key.
     fn wrap_to_peer(
         &self,
         state: &EngineState,
@@ -286,6 +290,7 @@ impl Engine {
         None
     }
 
+    /// A new encapsulation key for the peer to wrap to. The secret half is kept until a wrap arrives.
     fn advertise(&self, rng: &dyn Rng, policy: Policy) -> Result<Option<Minted>, EngineError> {
         let seed = KemSeed::from_pair(rng.random32(), rng.random32());
         let Ok(keys) = self.suite.kem().generate(policy, &seed) else {
@@ -305,11 +310,13 @@ impl Engine {
     }
 }
 
+/// This packet sits on the mix stride, so it is a candidate for folding in the next shared secret.
 fn mix_due(chain: &SendChain) -> bool {
     let seq = chain.packet_seq.as_u64();
     seq > 0 && seq.is_multiple_of(MIX_STRIDE)
 }
 
+/// The shared secret that belongs to the epoch we are about to enter.
 fn next_shared(
     state: &EngineState,
     cid: ConversationId,
@@ -324,6 +331,7 @@ fn next_shared(
     agreed.into_iter().nth(epoch)
 }
 
+/// Shared secrets both sides have acknowledged, in the order they should be mixed.
 fn agreed_shareds(state: &EngineState, cid: ConversationId, from_us: bool) -> Vec<Secret> {
     let Some(chains) = state.established(cid) else {
         return Vec::new();
@@ -340,6 +348,7 @@ fn agreed_shareds(state: &EngineState, cid: ConversationId, from_us: bool) -> Ve
     rows.into_iter().map(|(_, shared)| shared).collect()
 }
 
+/// Whether an acknowledgement of this hash is already stored.
 fn ack_exists(state: &EngineState, cid: ConversationId, tag: Tag) -> bool {
     state.bodies().iter().any(|body| {
         body.conversation_id == cid
@@ -350,6 +359,7 @@ fn ack_exists(state: &EngineState, cid: ConversationId, tag: Tag) -> bool {
     })
 }
 
+/// Whether that acknowledgement has been persistent-acked, so both sides can treat the secret as agreed.
 fn ack_watermarked(state: &EngineState, cid: ConversationId, tag: Tag) -> bool {
     state.body_pairs().into_iter().any(|(id, body)| {
         body.conversation_id == cid
@@ -361,6 +371,7 @@ fn ack_watermarked(state: &EngineState, cid: ConversationId, tag: Tag) -> bool {
     })
 }
 
+/// Hash of a public key or ciphertext, used as the value an acknowledgement names.
 fn digest_tag(engine: &Engine, bytes: &[u8]) -> Tag {
     Tag::from_bytes(engine.suite.hash().hash(bytes))
 }
