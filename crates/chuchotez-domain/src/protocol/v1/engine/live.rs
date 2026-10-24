@@ -47,6 +47,7 @@ pub(super) fn live_persistent_only(sort: ConversationSort, payload: &TxPayload) 
         )
 }
 
+/// Presence packet for the live path. The visible form names this device; the quiet form does not.
 fn presence_plain(
     visible: bool,
     actor: &[u8],
@@ -76,6 +77,7 @@ pub(super) fn bin_tag(hmac: &dyn HmacSha256, key: TagKey, label: &[u8], bin: Tim
     Tag::from_bytes(expand(hmac, &HmacSha256Key::from_bytes(*key.as_bytes()), &info).into_bytes())
 }
 
+/// Established conversations. Handshake rows are omitted because they do not use the live path for chat.
 fn established_cids(state: &EngineState) -> Vec<ConversationId> {
     let mut out = Vec::new();
     for user in state.users.values() {
@@ -272,6 +274,7 @@ impl Engine {
         })
     }
 
+    /// Tell the peer this device is here, once, after the process comes online.
     fn probe_presence(
         &self,
         state: &mut EngineState,
@@ -346,6 +349,7 @@ impl Engine {
         Ok(())
     }
 
+    /// Chain position the next packet should use. A packet still waiting for a live acknowledgement stays ahead of the stored chain.
     fn sending_chain(
         &self,
         state: &EngineState,
@@ -369,12 +373,13 @@ impl Engine {
         }
         join(
             self.suite.hmac(),
-            secret.as_bytes(),
+            secret,
             route.sort,
             route.actor.as_bytes(),
         )
     }
 
+    /// Queue one ephemeral write on every ephemeral channel this conversation uses.
     fn push_eph(
         &self,
         state: &mut EngineState,
@@ -397,6 +402,7 @@ impl Engine {
         }
     }
 
+    /// Queue one durable write on every durable channel this conversation uses.
     fn push_durable(
         &self,
         state: &mut EngineState,
@@ -419,6 +425,7 @@ impl Engine {
         }
     }
 
+    /// Channels, actor, and tag key for sending on this established conversation.
     fn live_route(&self, state: &EngineState, cid: ConversationId) -> Option<LiveRoute> {
         if let Some(route) = self.group_route(state, cid) {
             return Some(route);
@@ -442,6 +449,7 @@ impl Engine {
         })
     }
 
+    /// Open one body addressed to an established conversation and merge it when it decrypts.
     fn ingest_established(
         &self,
         state: &mut EngineState,
@@ -463,6 +471,7 @@ impl Engine {
         Err(EngineError::UnknownTag)
     }
 
+    /// Sending route for a live group. Group packets stay on the durable channels.
     fn group_route(&self, state: &EngineState, cid: ConversationId) -> Option<LiveRoute> {
         let live = super::group::group_live(state, cid)?;
         let (actor, signing) = local_material(self, state, cid)?;
@@ -480,6 +489,7 @@ impl Engine {
         })
     }
 
+    /// Whether this tag is one this device is listening for on an established direct message or sync.
     fn established_match(
         &self,
         state: &EngineState,
@@ -510,6 +520,7 @@ impl Engine {
         None
     }
 
+    /// Whether this tag is one this device is listening for on a live group.
     fn group_match(
         &self,
         state: &EngineState,
@@ -547,6 +558,7 @@ impl Engine {
         None
     }
 
+    /// A tag matches when it is the listen tag for one of the recent hour bins.
     fn tag_hits(
         &self,
         state: &EngineState,
@@ -589,6 +601,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Try each actor who might have sent this body. The first key that opens it wins.
     fn open_established(
         &self,
         state: &mut EngineState,
@@ -611,7 +624,7 @@ impl Engine {
         for actor_bytes in actors {
             let actor = super::helpers::actor_for(sort, &actor_bytes).expect("actor");
             #[rustfmt::skip]
-            let joined = join(self.suite.hmac(), secret.as_bytes(), sort, &actor_bytes)?;
+            let joined = join(self.suite.hmac(), secret, sort, &actor_bytes)?;
             let start = state
                 .established(cid)
                 .and_then(|chains| chains.recv.get(&actor).cloned())
@@ -639,6 +652,7 @@ impl Engine {
         Ok(None)
     }
 
+    /// Record a packet that opened, and advance the receive chain to the position after it.
     fn on_established(
         &self,
         state: &mut EngineState,
@@ -659,6 +673,7 @@ impl Engine {
         self.accept_fragment(state, rng, cid, packet, persistent)
     }
 
+    /// Store one fragment. When the last fragment arrives, reassemble the transaction and apply it.
     fn accept_fragment(
         &self,
         state: &mut EngineState,
@@ -755,6 +770,7 @@ impl Engine {
     }
 }
 
+/// Actor bytes carried on a fragment. Other packet kinds have none.
 fn packet_actor(packet: &PacketPlain) -> Vec<u8> {
     match packet {
         PacketPlain::TxFragMore(packet) => packet.actor_id.clone(),
@@ -778,6 +794,7 @@ pub(super) fn local_material(
     Some((Actor::signing(signing.clone()), signing))
 }
 
+/// Tag keys the peer published in the handshake intro. Listen tags are derived from these.
 fn intro_tag_keys(
     state: &EngineState,
     parent: ConversationId,
@@ -792,6 +809,7 @@ fn intro_tag_keys(
     (intro.signing_pk.as_bytes() == signing).then_some((intro.send_tag_key, intro.eph_send_tag_key))
 }
 
+/// Signing keys of the members a group packet might have come from.
 fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
     super::group::group_live(state, cid)
         .map(|live| {
@@ -803,6 +821,7 @@ fn group_member_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>>
         .unwrap_or_default()
 }
 
+/// This device's id and the peer's id. A sync packet is sealed to one of those actors.
 fn sync_open_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
     let mut actors = Vec::new();
     if let Some(id) = state.device.keys.as_ref().map(|keys| keys.id) {
@@ -816,6 +835,7 @@ fn sync_open_actors(state: &EngineState, cid: ConversationId) -> Vec<Vec<u8>> {
     actors
 }
 
+/// Signing keys that might have sent a direct-message packet: ours and the peer's.
 fn open_actors(
     state: &EngineState,
     parent: ConversationId,

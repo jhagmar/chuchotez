@@ -583,7 +583,7 @@ fn chains_json(
             .iter()
             .map(|e| {
                 Json::Object(vec![
-                    ("mk".into(), bstr(b64u, &e.mk)),
+                    ("mk".into(), bstr(b64u, e.mk.as_bytes())),
                     ("expires_at".into(), Json::Number(e.expires_at.as_u64())),
                     (
                         "tx_id".into(),
@@ -955,7 +955,7 @@ fn parse_chains(
                     Some(v) => Some(Tag::from_bytes(decode_fold32(b64u, v)?)),
                 };
                 entries.push(CachedMk {
-                    mk: mk_v,
+                    mk: super::super::chain::MessageKey::from_bytes(mk_v),
                     expires_at: super::super::UnixSeconds::from_u64(*expires_at),
                     tx_id,
                 });

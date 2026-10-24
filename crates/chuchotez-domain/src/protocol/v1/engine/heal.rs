@@ -161,6 +161,7 @@ impl Engine {
         Ok(())
     }
 
+    /// The peer's XOR of a range disagrees with ours, so split the range or name the one id that differs.
     fn on_half(
         &self,
         state: &mut EngineState,
@@ -205,6 +206,7 @@ impl Engine {
         self.replace_probes(state, rng, cid, probes)
     }
 
+    /// The range cannot be split any further, so report the ids this device has in it.
     fn have_local(
         &self,
         state: &mut EngineState,
@@ -230,6 +232,7 @@ impl Engine {
         )
     }
 
+    /// The peer is missing ids in this range, so prepare to send those transactions.
     fn on_want(
         &self,
         state: &mut EngineState,
@@ -258,6 +261,7 @@ impl Engine {
         self.retransmit(state, rng, cid, &ids)
     }
 
+    /// The peer listed the ids it has, so ask for the ones this device does not.
     fn on_have(
         &self,
         state: &mut EngineState,
@@ -297,6 +301,7 @@ impl Engine {
         )
     }
 
+    /// Keep one search at a time. A new answer replaces the probes still in flight and is posted.
     fn replace_probes(
         &self,
         state: &mut EngineState,
@@ -311,6 +316,7 @@ impl Engine {
         self.post_heal(state, rng, cid)
     }
 
+    /// Seal the current probes. While the conversation is live they go out on the ephemeral path. After the answer window they go out on the durable path.
     fn post_heal(
         &self,
         state: &mut EngineState,
@@ -338,7 +344,7 @@ impl Engine {
         let tag = invite_tag(self.suite.hmac(), secret.as_bytes(), time_bin(now));
         let origin = match state.chains(cid).and_then(|c| c.send.get(&actor).cloned()) {
             Some(chain) => chain,
-            None => join(self.suite.hmac(), secret.as_bytes(), sort, &[])?,
+            None => join(self.suite.hmac(), &secret, sort, &[])?,
         };
         let live = state
             .chains(cid)
@@ -399,6 +405,7 @@ impl Engine {
         Ok(())
     }
 
+    /// The ephemeral answer did not arrive in time, so post the durable copies that were sealed for this search.
     fn commit_ready(&self, state: &mut EngineState, cid: ConversationId) {
         let chains = state.chains(cid).expect("heal row");
         let ready = chains.heal.ready.clone();
@@ -428,6 +435,7 @@ impl Engine {
         chains.heal.needs_reseal = false;
     }
 
+    /// Send the transactions the search decided the other side is missing.
     fn retransmit(
         &self,
         state: &mut EngineState,
@@ -456,6 +464,7 @@ impl Engine {
     }
 }
 
+/// Three ticked seconds have passed since an ephemeral probe, and no answer has arrived.
 fn fallback_due(state: &EngineState, cid: ConversationId, now: UnixSeconds) -> bool {
     state.chains(cid).is_some_and(|c| {
         c.heal.on_ephemeral
@@ -466,6 +475,7 @@ fn fallback_due(state: &EngineState, cid: ConversationId, now: UnixSeconds) -> b
     })
 }
 
+/// The durable copies were sealed from the chain this device still holds. If the chain has moved, they have to be sealed again.
 fn sealed_matches(chains: &super::state::PacketChains) -> bool {
     let Some(from) = &chains.heal.sealed_from else {
         return false;
@@ -476,10 +486,12 @@ fn sealed_matches(chains: &super::state::PacketChains) -> bool {
     }
 }
 
+/// Same root, stepping key, epoch, and sequence. Used to notice that the chain moved after a seal.
 fn same_chain(a: &SendChain, b: &SendChain) -> bool {
     a.root == b.root && a.c == b.c && a.epoch == b.epoch && a.packet_seq == b.packet_seq
 }
 
+/// Conversations that still have packet chains. A set-XOR search only runs on those.
 fn heal_cids(state: &EngineState) -> Vec<ConversationId> {
     let mut ids = Vec::new();
     state.for_each_chains(|cid, chains| {
@@ -490,6 +502,7 @@ fn heal_cids(state: &EngineState) -> Vec<ConversationId> {
     ids
 }
 
+/// Durable and ephemeral channels this conversation posts on.
 fn channels(
     state: &EngineState,
     cid: ConversationId,
@@ -504,6 +517,7 @@ fn channels(
     (durable, ephemeral)
 }
 
+/// Transaction ids stored for this conversation. Their XOR is the set fingerprint.
 fn conv_ids(state: &EngineState, cid: ConversationId) -> Vec<Tag> {
     let mut ids: Vec<Tag> = state
         .body_pairs()
@@ -515,6 +529,7 @@ fn conv_ids(state: &EngineState, cid: ConversationId) -> Vec<Tag> {
     ids
 }
 
+/// XOR of the ids that fall in `[lo, hi)`. The two sides compare this to see whether that slice of the set matches.
 fn range_xor(ids: &[Tag], lo: &Tag, hi: &Tag) -> Tag {
     let mut acc = [0u8; 32];
     for id in ids {
@@ -527,18 +542,22 @@ fn range_xor(ids: &[Tag], lo: &Tag, hi: &Tag) -> Tag {
     Tag::from_bytes(acc)
 }
 
+/// Whether `id` sits in the half-open range this probe is about.
 fn in_range(id: &Tag, lo: &Tag, hi: &Tag) -> bool {
     id >= lo && (is_inf(hi) || id < hi)
 }
 
+/// An upper bound of all `0xff` bytes means the range runs through the end of the id space.
 fn is_inf(hi: &Tag) -> bool {
     hi.as_bytes() == &[0xff; 32]
 }
 
+/// The range holds one id, so the search can stop splitting and name that id.
 fn single_id(lo: &Tag, hi: &Tag) -> bool {
     successor(lo).is_some_and(|next| next == *hi)
 }
 
+/// The id just after `lo`. `None` when `lo` is already the last id.
 fn successor(lo: &Tag) -> Option<Tag> {
     let mut bytes = *lo.as_bytes();
     for byte in bytes.iter_mut().rev() {
@@ -551,6 +570,7 @@ fn successor(lo: &Tag) -> Option<Tag> {
     None
 }
 
+/// Where to split `[lo, hi)` for the next probe. `None` when the bounds are already adjacent.
 fn midpoint(lo: &Tag, hi: &Tag) -> Option<Tag> {
     let inf = is_inf(hi);
     let mid = if inf {
@@ -587,6 +607,7 @@ fn midpoint(lo: &Tag, hi: &Tag) -> Option<Tag> {
     (mid > *lo && (inf || mid < *hi)).then_some(mid)
 }
 
+/// The packet that carries one step of the set-XOR search.
 fn probe_plain(probe: &HealProbe, packet_seq: u64, actor_id: &[u8]) -> PacketPlain {
     match probe {
         HealProbe::Half { lo, hi } => PacketPlain::HealHalfXor(PacketHealHalfXor {

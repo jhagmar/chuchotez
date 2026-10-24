@@ -2246,7 +2246,7 @@ fn invite_packets_open_from_ticket_secret() {
     let ticket = ticket_from_json(engine.suite.b64u(), &json).expect("ticket");
     let chain = join(
         engine.suite.hmac(),
-        ticket.secret.as_bytes(),
+        &ticket.secret,
         ConversationSort::HandshakeDm,
         &[],
     )
@@ -2301,7 +2301,7 @@ fn invite_packets_open_from_ticket_secret() {
         cid,
         Actor::handshake(),
         super::super::chain::CachedMk {
-            mk: [1; 32],
+            mk: super::super::chain::MessageKey::from_bytes([1; 32]),
             expires_at: UnixSeconds::from_u64(u64::MAX),
             tx_id: Some(crate::protocol::v1::Tag::from_bytes([2; 32])),
         },
@@ -2368,7 +2368,7 @@ fn invite_packets_open_from_ticket_secret() {
         &mut EngineState::new(),
         cid,
         &Actor::handshake(),
-        &[0; 32],
+        &super::super::chain::MessageKey::from_bytes([0; 32]),
         crate::protocol::v1::Tag::from_bytes([0; 32]),
     );
     let ghost_hit = super::state::HandshakeHit {
@@ -2572,7 +2572,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
     let ticket_m = ticket_from_json(engine.suite.b64u(), &json_t).expect("ticketm");
     let mut ack_chain = join(
         engine.suite.hmac(),
-        ticket_m.secret.as_bytes(),
+        &ticket_m.secret,
         ConversationSort::HandshakeDm,
         &[],
     )
@@ -2669,7 +2669,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
     let ticket = ticket_from_json(engine.suite.b64u(), &json).expect("ticket");
     let chain = join(
         engine.suite.hmac(),
-        ticket.secret.as_bytes(),
+        &ticket.secret,
         ConversationSort::HandshakeDm,
         &[],
     )
@@ -2856,7 +2856,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
         sid,
         Actor::handshake(),
         super::super::chain::CachedMk {
-            mk: [2; 32],
+            mk: super::super::chain::MessageKey::from_bytes([2; 32]),
             expires_at: UnixSeconds::from_u64(u64::MAX),
             tx_id: None,
         },
@@ -3196,7 +3196,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
         ph_rk,
         Actor::handshake(),
         super::super::chain::CachedMk {
-            mk: [3; 32],
+            mk: super::super::chain::MessageKey::from_bytes([3; 32]),
             expires_at: UnixSeconds::from_u64(u64::MAX),
             tx_id: None,
         },
@@ -3205,7 +3205,7 @@ fn ingest_list_merges_notice_and_completes_bin() {
         ph_rk,
         Actor::signing(vec![7; 8]),
         super::super::chain::CachedMk {
-            mk: [6; 32],
+            mk: super::super::chain::MessageKey::from_bytes([6; 32]),
             expires_at: UnixSeconds::from_u64(u64::MAX),
             tx_id: None,
         },
@@ -4317,7 +4317,7 @@ fn handshake_intros_confirming_and_failures() {
         ConversationId::from_bytes([1; 32]),
         Actor::handshake(),
         super::super::chain::CachedMk {
-            mk: [2; 32],
+            mk: super::super::chain::MessageKey::from_bytes([2; 32]),
             expires_at: UnixSeconds::from_u64(9),
             tx_id: None,
         },
@@ -4331,8 +4331,8 @@ fn handshake_intros_confirming_and_failures() {
         },
     );
     let dummy = super::super::chain::SendChain {
-        root: [0; 32],
-        c: [0; 32],
+        root: super::super::chain::ChainRoot::from_bytes([0; 32]),
+        c: super::super::chain::ChainKey::from_bytes([0; 32]),
         epoch: crate::protocol::v1::PacketEpoch::from_u64(0),
         packet_seq: crate::protocol::v1::PacketSeq::from_u64(0),
     };
@@ -4424,7 +4424,7 @@ fn handshake_intros_confirming_and_failures() {
     assert_eq!(clash_ing.failed(cid), Some(FailedReason::NoticeConflict));
     let codec_chain = join(
         engine.suite.hmac(),
-        secret.as_bytes(),
+        &secret,
         ConversationSort::HandshakeDm,
         &[],
     )
@@ -4794,7 +4794,7 @@ fn watermark_expire_live_ack_and_fold_fields() {
     let ticket = super::super::codec::ticket_from_json(engine.suite.b64u(), &json).expect("ticket");
     let chain = join(
         engine.suite.hmac(),
-        ticket.secret.as_bytes(),
+        &ticket.secret,
         ConversationSort::HandshakeDm,
         &[],
     )
@@ -6621,7 +6621,7 @@ fn advertise_wrap_ack_and_mix() {
         let chains = mix_state.established_mut(dm).expect("c");
         let mut chain = super::super::chain::join(
             engine.suite.hmac(),
-            dm_secret.as_bytes(),
+            &dm_secret,
             ConversationSort::DirectMessage,
             &[],
         )
@@ -6778,7 +6778,7 @@ fn advertise_wrap_ack_and_mix() {
         engine.suite.hmac(),
         &start,
         ConversationSort::HandshakeDm,
-        &[0; 32],
+        &crate::protocol::v1::Secret::from_bytes([0; 32]),
     )
     .expect("mx");
     let body = seal_packet(
@@ -6819,7 +6819,7 @@ fn advertise_wrap_ack_and_mix() {
         chains.skipped_mks.insert(
             Actor::handshake(),
             vec![super::super::chain::CachedMk {
-                mk: [6; 32],
+                mk: super::super::chain::MessageKey::from_bytes([6; 32]),
                 expires_at: UnixSeconds::from_u64(9),
                 tx_id: None,
             }],
@@ -6859,7 +6859,7 @@ fn advertise_wrap_ack_and_mix() {
     assert_eq!(back.established(dm).expect("dm").ratchet.known.len(), 1);
     let bare = super::super::chain::join(
         engine.suite.hmac(),
-        secret.as_bytes(),
+        &secret,
         ConversationSort::HandshakeDm,
         &[],
     )
@@ -7406,7 +7406,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
     assert!(later.writes.len() > durable_before);
     let origin = super::super::chain::join(
         live_engine.suite.hmac(),
-        ada.ticket(cid).expect("t").secret.as_bytes(),
+        &ada.ticket(cid).expect("t").secret,
         ConversationSort::HandshakeDm,
         &[],
     )
@@ -7631,7 +7631,7 @@ fn heal_searches_then_retransmits_and_falls_back() {
         let chains = gap.chains_mut(cid).expect("g2");
         let origin = super::super::chain::join(
             live_engine.suite.hmac(),
-            ticket.secret.as_bytes(),
+            &ticket.secret,
             ConversationSort::HandshakeDm,
             &[],
         )
@@ -7999,7 +7999,7 @@ fn live_path_waits_then_falls_back() {
     let secret = ada.established_secret(child).expect("sec");
     let peer = join(
         engine.suite.hmac(),
-        secret.as_bytes(),
+        &secret,
         ConversationSort::DirectMessage,
         &invitee_pk,
     )

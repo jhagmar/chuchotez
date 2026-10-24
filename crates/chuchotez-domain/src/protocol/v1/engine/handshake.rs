@@ -861,7 +861,7 @@ impl Engine {
         }
         let actor = Actor::handshake();
         self.absorb_peer_wraps(state, hit.cid);
-        let joined = join(self.suite.hmac(), hit.secret.as_bytes(), hit.sort, &[])?;
+        let joined = join(self.suite.hmac(), &hit.secret, hit.sort, &[])?;
         let start = state
             .chains(hit.cid)
             .and_then(|c| c.recv.get(&actor).cloned())

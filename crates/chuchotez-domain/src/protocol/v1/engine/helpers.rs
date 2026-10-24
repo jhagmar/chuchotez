@@ -569,11 +569,12 @@ pub(super) fn prune_cached_mks(state: &mut EngineState) {
     });
 }
 
+/// Remember which transaction a skipped message key opened, so the cache can be dropped once that transaction is acknowledged.
 pub(super) fn annotate_cached_mk(
     state: &mut EngineState,
     cid: ConversationId,
     actor: &Actor,
-    mk: &[u8; 32],
+    mk: &super::super::chain::MessageKey,
     tx_id: Tag,
 ) {
     if let Some(chains) = state.chains_mut(cid)
